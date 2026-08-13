@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+node_modules/
+.next/
+
+.terraform/
+*.tfstate
+*.tfstate.*

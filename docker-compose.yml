@@ -1,0 +1,24 @@
+# Local development dependencies. Production runs the same Postgres major version
+# on RDS; anything that works here should work there.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: autotrain
+      POSTGRES_PASSWORD: autotrain
+      POSTGRES_DB: autotrain
+    ports:
+      # Host 5433, not 5432: a natively installed Postgres commonly holds 5432,
+      # and on Windows both can bind it (different address families) so
+      # connections land on whichever answers first. Explicit port, no ambiguity.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autotrain"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

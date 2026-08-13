@@ -1,0 +1,51 @@
+[project]
+name = "autotrain"
+version = "0.1.0"
+description = "Auto-refund engine for UK rail Delay Repay"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary,pool]>=3.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+]
+
+[project.scripts]
+autotrain-migrate = "autotrain.core.migrate:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.7",
+    "import-linter>=2.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/autotrain"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "S",        # bandit — S608 is the SQL-injection rule we rely on (ARCHITECTURE §3)
+    "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may assert and may build throwaway SQL against a disposable database.
+"tests/**" = ["S101", "S608"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
