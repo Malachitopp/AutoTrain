@@ -40,11 +40,15 @@ Delay Repay is a per-operator scheme, not a national system. Nearly all operator
 
 Access is free via registration on the Rail Data Marketplace (up to 5M API requests per 4-week period; push feeds free). HSP is the workhorse: even if live tracking misses something, a nightly HSP sweep over every stored journey catches every qualifying delay.
 
-## 5. Architecture (mobile app + backend)
+## 5. Architecture (web + mobile app + backend)
 
-**App (React Native, iOS + Android):** onboarding, ticket capture (camera barcode scan + manual form), journey list, delay notifications (push), claim status screen, recovered-money total. Keep the app thin — all logic server-side.
+**Web (Next.js) — the primary surface.** Server-rendered so it's indexable: per-operator Delay Repay guides, a free no-login "what am I owed?" calculator, the back-claim flow for the last 28 days, plus full account and claim management. Search is our main acquisition channel and an app can't be searched, so the web app is a distribution requirement, not a nice-to-have (see [MARKET §2a](MARKET.md)). It also serves the passengers least likely to install anything — older and less app-native users, who are over-represented among those losing out today.
 
-**Backend (Node or Python, Postgres):**
+**App (React Native, iOS + Android) — the notification loop.** Push notification within minutes of a delayed arrival, camera barcode scan, journey list, claim status, recovered-money total. Reliable push is the one thing the web genuinely can't match.
+
+Both are thin clients of the same API; all logic stays server-side.
+
+**Backend (Python, FastAPI, Postgres):**
 
 - *Journey service* — stores tickets/journeys, matches them to scheduled services.
 - *Delay engine* — consumes Darwin Push Port in real time, plus a nightly HSP reconciliation job; when a monitored journey qualifies, computes the entitlement and fires a push notification.
@@ -68,10 +72,11 @@ The big three: **operator form changes** breaking adapters (mitigate: monitoring
 
 ## 8. Build phases
 
-1. **Weeks 1–2 — Delay engine proof.** Rail Data Marketplace access, HSP + LDB integration, CLI that takes a journey and answers "was it late, how much are you owed". No app yet.
-2. **Weeks 3–6 — App MVP.** React Native app: manual journey entry, push notification on qualifying delay, pre-filled claim link for every operator. This alone is shippable and useful.
-3. **Weeks 7–10 — Auto-filing.** Barcode ticket scan; server-side claim submission for the top 3–5 operators; claim status tracking.
-4. **Then:** email ticket ingestion, more operator adapters, season tickets, paid tier.
+1. **Weeks 1–2 — Delay engine proof.** Rail Data Marketplace access, HSP + LDB integration, CLI that takes a journey and answers "was it late, how much are you owed". No UI yet.
+2. **Weeks 3–6 — Web MVP.** Next.js: the free "what am I owed?" calculator over the delay engine, back-claiming for the last 28 days, accounts, pre-filled claim links for every operator, and the first SEO content. Shipping this first starts the SEO clock — rankings take months to mature, so the content should exist well before we need the traffic — and it's cheaper to build and iterate than the app (no store review).
+3. **Weeks 7–10 — App + notifications.** React Native: barcode scan, journey list, and the push notification loop on qualifying delays — the magic moment web can't deliver.
+4. **Weeks 11–14 — Auto-filing.** Server-side claim submission for the top 3–5 operators; claim status tracking.
+5. **Then:** email ticket ingestion (LLM extraction — see [ARCHITECTURE §6a](ARCHITECTURE.md)), more operator adapters, season tickets, paid tier.
 
 ## 9. Open questions
 

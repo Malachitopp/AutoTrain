@@ -8,6 +8,24 @@ Feature-by-feature analysis of who else does this, where they fall short, what w
 - **£80m+/year goes unclaimed.** 58% say a claim takes 6+ minutes; 43% call the process frustrating.
 - The blocker is exactly what PLAN.md assumed: not knowing you're eligible + claim-form friction. The market thesis is validated by independent data.
 
+## 0a. Proof it works at n=1 — the origin tweet
+
+AutoTrain's seed: [Owen Greenhalgh (@ogme01)](https://x.com/ogme01) tweeted (Aug 2026) — *"I have a codex scheduled task that checks my inbox for train tickets, works out which journeys arrived late and submits the delay repay claims… it's been cooking recently"* — with a screenshot of six Govia Thameslink Railway payments landing in his bank between 6–12 Aug 2026 (£1.30–£5.60 each, ~£17 total in a week).
+
+**Reverse engineer:** 
+
+1. **Scheduled agent** — a Codex task on a cron cadence; the whole loop runs unattended.
+2. **Inbox ingestion** — the agent reads his email (Gmail API/IMAP access) and finds train ticket confirmations; the LLM extracts journey details directly from the raw email, no parser code.
+3. **Delay check** — compares booked journeys against actual arrivals, almost certainly via the free HSP/Darwin data (or the operator's own delay-checker) — the same feeds in our Phase 1.
+4. **Claim submission** — automates GTR's Delay Repay web form, filing from *his own operator account* with saved bank details — which is why the screenshot shows direct "Payment received" bank credits.
+
+**What this single data point validates:**
+
+- **The full loop is automatable today** — email → LLM extraction → delay verification → form submission → payout. No step required a partnership or API that doesn't exist. This is our architecture at n=1 (see [ARCHITECTURE §6a](ARCHITECTURE.md) — LLM ingestion at the edges, deterministic delay checks in the middle).
+- **Filing as the user works.** GTR — the operator that pushed back on Delay Repay Sniper's third-party claims — paid six automated claims filed from the user's own account without friction. That's direct evidence for the file-as-the-user-with-consent model (§F4) over the claims-company model.
+- **The unit economics warning in §2a, illustrated.** A committed commuter on one of Britain's least punctual operators recovered ~£17/week. Real money for him; at a 10% fee that's £1.70/week of revenue — subscription-shaped, not fee-shaped, for commuters.
+- **The substitute-product threat is real but bounded.** Technical users can now self-serve this with an agent and a cron job — and as agent tools get easier, more will. AutoTrain's market is everyone who won't wire up inbox access and a scheduled agent themselves: the product is *packaging* this loop — trust, polish, zero setup, every operator — not the loop itself.
+
 ## 1. Competitive landscape
 
 | Competitor | What they do | Coverage limit | Business model |
@@ -16,7 +34,7 @@ Feature-by-feature analysis of who else does this, where they fall short, what w
 | **Trainline** | Detects delay, push-notifies eligibility, links to the operator's form | **Only Trainline-bought tickets**; stops at the link — user still fills the claim | Drives retail loyalty |
 | **Choo Choo** (National Rail–accredited retailer) | Delay Repay alerts + deep link to claim page; strong on price/split tickets | **Only its own bookings** get the smooth path; still not auto-submission | Ticket retail |
 | **Delay Repay Sniper / Genie** | Detection + assisted claims, aimed at **season-ticket commuters** | Web-era product; users report breakage and operator pushback (GTR skepticism of its claims) | Subscription + "full service" tier |
-| **Railed (gotrailed.co.uk)** ⚠️ | **Our exact model**: forward ticket by email → they monitor → auto-file the claim → payout minus fee. iOS + Android. | Unknown operator coverage/depth | **10% success fee** |
+| **Railed (gotrailed.co.uk)**  | **Our exact model**: forward ticket by email → they monitor → auto-file the claim → payout minus fee. iOS + Android. | Unknown operator coverage/depth | **10% success fee** |
 | **TrainDelaysRepay.co.uk** | Claim-assistance app "against all UK TOCs" | Assisted, not automatic | Unclear |
 
 **The key fact: [Railed](https://gotrailed.co.uk/) already built AutoTrain — and appears to have no traction.** Email-forward ingestion, automatic monitoring, automatic filing, 10% success fee, iOS + Android — and essentially no reviews or visible user base (checked Aug 2026). That's simultaneously good news (the universal-claim gap is still open; the concept is buildable; operators tolerate third-party auto-filing) and the loudest warning in this document: someone walked this exact path and stalled. The autopsy points at two structural problems, analysed in §2a — distribution and unit economics — and AutoTrain must answer both, not just out-build a company that may have died of neither engineering nor demand.
@@ -27,10 +45,11 @@ Feature-by-feature analysis of who else does this, where they fall short, what w
 
 Why does a working product in an £80m/year market have no users? Two structural traps, both of which apply to us:
 
-**Distribution.** Nobody searches for a delay-repay app; the need is discovered *after* a delay and forgotten by morning. Trainline/Choo Choo sidestep this — delay alerts are a retention feature inside an app people already open to buy tickets. A standalone claims app pays full acquisition cost for a product used a handful of times a year. Mitigations to design in from day one:
+**Distribution.** Nobody searches for a delay-repay *app*, and app installs are a high-friction ask for a product used a handful of times a year — the need is felt *after* a delay and forgotten by morning. Trainline/Choo Choo sidestep this entirely: delay alerts are a retention feature inside an app people already open to buy tickets. Mitigations to design in from day one:
 
-- **The screenshot loop.** "AutoTrain just got me £12 for doing nothing" is inherently shareable; make the payout moment beautiful and one-tap shareable. Every delayed train is a trainful of identically-annoyed prospects — moment-of-delay marketing (search/social around major disruptions) hits people at peak motivation.
-- **Back-claiming as the acquisition hook.** HSP lets a new user enter journeys from the last 28 days and instantly discover money they're already owed — value in the first session, before any waiting.
+- **Search is the channel — which means the web app is not optional.** People don't search for the app, but they search the *problem* constantly: "train delayed compensation", "delay repay Thameslink", "how late does a train have to be to claim", "my train was cancelled can I get a refund". That is high-intent traffic arriving at peak motivation, and an app captures none of it. A server-rendered web surface with per-operator guides and a free "what am I owed?" calculator (no login) is the cheapest acquisition channel available, and it compounds — SEO takes months to mature, so the content should exist *before* it's needed. It also serves the users least likely to install anything: older and less app-native passengers, who are disproportionately the ones losing out today.
+- **The screenshot loop needs a destination.** "AutoTrain just got me £12 for doing nothing" is inherently shareable; make the payout moment beautiful and one-tap shareable — and point the link at a web page that converts on the spot, not an app-store listing that leaks 80% of the click. Every delayed train is a trainful of identically-annoyed prospects; moment-of-delay marketing (search and social around major disruptions) hits them at peak motivation.
+- **Back-claiming as the acquisition hook.** HSP lets a new user enter journeys from the last 28 days and instantly discover money they're already owed — value in the first session, before any waiting. This is a keyboard-and-screen task, which is another reason it belongs on web first.
 
 **Unit economics of the success fee.** A typical 15–29 min claim pays 25% of a single fare — often £2–8, so a 10% fee earns *pennies*. Ten qualifying delays a year ≈ £5–10 revenue per user. This is why funded players give detection away: it's retention for ticket retail, not a business. Consequences for us (supersedes the pricing discussion in §F6 where they conflict):
 
