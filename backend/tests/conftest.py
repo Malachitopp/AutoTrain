@@ -33,17 +33,33 @@ get_settings.cache_clear()
 
 def _maintenance_conninfo() -> str:
     """Connection string for the `postgres` database — you cannot drop the
-    database you are currently connected to."""
-    params = conninfo.conninfo_to_dict(TEST_DATABASE_URL)
-    params["dbname"] = "postgres"
-    return conninfo.make_conninfo(**params)
+    database you are currently connected to.
+
+    Host, port and credentials are inherited from the test URL; only the target
+    database is overridden.
+    """
+    return conninfo.make_conninfo(TEST_DATABASE_URL, dbname="postgres")
 
 
 def _test_dbname() -> str:
-    name = conninfo.conninfo_to_dict(TEST_DATABASE_URL).get("dbname")
-    if not name:
+    """The database this suite is allowed to destroy.
+
+    `conninfo_to_dict` returns `str | int | None` values, so the name is narrowed
+    to a string before use.
+    """
+    raw = conninfo.conninfo_to_dict(TEST_DATABASE_URL).get("dbname")
+    if not raw:
         raise RuntimeError(f"no database name in AUTOTRAIN_TEST_DATABASE_URL: {TEST_DATABASE_URL}")
-    return str(name)
+
+    name = str(raw)
+    # This fixture runs DROP DATABASE ... WITH (FORCE). A mistyped environment
+    # variable should fail the run, not destroy whatever it happens to point at.
+    if not name.endswith("_test"):
+        raise RuntimeError(
+            f"refusing to run: test database {name!r} must end in '_test'. "
+            "This suite drops and recreates the database it connects to."
+        )
+    return name
 
 
 @pytest.fixture(scope="session")

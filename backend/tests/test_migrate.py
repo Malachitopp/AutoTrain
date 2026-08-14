@@ -99,4 +99,6 @@ class TestAgainstRealPostgres:
         """0001 is only worth having if it actually took effect."""
         with conn.cursor() as cur:
             cur.execute("SELECT 'A'::citext = 'a'::citext")
-            assert cur.fetchone()[0] is True
+            row = cur.fetchone()
+        assert row is not None
+        assert row[0] is True
