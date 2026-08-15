@@ -1,0 +1,126 @@
+"""SQL for the journeys module — the only file in the module that contains any.
+
+Constants are deliberately unannotated: pyright then keeps their LiteralString
+type, which is what lets `core.db` reject any statement assembled from runtime
+values (ARCHITECTURE §3). Values travel as `%s` parameters, never in the text.
+
+Every function takes the connection first and never commits — the caller owns
+the transaction, which is how ticket + journey creation stays atomic without
+either insert knowing about the other.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from uuid import UUID
+
+import psycopg
+
+from autotrain.core import db
+from autotrain.modules.journeys.models import JourneyRow
+
+# The full journeys column list is repeated verbatim in each statement below:
+# core.db maps rows by name and treats an unexpected column as an error, so
+# SELECT * never appears — and building the list by concatenation would trip
+# both S608 and the LiteralString guarantee these constants exist to keep.
+
+_INSERT_TICKET = (
+    "INSERT INTO tickets (user_id, kind, price_pence, source) "
+    "VALUES (%s, %s, %s, %s) RETURNING id"
+)
+
+_INSERT_JOURNEY = (
+    "INSERT INTO journeys (user_id, ticket_id, origin_crs, destination_crs, "
+    "travel_date, scheduled_departure, scheduled_arrival) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+    "RETURNING id, user_id, ticket_id, operator_id, origin_crs, destination_crs, "
+    "travel_date, scheduled_departure, scheduled_arrival, "
+    "darwin_rid, darwin_uid, status, created_at, updated_at"
+)
+
+# Ownership lives in the WHERE clause: a journey belonging to someone else is
+# indistinguishable from one that does not exist.
+_GET_FOR_USER = (
+    "SELECT id, user_id, ticket_id, operator_id, origin_crs, destination_crs, "
+    "travel_date, scheduled_departure, scheduled_arrival, "
+    "darwin_rid, darwin_uid, status, created_at, updated_at "
+    "FROM journeys WHERE id = %s AND user_id = %s"
+)
+
+# Newest travel day first — exactly the shape journeys_user_date_idx serves.
+# created_at breaks ties so same-day journeys keep a stable order.
+_LIST_FOR_USER = (
+    "SELECT id, user_id, ticket_id, operator_id, origin_crs, destination_crs, "
+    "travel_date, scheduled_departure, scheduled_arrival, "
+    "darwin_rid, darwin_uid, status, created_at, updated_at "
+    "FROM journeys WHERE user_id = %s "
+    "ORDER BY travel_date DESC, created_at DESC LIMIT %s"
+)
+
+# Mirrors journeys_user_leg_departure_key (migration 0009) exactly: same leg,
+# same day, DIFFERENT departure is a second genuine journey, not a duplicate.
+_LEG_EXISTS = (
+    "SELECT EXISTS (SELECT 1 FROM journeys WHERE user_id = %s AND travel_date = %s "
+    "AND origin_crs = %s AND destination_crs = %s AND scheduled_departure = %s)"
+)
+
+
+def insert_ticket(
+    conn: psycopg.Connection, user_id: UUID, kind: str, price_pence: int, source: str
+) -> UUID:
+    return db.fetch_value(conn, _INSERT_TICKET, (user_id, kind, price_pence, source))
+
+
+def insert_journey(
+    conn: psycopg.Connection,
+    *,
+    user_id: UUID,
+    ticket_id: UUID,
+    origin_crs: str,
+    destination_crs: str,
+    travel_date: date,
+    scheduled_departure: datetime,
+    scheduled_arrival: datetime,
+) -> JourneyRow:
+    row = db.fetch_one(
+        conn,
+        _INSERT_JOURNEY,
+        (
+            user_id,
+            ticket_id,
+            origin_crs,
+            destination_crs,
+            travel_date,
+            scheduled_departure,
+            scheduled_arrival,
+        ),
+        row_cls=JourneyRow,
+    )
+    if row is None:  # unreachable: INSERT ... RETURNING yields the row or raises
+        raise RuntimeError("INSERT ... RETURNING produced no row")
+    return row
+
+
+def get_for_user(conn: psycopg.Connection, journey_id: UUID, user_id: UUID) -> JourneyRow | None:
+    return db.fetch_one(conn, _GET_FOR_USER, (journey_id, user_id), row_cls=JourneyRow)
+
+
+def list_for_user(conn: psycopg.Connection, user_id: UUID, limit: int) -> list[JourneyRow]:
+    return db.fetch_all(conn, _LIST_FOR_USER, (user_id, limit), row_cls=JourneyRow)
+
+
+def leg_exists(
+    conn: psycopg.Connection,
+    user_id: UUID,
+    travel_date: date,
+    origin_crs: str,
+    destination_crs: str,
+    scheduled_departure: datetime,
+) -> bool:
+    return bool(
+        db.fetch_value(
+            conn,
+            _LEG_EXISTS,
+            (user_id, travel_date, origin_crs, destination_crs, scheduled_departure),
+        )
+    )
