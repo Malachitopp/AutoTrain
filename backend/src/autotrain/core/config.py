@@ -40,6 +40,11 @@ class Settings(BaseSettings):
 
     migrations_dir: Path = _BACKEND_ROOT / "migrations"
 
+    # Bind address for the api process. Loopback by default so a dev machine
+    # never exposes the stub-auth API by accident; containers set 0.0.0.0.
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8000, ge=1, le=65535)
+
     # Only read by the integration test suite, which drops and recreates it.
     test_database_url: str | None = None
 

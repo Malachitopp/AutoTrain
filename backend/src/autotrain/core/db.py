@@ -32,6 +32,11 @@ from autotrain.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Re-exported so layers that only pass connections through (api dependencies)
+# can annotate them without importing psycopg themselves — psycopg types and
+# errors are meant to stay behind core/ and module services (ARCHITECTURE §3).
+Connection = psycopg.Connection
+
 T = TypeVar("T")
 
 # One set of parameters. `None` means "this statement takes none".
