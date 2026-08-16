@@ -25,6 +25,7 @@ uv run autotrain-migrate status    # what's applied, what's pending
 uv run pytest                      # integration tests against real Postgres
 uv run ruff check .                # lint, including the SQL-injection rule
 uv run ruff format .
+uv run lint-imports                # ARCHITECTURE §3 boundary contracts (.importlinter)
 ```
 
 Without `uv` installed, the same commands work through the venv directly —
@@ -33,6 +34,24 @@ Install `uv` when convenient; CI uses it.
 
 `pytest` drops and recreates the database named in `AUTOTRAIN_TEST_DATABASE_URL`
 on every run. It never touches the development database.
+
+## Run the API
+
+```bash
+uv run python -m autotrain.entrypoints.api   # http://127.0.0.1:8000 — docs at /docs
+```
+
+Host and port come from `AUTOTRAIN_API_HOST` / `AUTOTRAIN_API_PORT` (defaults
+`127.0.0.1:8000`).
+
+**Auth is a development stub.** Every request identifies itself with an
+`X-User-Id` header carrying an existing user's UUID — the server trusts it
+outright. Real authentication (magic-link + JWT) arrives with the identity
+module and replaces the stub wholesale; do not build anything on that header.
+
+```bash
+curl -s http://127.0.0.1:8000/journeys -H "X-User-Id: <uuid>"
+```
 
 ## Writing a migration
 

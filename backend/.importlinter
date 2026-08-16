@@ -1,0 +1,75 @@
+; ARCHITECTURE §3's boundary rules, made mechanical. Run from backend/ with:
+;   lint-imports        (or: uv run lint-imports)
+
+[importlinter]
+root_package = autotrain
+; External packages appear in the graph (squashed to their top-level name) so
+; the driver-containment contract below can see psycopg; contracts over
+; internal modules are unaffected.
+include_external_packages = True
+
+; --- Module privacy ---------------------------------------------------------
+; Modules talk to each other only through their service layer. Privacy is one
+; contract PER MODULE, because a blanket source of autotrain.modules would
+; forbid a module importing its own internals. Adding module M means:
+;   1. add an "<M>-privacy" contract: source_modules = api, entrypoints and
+;      every OTHER module; forbidden_modules = M's non-service files;
+;   2. add M to source_modules of every existing *-privacy contract —
+;      otherwise M may import its siblings' internals with CI green.
+; allow_indirect_imports: reaching repository/models THROUGH the service is the
+; sanctioned path — only a direct import is a boundary breach.
+[importlinter:contract:journeys-privacy]
+name = journeys internals are importable only via journeys.service
+type = forbidden
+source_modules =
+    autotrain.api
+    autotrain.entrypoints
+forbidden_modules =
+    autotrain.modules.journeys.models
+    autotrain.modules.journeys.repository
+allow_indirect_imports = True
+
+[importlinter:contract:api-does-not-import-repositories]
+name = api delegates to services, never to repositories
+type = forbidden
+source_modules =
+    autotrain.api
+forbidden_modules =
+    autotrain.modules.journeys.repository
+allow_indirect_imports = True
+
+; --- Layer direction --------------------------------------------------------
+[importlinter:contract:core-knows-nothing-of-domain]
+name = core is domain-free plumbing
+type = forbidden
+source_modules =
+    autotrain.core
+forbidden_modules =
+    autotrain.modules
+    autotrain.api
+    autotrain.entrypoints
+
+[importlinter:contract:modules-do-not-import-api]
+name = modules never reach up into api or entrypoints
+type = forbidden
+source_modules =
+    autotrain.modules
+forbidden_modules =
+    autotrain.api
+    autotrain.entrypoints
+
+; --- Driver containment -----------------------------------------------------
+; psycopg stays behind core/ and module services — the reason core.db
+; re-exports Connection. The indirect chain api -> core.db -> psycopg is the
+; sanctioned path; a direct import (e.g. catching pg_errors in a router) is
+; the breach this catches.
+[importlinter:contract:psycopg-stays-behind-core]
+name = api and entrypoints never import psycopg directly
+type = forbidden
+source_modules =
+    autotrain.api
+    autotrain.entrypoints
+forbidden_modules =
+    psycopg
+    psycopg_pool
+allow_indirect_imports = True
