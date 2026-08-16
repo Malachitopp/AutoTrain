@@ -33,9 +33,7 @@ def _mk_user(conn: psycopg.Connection, email: str = "svc@example.com") -> UUID:
 
 
 def _tickets_for(conn: psycopg.Connection, user_id: UUID) -> int:
-    row = conn.execute(
-        "SELECT count(*) FROM tickets WHERE user_id = %s", (user_id,)
-    ).fetchone()
+    row = conn.execute("SELECT count(*) FROM tickets WHERE user_id = %s", (user_id,)).fetchone()
     assert row is not None
     return row[0]
 
@@ -139,9 +137,7 @@ class TestDuplicateGuardLivesInTheDatabase:
         with pytest.raises(service.DuplicateJourney), conn.transaction():
             _add(conn, uid)
 
-    def test_sequential_duplicate_is_caught_by_the_precheck(
-        self, conn: psycopg.Connection
-    ) -> None:
+    def test_sequential_duplicate_is_caught_by_the_precheck(self, conn: psycopg.Connection) -> None:
         uid = _mk_user(conn)
         with conn.transaction():
             _add(conn, uid)
@@ -150,9 +146,7 @@ class TestDuplicateGuardLivesInTheDatabase:
 
 
 class TestListOrdering:
-    def test_created_at_breaks_same_day_ties_newest_first(
-        self, conn: psycopg.Connection
-    ) -> None:
+    def test_created_at_breaks_same_day_ties_newest_first(self, conn: psycopg.Connection) -> None:
         """travel_date DESC, created_at DESC. now() is fixed for the whole
         transaction, so distinct created_at values must be inserted explicitly
         — which is also why no API-level test can cover this tiebreak."""

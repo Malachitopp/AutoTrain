@@ -57,9 +57,7 @@ def _count(conn: psycopg.Connection, table: str, user_id: str) -> int:
     # Test-only SQL (S608 is off for tests); the identifier comes from the
     # two literals below, never from input.
     assert table in ("journeys", "tickets")
-    row = conn.execute(
-        f"SELECT count(*) FROM {table} WHERE user_id = %s", (user_id,)
-    ).fetchone()
+    row = conn.execute(f"SELECT count(*) FROM {table} WHERE user_id = %s", (user_id,)).fetchone()
     assert row is not None
     return row[0]
 
@@ -223,9 +221,7 @@ class TestCreateJourney:
         schema ceiling this reached the INSERT and surfaced as a driver range
         error — a 500 for plainly invalid input."""
         headers = {"X-User-Id": _mk_user(conn)}
-        resp = client.post(
-            "/journeys", json=_payload(price_pence=3_000_000_000), headers=headers
-        )
+        resp = client.post("/journeys", json=_payload(price_pence=3_000_000_000), headers=headers)
         assert resp.status_code == 422
         err = _single_error(resp)
         assert err["loc"] == ["body", "price_pence"]

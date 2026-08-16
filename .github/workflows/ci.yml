@@ -1,0 +1,63 @@
+# Every check here is one a developer can run locally with the same command —
+# CI enforces, it does not invent. Two jobs so a red build says at a glance
+# whether code quality or behaviour broke.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch supersedes the previous run; stop paying for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  checks:
+    name: lint / types / boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pyright
+      - run: uv run lint-imports
+
+  tests:
+    name: pytest (real Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: autotrain
+          POSTGRES_PASSWORD: autotrain
+          POSTGRES_DB: autotrain
+        ports:
+          # Host 5433 to mirror docker-compose.yml, so conftest's default
+          # URL is correct here with no extra configuration.
+          - "5433:5432"
+        options: >-
+          --health-cmd "pg_isready -U autotrain"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync
+      - run: uv run pytest
+        env:
+          AUTOTRAIN_TEST_DATABASE_URL: postgresql://autotrain:autotrain@localhost:5433/autotrain_test

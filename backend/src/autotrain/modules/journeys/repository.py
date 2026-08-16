@@ -25,8 +25,7 @@ from autotrain.modules.journeys.models import JourneyRow
 # both S608 and the LiteralString guarantee these constants exist to keep.
 
 _INSERT_TICKET = (
-    "INSERT INTO tickets (user_id, kind, price_pence, source) "
-    "VALUES (%s, %s, %s, %s) RETURNING id"
+    "INSERT INTO tickets (user_id, kind, price_pence, source) VALUES (%s, %s, %s, %s) RETURNING id"
 )
 
 _INSERT_JOURNEY = (

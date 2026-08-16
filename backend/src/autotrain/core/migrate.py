@@ -87,12 +87,10 @@ def discover(migrations_dir: Path) -> list[Migration]:
         raise MigrationError(f"migrations directory not found: {migrations_dir}")
 
     found: dict[int, Migration] = {}
-    for path in sorted(migrations_dir.glob("*.sql")): #any file that ends in .sql
+    for path in sorted(migrations_dir.glob("*.sql")):  # any file that ends in .sql
         match = FILENAME_RE.match(path.name)
         if match is None:
-            raise MigrationError(
-                f"{path.name}: migration files must be named NNNN_snake_case.sql"
-            )
+            raise MigrationError(f"{path.name}: migration files must be named NNNN_snake_case.sql")
         version, name = int(match.group(1)), match.group(2)
         if version in found:
             raise MigrationError(
