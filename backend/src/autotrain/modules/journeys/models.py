@@ -31,6 +31,30 @@ class TicketRow:
 
 
 @dataclass(frozen=True)
+class AssessableJourney:
+    """One journey awaiting delay assessment: past its scheduled arrival and
+    still 'pending'/'matched'. The shape of the delay sweep's work query —
+    ticket fields ride along so entitlement can be priced without a second
+    query. Owned by journeys (its tables), consumed by the delays module."""
+
+    id: UUID
+    user_id: UUID
+    ticket_id: UUID
+    operator_id: UUID | None
+    origin_crs: str
+    destination_crs: str
+    travel_date: date
+    scheduled_departure: datetime
+    scheduled_arrival: datetime
+    status: str
+    price_pence: int
+    ticket_kind: str
+    # NULL when the journey has no operator yet (LEFT JOIN) — the sweep may
+    # still resolve one from the arrival report's ATOC code.
+    operator_min_delay_minutes: int | None
+
+
+@dataclass(frozen=True)
 class JourneyRow:
     """One row of `journeys` (migration 0005): one dated leg being monitored."""
 

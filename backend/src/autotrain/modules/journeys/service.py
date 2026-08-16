@@ -21,7 +21,11 @@ from psycopg import errors as pg_errors
 # records only an import of the service). The underscore makes that an
 # ImportError, so the public surface is exactly the functions below.
 from autotrain.modules.journeys import repository as _repository
-from autotrain.modules.journeys.models import JourneyRow
+
+# AssessableJourney is re-exported deliberately: it is the shape this service
+# hands the delay engine, and importing it from here keeps callers off
+# journeys.models (the journeys-privacy contract).
+from autotrain.modules.journeys.models import AssessableJourney, JourneyRow
 
 # The two constraints that mean "this journey is already tracked":
 # journeys_user_leg_departure_key (0009) is the cross-request guard — every
@@ -122,3 +126,42 @@ def get_journey(conn: psycopg.Connection, journey_id: UUID, user_id: UUID) -> Jo
 def list_journeys(conn: psycopg.Connection, user_id: UUID, limit: int = 50) -> list[JourneyRow]:
     """The user's journeys, newest travel date first."""
     return _repository.list_for_user(conn, user_id, limit)
+
+
+# --- Journey lifecycle for the delay engine -------------------------------
+# journeys owns its tables and its status machine; the delays module drives
+# these transitions through here rather than with its own SQL
+# (ARCHITECTURE §3: no cross-module table access).
+
+
+def list_awaiting_assessment(
+    conn: psycopg.Connection,
+    cutoff: datetime,
+    limit: int,
+    after: tuple[date, datetime, UUID] | None = None,
+) -> list[AssessableJourney]:
+    """Journeys past their scheduled arrival still needing a delay decision,
+    oldest first. `after` is the keyset cursor — pass the last row's
+    (travel_date, scheduled_departure-ordering key, id) to page past journeys
+    the caller examined but could not decide."""
+    return _repository.list_awaiting_assessment(conn, cutoff, limit, after)
+
+
+def mark_assessed(conn: psycopg.Connection, journey_id: UUID) -> bool:
+    """Claim the journey for assessment: True moves 'pending'/'matched' →
+    'assessed'; False means another process moved it first and the caller
+    must stop (the rowcount-is-load-bearing protocol, core.db)."""
+    return _repository.mark_assessed(conn, journey_id)
+
+
+def mark_unmatched(conn: psycopg.Connection, journey_id: UUID) -> bool:
+    """Retire a 'pending' journey we gave up on. Guarded to 'pending' only —
+    a 'matched' journey has a service, so lacking data is never a matching
+    failure (0005's status semantics)."""
+    return _repository.mark_unmatched(conn, journey_id)
+
+
+def assign_operator(conn: psycopg.Connection, journey_id: UUID, operator_id: UUID) -> None:
+    """Attach an operator to a journey that has none. Never overrides an
+    existing match."""
+    _repository.assign_operator(conn, journey_id, operator_id)
