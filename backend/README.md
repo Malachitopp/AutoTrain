@@ -53,6 +53,17 @@ module and replaces the stub wholesale; do not build anything on that header.
 curl -s http://127.0.0.1:8000/journeys -H "X-User-Id: <uuid>"
 ```
 
+## Run the ingestor
+
+```bash
+uv run python -m autotrain.entrypoints.ingestor --once
+```
+
+Sweeps journeys past their scheduled arrival and records frozen delay
+decisions (`delay_detections`). Refuses to start until
+`AUTOTRAIN_ARRIVALS_SOURCE` names a real source — the HSP client lands in a
+later PR, so today this process only proves the wiring.
+
 ## Writing a migration
 
 Add `migrations/NNNN_snake_case.sql` with the next number. Never edit a migration

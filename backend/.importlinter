@@ -24,9 +24,22 @@ type = forbidden
 source_modules =
     autotrain.api
     autotrain.entrypoints
+    autotrain.modules.delays
 forbidden_modules =
     autotrain.modules.journeys.models
     autotrain.modules.journeys.repository
+allow_indirect_imports = True
+
+[importlinter:contract:delays-privacy]
+name = delays internals are importable only via delays.service
+type = forbidden
+source_modules =
+    autotrain.api
+    autotrain.entrypoints
+    autotrain.modules.journeys
+forbidden_modules =
+    autotrain.modules.delays.models
+    autotrain.modules.delays.repository
 allow_indirect_imports = True
 
 [importlinter:contract:api-does-not-import-repositories]
@@ -36,6 +49,7 @@ source_modules =
     autotrain.api
 forbidden_modules =
     autotrain.modules.journeys.repository
+    autotrain.modules.delays.repository
 allow_indirect_imports = True
 
 ; --- Layer direction --------------------------------------------------------
