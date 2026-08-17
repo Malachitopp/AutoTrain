@@ -45,6 +45,18 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
 
+    # Ingestor (delay sweep) — process type 2. 'none' makes the ingestor
+    # refuse to start; 'hsp' arrives with the HSP client PR.
+    arrivals_source: Literal["none", "hsp"] = "none"
+    ingestor_batch_size: int = Field(default=200, ge=1)
+    ingestor_interval_seconds: float = Field(default=900.0, gt=0)
+    # Wait this long after scheduled arrival before asking the source — HSP
+    # publishes next-day, so asking immediately is a guaranteed miss.
+    ingestor_arrival_lag_minutes: int = Field(default=120, ge=0)
+    # A journey still without data this many days after travel is marked
+    # 'unmatched' and leaves the sweep.
+    ingestor_give_up_days: int = Field(default=7, ge=1)
+
     # Only read by the integration test suite, which drops and recreates it.
     test_database_url: str | None = None
 
