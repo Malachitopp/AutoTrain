@@ -61,8 +61,13 @@ uv run python -m autotrain.entrypoints.ingestor --once
 
 Sweeps journeys past their scheduled arrival and records frozen delay
 decisions (`delay_detections`). Refuses to start until
-`AUTOTRAIN_ARRIVALS_SOURCE` names a real source — the HSP client lands in a
-later PR, so today this process only proves the wiring.
+`AUTOTRAIN_ARRIVALS_SOURCE` names a real source.
+
+The real source is `hsp` — National Rail's Historical Service Performance
+API (actual arrival times, next-day data). Register a free account at
+https://raildata.org.uk, subscribe to HSP, then set `AUTOTRAIN_HSP_EMAIL`
+and `AUTOTRAIN_HSP_PASSWORD` in `.env`. The client lives in
+`sources/hsp.py`; the sweep only ever sees the `ArrivalsSource` protocol.
 
 ## Writing a migration
 

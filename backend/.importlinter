@@ -25,6 +25,7 @@ source_modules =
     autotrain.api
     autotrain.entrypoints
     autotrain.modules.delays
+    autotrain.sources
 forbidden_modules =
     autotrain.modules.journeys.models
     autotrain.modules.journeys.repository
@@ -37,6 +38,7 @@ source_modules =
     autotrain.api
     autotrain.entrypoints
     autotrain.modules.journeys
+    autotrain.sources
 forbidden_modules =
     autotrain.modules.delays.models
     autotrain.modules.delays.repository
@@ -62,6 +64,7 @@ forbidden_modules =
     autotrain.modules
     autotrain.api
     autotrain.entrypoints
+    autotrain.sources
 
 [importlinter:contract:modules-do-not-import-api]
 name = modules never reach up into api or entrypoints
@@ -72,17 +75,40 @@ forbidden_modules =
     autotrain.api
     autotrain.entrypoints
 
+; The delay engine defines the ArrivalsSource protocol; concrete transports
+; implement it from outside. If a module imported a source, the engine would
+; be married to one transport and the protocol would be theatre.
+[importlinter:contract:modules-do-not-import-sources]
+name = modules stay source-agnostic
+type = forbidden
+source_modules =
+    autotrain.modules
+forbidden_modules =
+    autotrain.sources
+
+; ...and sources are constructed BY entrypoints, never the reverse: a source
+; reaching up would invert the layering and invite circular imports.
+[importlinter:contract:sources-do-not-reach-up]
+name = sources never import api or entrypoints
+type = forbidden
+source_modules =
+    autotrain.sources
+forbidden_modules =
+    autotrain.api
+    autotrain.entrypoints
+
 ; --- Driver containment -----------------------------------------------------
 ; psycopg stays behind core/ and module services — the reason core.db
 ; re-exports Connection. The indirect chain api -> core.db -> psycopg is the
 ; sanctioned path; a direct import (e.g. catching pg_errors in a router) is
 ; the breach this catches.
 [importlinter:contract:psycopg-stays-behind-core]
-name = api and entrypoints never import psycopg directly
+name = api, entrypoints and sources never import psycopg directly
 type = forbidden
 source_modules =
     autotrain.api
     autotrain.entrypoints
+    autotrain.sources
 forbidden_modules =
     psycopg
     psycopg_pool
