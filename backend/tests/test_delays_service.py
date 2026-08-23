@@ -21,6 +21,8 @@ from autotrain.modules.delays.service import (
     compute_entitlement,
     run_sweep,
 )
+from conftest import mk_user as _mk_user
+from conftest import scalar as _scalar
 
 # The standard national scale: 25% at 15-29, 50% at 30-59, 100% at 60-119,
 # 100% of the RETURN fare at 120+.
@@ -61,22 +63,6 @@ class FakeSource:
         if journey.id in self.explode:
             raise RuntimeError("source blew up")
         return self.reports.get(journey.id)
-
-
-def _scalar(cur: psycopg.Cursor) -> UUID:
-    row = cur.fetchone()
-    assert row is not None
-    return row[0]
-
-
-def _mk_user(conn: psycopg.Connection, email: str = "sweep@example.com") -> UUID:
-    return _scalar(
-        conn.execute(
-            "INSERT INTO users (email, claim_consent_at, claim_consent_terms) "
-            "VALUES (%s, now(), 'loa-v1') RETURNING id",
-            (email,),
-        )
-    )
 
 
 def _mk_ticket(
@@ -450,7 +436,9 @@ class TestSweep:
         # price differently (10% single band) — entitlement must come from
         # the journey's operator scale.
         op_a = _mk_operator(conn, atoc="QQ")
-        op_b = _mk_operator(conn, atoc="QX", bands=(Band(15, None, 10, of_return_fare=False),))
+        # A second operator whose scheme would price differently (10%) — its
+        # bands must NOT be used.
+        _mk_operator(conn, atoc="QX", bands=(Band(15, None, 10, of_return_fare=False),))
         uid = _mk_user(conn)
         jid = _mk_journey(conn, uid, _mk_ticket(conn, uid), operator_id=op_a)
         source = FakeSource(
@@ -466,7 +454,82 @@ class TestSweep:
         assert _detection(conn, jid) == (35, "hsp", 50, 2275, None)  # op_a's 30-59 band
         row = conn.execute("SELECT operator_id FROM journeys WHERE id = %s", (jid,)).fetchone()
         assert row is not None and row[0] == op_a
-        assert op_b is not None  # silence "unused" — its bands must NOT be used
+
+    def test_source_wide_failure_retires_nothing(self, conn: psycopg.Connection) -> None:
+        # Bad credentials or an HSP outage = EVERY call raises. The journeys
+        # are fine; the source is not. Give-up must not fire, or a week-long
+        # credential typo silently forfeits the whole backlog.
+        uid = _mk_user(conn)
+        old = {
+            _mk_journey(
+                conn,
+                uid,
+                _mk_ticket(conn, uid),
+                departure=DEPARTURE + timedelta(minutes=i),
+                arrival=ARRIVAL + timedelta(minutes=i),
+            )
+            for i in range(2)
+        }
+        source = FakeSource(explode=old)
+
+        stats = run_sweep(
+            conn, source, cutoff=CUTOFF, give_up_before=TRAVEL_DATE + timedelta(days=1)
+        )
+
+        assert (stats.errors, stats.gave_up) == (2, 0)
+        for jid in old:
+            assert _status(conn, jid) == "pending"
+
+    def test_poison_journey_is_retired_once_the_source_proves_alive(
+        self, conn: psycopg.Connection
+    ) -> None:
+        # One journey deterministically errors while another succeeds: the
+        # failure is journey-scoped, so the old poison journey ages out.
+        op = _mk_operator(conn)
+        uid = _mk_user(conn)
+        bad = _mk_journey(conn, uid, _mk_ticket(conn, uid), origin="LDS")
+        good = _mk_journey(
+            conn,
+            uid,
+            _mk_ticket(conn, uid),
+            operator_id=op,
+            departure=DEPARTURE + timedelta(minutes=5),
+            arrival=ARRIVAL + timedelta(minutes=5),
+        )
+        source = FakeSource(
+            {good: ArrivalReport(actual_arrival=ARRIVAL + timedelta(minutes=25), source="hsp")},
+            explode={bad},
+        )
+
+        stats = run_sweep(
+            conn, source, cutoff=CUTOFF, give_up_before=TRAVEL_DATE + timedelta(days=1)
+        )
+
+        assert (stats.errors, stats.assessed, stats.gave_up) == (1, 1, 1)
+        assert _status(conn, bad) == "unmatched"
+        assert _status(conn, good) == "assessed"
+
+    def test_sweep_aborts_when_every_early_journey_fails(self, conn: psycopg.Connection) -> None:
+        # First N journeys all erroring = the source is down; stop paying a
+        # timeout per journey to keep learning it.
+        uid = _mk_user(conn)
+        jids = {
+            _mk_journey(
+                conn,
+                uid,
+                _mk_ticket(conn, uid),
+                departure=DEPARTURE + timedelta(minutes=i),
+                arrival=ARRIVAL + timedelta(minutes=i),
+            )
+            for i in range(5)
+        }
+        source = FakeSource(explode=jids)
+
+        stats = run_sweep(
+            conn, source, cutoff=CUTOFF, give_up_before=GIVE_UP_BEFORE, abort_error_streak=3
+        )
+
+        assert (stats.examined, stats.errors) == (3, 3)
 
     def test_existing_detection_is_kept_and_counted_as_lost_race(
         self, conn: psycopg.Connection

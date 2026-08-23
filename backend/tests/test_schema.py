@@ -7,31 +7,12 @@ one of these fails after a schema change, a product invariant broke — not a te
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
 
 import psycopg
 import pytest
 
-
-def _scalar(cur: psycopg.Cursor[Any]) -> Any:
-    """First column of a row that must exist (RETURNING id, count(*), ...).
-
-    `fetchone()` is typed `tuple | None`; the assert narrows away the None arm
-    for queries whose shape guarantees a row — which the checker can't know.
-    """
-    row = cur.fetchone()
-    assert row is not None, "query was expected to return a row"
-    return row[0]
-
-
-def _mk_user(conn: psycopg.Connection, email: str = "test@example.com") -> str:
-    return _scalar(
-        conn.execute(
-            "INSERT INTO users (email, claim_consent_at, claim_consent_terms) "
-            "VALUES (%s, now(), 'loa-v1') RETURNING id",
-            (email,),
-        )
-    )
+from conftest import mk_user as _mk_user
+from conftest import scalar as _scalar
 
 
 def _mk_ticket(conn: psycopg.Connection, user_id: str) -> str:

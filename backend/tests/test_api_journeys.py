@@ -24,19 +24,14 @@ from fastapi.testclient import TestClient
 
 from autotrain.api.app import create_app
 from autotrain.api.deps import get_conn
+from conftest import mk_user
 
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
 
 
 def _mk_user(conn: psycopg.Connection, email: str = "rider@example.com") -> str:
-    cur = conn.execute(
-        "INSERT INTO users (email, claim_consent_at, claim_consent_terms) "
-        "VALUES (%s, now(), 'loa-v1') RETURNING id",
-        (email,),
-    )
-    row = cur.fetchone()
-    assert row is not None
-    return str(row[0])
+    # The API speaks header strings, not UUIDs — hence the local wrapper.
+    return str(mk_user(conn, email))
 
 
 def _payload(**overrides: Any) -> dict[str, Any]:

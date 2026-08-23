@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from typing import Any
 
 import psycopg
 import pytest
@@ -98,3 +99,30 @@ def pool(migrated_database: str) -> Iterator[None]:
     db.init_pool()
     yield
     db.close_pool()
+
+
+# --- Shared row helpers ------------------------------------------------------
+# One definition each; test files import and alias these. Promoted here after
+# the fourth verbatim copy appeared (PR #6 review).
+
+
+def scalar(cur: psycopg.Cursor[Any]) -> Any:
+    """First column of a row that must exist (RETURNING id, count(*), ...).
+
+    `fetchone()` is typed `tuple | None`; the assert narrows away the None arm
+    for queries whose shape guarantees a row — which the checker can't know.
+    """
+    row = cur.fetchone()
+    assert row is not None, "query was expected to return a row"
+    return row[0]
+
+
+def mk_user(conn: psycopg.Connection, email: str = "user@example.com") -> Any:
+    """A consented user row — the row everything else hangs off."""
+    return scalar(
+        conn.execute(
+            "INSERT INTO users (email, claim_consent_at, claim_consent_terms) "
+            "VALUES (%s, now(), 'loa-v1') RETURNING id",
+            (email,),
+        )
+    )

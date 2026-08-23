@@ -17,19 +17,10 @@ import psycopg
 import pytest
 
 from autotrain.modules.journeys import repository, service
+from conftest import mk_user as _mk_user
 
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
 _DAY = date(2026, 8, 10)
-
-
-def _mk_user(conn: psycopg.Connection, email: str = "svc@example.com") -> UUID:
-    row = conn.execute(
-        "INSERT INTO users (email, claim_consent_at, claim_consent_terms) "
-        "VALUES (%s, now(), 'loa-v1') RETURNING id",
-        (email,),
-    ).fetchone()
-    assert row is not None
-    return row[0]
 
 
 def _tickets_for(conn: psycopg.Connection, user_id: UUID) -> int:
