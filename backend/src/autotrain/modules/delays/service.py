@@ -128,6 +128,7 @@ def run_sweep(
     give_up_before: date,
     batch_size: int = 200,
     commit_each: bool = False,
+    abort_error_streak: int = 25,
 ) -> SweepStats:
     """Assess every journey whose scheduled arrival is before `cutoff`.
 
@@ -143,9 +144,19 @@ def run_sweep(
     is made, so locks release immediately, finished work survives a
     mid-sweep crash, and concurrent readers see decisions without waiting for
     the whole sweep.
+
+    Failure containment: a journey whose source call RAISES is retired (aged
+    out) only after this sweep proves the source alive for someone else — if
+    every call failed, the problem is the source (bad credentials, outage),
+    not the journeys, and retiring them would permanently forfeit real
+    claims. For the same reason the sweep aborts once its first
+    `abort_error_streak` journeys all error: no point paying a timeout per
+    journey to learn the source is down.
     """
     stats = SweepStats()
+    retire_after: list[AssessableJourney] = []
     after: tuple[date, datetime, UUID] | None = None
+    aborted = False
     while True:
         page = _journeys.list_awaiting_assessment(conn, cutoff, batch_size, after)
         if not page:
@@ -157,25 +168,43 @@ def run_sweep(
                     _assess_one(conn, source, journey, give_up_before, stats)
             except Exception:
                 logger.exception("sweep: journey %s failed; continuing", journey.id)
-                # A journey whose source call RAISES (not just "no data")
-                # must still age out, or a poison journey occupies the sweep
-                # forever. The failed savepoint is rolled back; retire in a
-                # fresh one.
+                stats.errors += 1
+                # Poison-journey candidate: a journey that makes the source
+                # RAISE must still age out eventually, or it occupies the
+                # sweep forever. Decided after the loop, once we know the
+                # failures were journey-scoped. ('matched' journeys never
+                # retire — 0005 semantics — so a matched poison journey
+                # retries forever; acceptable until a matcher exists and
+                # brings its own terminal state.)
                 if journey.status == "pending" and journey.travel_date <= give_up_before:
-                    with conn.transaction():
-                        retired = _journeys.mark_unmatched(conn, journey.id)
-                    if retired:
-                        stats.gave_up += 1
-                    else:
-                        stats.errors += 1
-                else:
-                    stats.errors += 1
+                    retire_after.append(journey)
+                if stats.errors == stats.examined and stats.errors >= abort_error_streak:
+                    logger.error(
+                        "sweep: first %d journeys all failed — treating the source "
+                        "as down and aborting this sweep",
+                        stats.errors,
+                    )
+                    aborted = True
+                    break
             if commit_each:
                 conn.commit()
+        if aborted:
+            break
         last = page[-1]
         after = (last.travel_date, last.scheduled_arrival, last.id)
         if len(page) < batch_size:
             break
+
+    if stats.examined > stats.errors:
+        # At least one journey got a real answer, so the source is alive and
+        # the failures above are journey-scoped: age the old ones out.
+        for journey in retire_after:
+            with conn.transaction():
+                retired = _journeys.mark_unmatched(conn, journey.id)
+            if retired:
+                stats.gave_up += 1
+            if commit_each:
+                conn.commit()
     return stats
 
 
