@@ -5,9 +5,11 @@ Polls for journeys past their scheduled arrival, asks the configured arrivals
 source what actually happened, and records frozen delay decisions. Everything
 downstream (notification worker, claims) only ever reads those decisions.
 
-No real source exists yet — the HSP client is a later PR. Until one is
-configured this process refuses to start: sweeping with a source that knows
-nothing would age every journey into 'unmatched' for no reason.
+The one real source today is HSP (sources/hsp.py). Without a configured
+source this process refuses to start — sweeping with a source that knows
+nothing would age journeys toward 'unmatched' for no reason — and credential
+presence is enforced by Settings itself, so a misconfigured container dies
+at boot with a validation error, not mid-sweep with per-journey 401s.
 """
 
 from __future__ import annotations
@@ -16,20 +18,33 @@ import argparse
 import logging
 import time
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from autotrain.core import db
-from autotrain.core.config import get_settings
+from autotrain.core.config import Settings, get_settings
 from autotrain.modules.delays import service
+from autotrain.sources.hsp import HspSource
 
 logger = logging.getLogger(__name__)
 
+_LONDON = ZoneInfo("Europe/London")
 
-def _build_source(name: str) -> service.ArrivalsSource:
-    # The HSP client will be constructed here once it exists. Adding a source
-    # = one branch here + the client module; nothing else changes.
+
+def _build_source(settings: Settings) -> service.ArrivalsSource:
+    # One branch per source; adding one touches this function and the
+    # sources/ module, nothing else. Credential PRESENCE is validated by
+    # Settings — the check here only narrows the Optional types.
+    if settings.arrivals_source == "hsp":
+        if not settings.hsp_email or settings.hsp_password is None:
+            raise SystemExit(
+                "hsp credentials missing — Settings validation should have caught this"
+            )
+        return HspSource.from_credentials(
+            settings.hsp_email, settings.hsp_password.get_secret_value()
+        )
     raise SystemExit(
-        f"AUTOTRAIN_ARRIVALS_SOURCE={name!r} has no implementation yet — "
-        "the HSP client arrives in a later PR; the ingestor cannot run without a source."
+        "AUTOTRAIN_ARRIVALS_SOURCE=none — nothing to ingest. Configure a real "
+        "arrivals source (hsp) before running the ingestor."
     )
 
 
@@ -39,7 +54,10 @@ def _sweep_once(source: service.ArrivalsSource) -> service.SweepStats:
     # The lag gives the source time to publish: HSP is next-day data, so a
     # journey is not worth asking about the moment its arrival time passes.
     cutoff = now - timedelta(minutes=settings.ingestor_arrival_lag_minutes)
-    give_up_before = now.date() - timedelta(days=settings.ingestor_give_up_days)
+    # travel_date is a UK timetable day, so the give-up boundary must come
+    # from the UK calendar date — the UTC date lags it by an hour a night
+    # during BST.
+    give_up_before = now.astimezone(_LONDON).date() - timedelta(days=settings.ingestor_give_up_days)
     with db.transaction() as conn:
         # commit_each: every journey's decision commits the moment it is
         # made — locks release, finished work survives a crash, and the
@@ -62,12 +80,7 @@ def main() -> None:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level.upper())
 
-    if settings.arrivals_source == "none":
-        raise SystemExit(
-            "AUTOTRAIN_ARRIVALS_SOURCE=none — nothing to ingest. "
-            "Configure a real arrivals source before running the ingestor."
-        )
-    source = _build_source(settings.arrivals_source)
+    source = _build_source(settings)
 
     db.init_pool()
     try:
@@ -86,6 +99,11 @@ def main() -> None:
                 break
             time.sleep(settings.ingestor_interval_seconds)
     finally:
+        # The protocol doesn't demand a close(); sources that hold network
+        # clients (HSP) provide one.
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
         db.close_pool()
 
 
