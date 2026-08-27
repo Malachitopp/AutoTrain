@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     # 'unmatched' and leaves the sweep.
     ingestor_give_up_days: int = Field(default=7, ge=1)
 
+    # Scheduler (claims jobs) — process type 3. Interval matches the ingestor:
+    # both jobs are cheap no-op sweeps when their partial-index work queues are
+    # empty, so a short interval costs almost nothing.
+    scheduler_batch_size: int = Field(default=200, ge=1)
+    scheduler_interval_seconds: float = Field(default=900.0, gt=0)
+
     # Only read by the integration test suite, which drops and recreates it.
     test_database_url: str | None = None
 

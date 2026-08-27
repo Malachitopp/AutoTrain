@@ -69,6 +69,17 @@ https://raildata.org.uk, subscribe to HSP, then set `AUTOTRAIN_HSP_EMAIL`
 and `AUTOTRAIN_HSP_PASSWORD` in `.env`. The client lives in
 `sources/hsp.py`; the sweep only ever sees the `ArrivalsSource` protocol.
 
+## Run the scheduler
+
+```bash
+uv run python -m autotrain.entrypoints.scheduler --once
+```
+
+Runs the recurring claims jobs: open a draft claim for every entitled delay
+detection that lacks one, then expire claims whose filing window has closed.
+Without `--once` it loops on `AUTOTRAIN_SCHEDULER_INTERVAL_SECONDS`. No
+credentials needed — both jobs read only our own database.
+
 ## Writing a migration
 
 Add `migrations/NNNN_snake_case.sql` with the next number. Never edit a migration
