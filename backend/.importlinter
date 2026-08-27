@@ -24,6 +24,7 @@ type = forbidden
 source_modules =
     autotrain.api
     autotrain.entrypoints
+    autotrain.modules.claims
     autotrain.modules.delays
     autotrain.sources
 forbidden_modules =
@@ -37,11 +38,27 @@ type = forbidden
 source_modules =
     autotrain.api
     autotrain.entrypoints
+    autotrain.modules.claims
     autotrain.modules.journeys
     autotrain.sources
+
 forbidden_modules =
     autotrain.modules.delays.models
     autotrain.modules.delays.repository
+allow_indirect_imports = True
+
+[importlinter:contract:claims-privacy]
+name = claims internals are importable only via claims.service
+type = forbidden
+source_modules =
+    autotrain.api
+    autotrain.entrypoints
+    autotrain.modules.delays
+    autotrain.modules.journeys
+    autotrain.sources
+forbidden_modules =
+    autotrain.modules.claims.models
+    autotrain.modules.claims.repository
 allow_indirect_imports = True
 
 [importlinter:contract:api-does-not-import-repositories]
@@ -52,6 +69,7 @@ source_modules =
 forbidden_modules =
     autotrain.modules.journeys.repository
     autotrain.modules.delays.repository
+    autotrain.modules.claims.repository
 allow_indirect_imports = True
 
 ; --- Layer direction --------------------------------------------------------
