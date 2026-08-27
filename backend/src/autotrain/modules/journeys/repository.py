@@ -11,13 +11,14 @@ either insert knowing about the other.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, datetime
 from uuid import UUID
 
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.journeys.models import AssessableJourney, JourneyRow
+from autotrain.modules.journeys.models import AssessableJourney, ClaimContext, JourneyRow
 
 # The full journeys column list is repeated verbatim in each statement below:
 # core.db maps rows by name and treats an unexpected column as an error, so
@@ -111,6 +112,22 @@ _MARK_UNMATCHED = "UPDATE journeys SET status = 'unmatched' WHERE id = %s AND st
 _ASSIGN_OPERATOR = "UPDATE journeys SET operator_id = %s WHERE id = %s AND operator_id IS NULL"
 
 
+# --- Journey facts for the claims module -----------------------------------
+
+# Batched by design: the claims sweep resolves a whole page of detections in
+# one round trip rather than one query per journey. Not user-scoped, unlike
+# _GET_FOR_USER — the caller here is a background sweep acting for every user,
+# and ownership is already fixed by the detection it started from.
+# LEFT JOIN, not JOIN: a journey with no operator must come back so the sweep
+# can retire it as unclaimable, rather than silently vanishing from the page.
+_CLAIM_CONTEXTS = (
+    "SELECT j.id AS journey_id, j.user_id, j.operator_id, j.travel_date, "
+    "o.claim_window_days "
+    "FROM journeys j LEFT JOIN operators o ON o.id = j.operator_id "
+    "WHERE j.id = ANY(%s)"
+)
+
+
 def list_awaiting_assessment(
     conn: psycopg.Connection,
     cutoff: datetime,
@@ -198,3 +215,10 @@ def leg_exists(
             (user_id, travel_date, origin_crs, destination_crs, scheduled_departure),
         )
     )
+
+
+def claim_contexts(
+    conn: psycopg.Connection, journey_ids: Sequence[UUID]
+) -> dict[UUID, ClaimContext]:
+    rows = db.fetch_all(conn, _CLAIM_CONTEXTS, (list(journey_ids),), row_cls=ClaimContext)
+    return {row.journey_id: row for row in rows}

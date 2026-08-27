@@ -55,6 +55,24 @@ class AssessableJourney:
 
 
 @dataclass(frozen=True)
+class ClaimContext:
+    """The journey facts a Delay Repay claim is built from, for one journey.
+
+    Owned by journeys (its tables) and consumed by the claims module, exactly
+    as AssessableJourney is owned here and consumed by delays. claim_window_days
+    rides along from the operators LEFT JOIN so the filing deadline can be
+    frozen without a second query; both it and operator_id are NULL together,
+    which is precisely the case that cannot become a claim.
+    """
+
+    journey_id: UUID
+    user_id: UUID
+    operator_id: UUID | None
+    travel_date: date
+    claim_window_days: int | None
+
+
+@dataclass(frozen=True)
 class JourneyRow:
     """One row of `journeys` (migration 0005): one dated leg being monitored."""
 

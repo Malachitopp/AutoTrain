@@ -9,6 +9,7 @@ driver knowledge.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, datetime
 from uuid import UUID
 
@@ -22,10 +23,11 @@ from psycopg import errors as pg_errors
 # ImportError, so the public surface is exactly the functions below.
 from autotrain.modules.journeys import repository as _repository
 
-# AssessableJourney is re-exported deliberately: it is the shape this service
-# hands the delay engine, and importing it from here keeps callers off
-# journeys.models (the journeys-privacy contract).
-from autotrain.modules.journeys.models import AssessableJourney, JourneyRow
+# AssessableJourney and ClaimContext are re-exported deliberately: they are the
+# shapes this service hands the delay engine and the claims module, and
+# importing them from here keeps callers off journeys.models (the
+# journeys-privacy contract).
+from autotrain.modules.journeys.models import AssessableJourney, ClaimContext, JourneyRow
 
 # The two constraints that mean "this journey is already tracked":
 # journeys_user_leg_departure_key (0009) is the cross-request guard — every
@@ -165,3 +167,15 @@ def assign_operator(conn: psycopg.Connection, journey_id: UUID, operator_id: UUI
     """Attach an operator to a journey that has none. Never overrides an
     existing match."""
     _repository.assign_operator(conn, journey_id, operator_id)
+
+
+# --- Journey facts for the claims module -----------------------------------
+
+
+def claim_contexts(
+    conn: psycopg.Connection, journey_ids: Sequence[UUID]
+) -> dict[UUID, ClaimContext]:
+    """The user, operator, travel date and filing window for each journey,
+    keyed by journey id. Batched so a claims sweep resolves a page in one
+    round trip; ids with no journey are simply absent from the result."""
+    return _repository.claim_contexts(conn, journey_ids)
