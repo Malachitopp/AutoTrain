@@ -78,7 +78,7 @@ uv run python -m autotrain.entrypoints.scheduler --once
 Runs the recurring claims jobs: open a draft claim for every entitled delay
 detection that lacks one, then expire claims whose filing window has closed.
 Without `--once` it loops on `AUTOTRAIN_SCHEDULER_INTERVAL_SECONDS`. No
-credentials needed — both jobs read only our own database.
+credentials needed — both jobs touch only our own database.
 
 ## Writing a migration
 

@@ -1,5 +1,6 @@
-"""Process type 3 of 4: the scheduler — recurring jobs on an interval
-(ARCHITECTURE §2).
+"""Process type 4 of 4: the scheduler — recurring jobs on an interval
+(ARCHITECTURE §2; the enumeration is api, ingestor, worker, scheduler, and
+the worker — type 3 — is not built yet).
 
 Two jobs today, both from the claims module, both cheap no-ops when their
 work queues are empty:
@@ -42,9 +43,10 @@ def _uk_today(now: datetime) -> date:
 
     file_by is derived from travel_date, a UK timetable day, so "has the
     filing window closed" must be judged against the UK calendar date. The
-    UTC date lags it by an hour a night during BST (the same reasoning as
-    the ingestor's give-up boundary), and using it would expire a claim an
-    hour early on its last valid night.
+    UTC date lags it by an hour a night during BST (the same hour as the
+    ingestor's give-up boundary): judged by it, a claim would still look
+    filable for an hour after its last valid UK day had ended — the
+    deadline must move exactly at UK midnight, not an hour later.
     """
     return now.astimezone(_LONDON).date()
 
