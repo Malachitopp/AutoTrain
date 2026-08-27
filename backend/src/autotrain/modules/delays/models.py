@@ -42,3 +42,17 @@ class ArrivalReport:
     # The operating TOC as reported by the source, when known. Used to resolve
     # operator_id for manually-entered journeys that never named an operator.
     atoc_code: str | None = None
+
+
+@dataclass(frozen=True)
+class UnclaimedDetection:
+    """One entitled detection the claims module has not decided about yet
+    (claims_processed_at IS NULL, 0010). Deliberately narrow: it carries only
+    delay_detections columns, because everything else a claim needs —
+    user, operator, travel date — belongs to journeys and reaches claims
+    through journeys.service."""
+
+    id: UUID
+    journey_id: UUID
+    entitlement_pence: int
+    observed_at: datetime

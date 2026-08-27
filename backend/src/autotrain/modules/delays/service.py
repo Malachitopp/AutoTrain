@@ -33,13 +33,14 @@ import psycopg
 # objects must not be reachable through this namespace, or callers could climb
 # past every import-linter contract.
 from autotrain.modules.delays import repository as _repository
-from autotrain.modules.delays.models import ArrivalReport, Band
+from autotrain.modules.delays.models import ArrivalReport, Band, UnclaimedDetection
 from autotrain.modules.journeys import service as _journeys
 
 # Re-exported names: ArrivalReport/ArrivalsSource are the protocol surface a
 # source implementation (or test fake) builds against; AssessableJourney is
 # the row shape journeys.service hands the sweep; Band feeds
-# compute_entitlement. All importable from here by design.
+# compute_entitlement; UnclaimedDetection is the row shape this service hands
+# the claims module. All importable from here by design.
 from autotrain.modules.journeys.service import AssessableJourney
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,10 @@ __all__ = [
     "AssessableJourney",
     "Band",
     "SweepStats",
+    "UnclaimedDetection",
     "compute_entitlement",
+    "list_unclaimed_detections",
+    "mark_claims_processed",
     "run_sweep",
 ]
 
@@ -289,3 +293,24 @@ def _minutes_late(scheduled: datetime, actual: datetime) -> int:
     are defined in whole minutes — 29m59s is a 29-minute delay."""
     seconds = (actual - scheduled).total_seconds()
     return max(0, int(seconds // 60))
+
+
+# --- Detection lifecycle for the claims module -----------------------------
+# delays owns delay_detections, so the claims module reads and stamps them
+# through here rather than with its own SQL — the mirror image of the sweep
+# above driving journey status transitions through journeys.service
+# (ARCHITECTURE §3: no cross-module table access).
+
+
+def list_unclaimed_detections(conn: psycopg.Connection, limit: int) -> list[UnclaimedDetection]:
+    """Entitled detections the claims module has not decided about yet,
+    oldest observation first. Entitlement-0 detections are excluded: 'late but
+    under threshold' is recorded and never claimed (0006)."""
+    return _repository.list_unclaimed(conn, limit)
+
+
+def mark_claims_processed(conn: psycopg.Connection, detection_id: UUID) -> bool:
+    """Record that claims has finished deciding about this detection — a claim
+    exists, or one provably cannot (0010). True if this call wrote the stamp;
+    False means another claims sweep got there first."""
+    return _repository.mark_claims_processed(conn, detection_id)
