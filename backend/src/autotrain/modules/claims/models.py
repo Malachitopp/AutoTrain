@@ -47,3 +47,10 @@ class ClaimEventRow:
     to_status: str
     detail: str | None
     created_at: datetime
+
+@dataclass(frozen =True) 
+class ClaimTotal:
+    """Recovered pence is the total that the user has received, and pending 
+    is the amount pending to be digested"""
+    recovered_pence: int 
+    pending_pence : int 
