@@ -337,3 +337,62 @@ def test_open_claim_visible_through_api(client: TestClient, conn: psycopg.Connec
     assert resp.status_code == 200
     assert resp.json()["amount_pence"] == ENTITLEMENT
     assert resp.json()["file_by"] == date(2026, 9, 7).isoformat()  # Aug 10 + 28 days
+
+
+class TestClaimSummary:
+    def test_new_users(self, client: TestClient, conn: psycopg.Connection) -> None:
+        user_id = mk_user(conn)
+
+        resp = client.get("/claims/summary", headers=_hdr(user_id))
+
+        assert resp.status_code == 200
+        assert resp.json() == {"recovered_pence": 0, "pending_pence": 0}
+
+    def test_correct_buckets(self, client: TestClient, conn: psycopg.Connection) -> None:
+        user_id = mk_user(conn)
+        operator_id = _mk_operator(conn)
+        paid_claim, _ = _mk_claim(conn, user_id, operator_id)
+        _mk_claim(conn, user_id, operator_id, origin="LDS", entitlement_pence=1000)
+
+        assert transition(conn, paid_claim, "ready")
+        assert transition(conn, paid_claim, "submitted")
+        assert transition(conn, paid_claim, "paid")
+
+        resp = client.get("/claims/summary", headers=_hdr(user_id))
+
+        assert resp.status_code == 200
+        assert resp.json() == {"recovered_pence": 2275, "pending_pence": 1000}
+
+    def test_scoped_to_the_requesting_user(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        owner = mk_user(conn, "owner@example.com")
+        stranger = mk_user(conn, "stranger@example.com")
+        paid_claim, _ = _mk_claim(conn, owner, _mk_operator(conn))
+        assert transition(conn, paid_claim, "ready")
+        assert transition(conn, paid_claim, "submitted")
+        assert transition(conn, paid_claim, "paid")
+
+        # The owner really has money on the books — so the stranger's zeros
+        # below prove scoping, not an accidentally empty database.
+        owner_resp = client.get("/claims/summary", headers=_hdr(owner))
+        assert owner_resp.json()["recovered_pence"] == ENTITLEMENT
+
+        resp = client.get("/claims/summary", headers=_hdr(stranger))
+
+        assert resp.status_code == 200
+        assert resp.json() == {"recovered_pence": 0, "pending_pence": 0}
+
+    def test_summary_route_is_not_shadowed_by_the_claim_id_route(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        """Route-order tripwire. FastAPI matches routes in declaration order,
+        and "/{claim_id}" happily matches the literal segment "summary" —
+        then fails to parse it as a UUID, answering 422. The summary route
+        must stay declared ABOVE "/{claim_id}"; this test fails the moment
+        anyone tidies the router into an order that breaks that."""
+        user_id = mk_user(conn)
+
+        resp = client.get("/claims/summary", headers=_hdr(user_id))
+
+        assert resp.status_code == 200  # 422 here = the route got shadowed again

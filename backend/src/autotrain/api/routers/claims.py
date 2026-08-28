@@ -14,7 +14,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query
 
 from autotrain.api.deps import ConnDep, UserIdDep
-from autotrain.api.schemas import ClaimEventOut, ClaimOut, ClaimPage
+from autotrain.api.schemas import ClaimEventOut, ClaimOut, ClaimPage, ClaimSummaryOut
 from autotrain.modules.claims import service
 
 router = APIRouter(prefix="/claims", tags=["claims"])
@@ -29,6 +29,12 @@ def list_claims(
     rows = service.list_claims(conn, user_id, limit=limit)
     items = [ClaimOut.model_validate(row) for row in rows]
     return ClaimPage(items=items, count=len(items), limit=limit)
+
+
+@router.get("/summary")
+def total_claims(user_id: UserIdDep, conn: ConnDep) -> ClaimSummaryOut:
+
+    return ClaimSummaryOut.model_validate(service.claims_total(conn, user_id))
 
 
 @router.get("/{claim_id}")

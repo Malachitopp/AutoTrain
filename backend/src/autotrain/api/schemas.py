@@ -144,3 +144,12 @@ class ClaimEventOut(BaseModel):
     @field_serializer("created_at")
     def _in_utc(self, value: datetime) -> datetime:
         return value.astimezone(UTC)
+
+
+class ClaimSummaryOut(BaseModel):
+    """money recovered box on the home screen"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    recovered_pence: int
+    pending_pence: int

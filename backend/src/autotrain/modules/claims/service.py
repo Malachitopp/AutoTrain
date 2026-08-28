@@ -38,7 +38,7 @@ import psycopg
 # module objects must not be reachable through this namespace, or callers could
 # climb past every import-linter contract.
 from autotrain.modules.claims import repository as _repository
-from autotrain.modules.claims.models import ClaimEventRow, ClaimRow
+from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal
 from autotrain.modules.delays import service as _delays
 
 # Re-exported: the two row shapes a claim is built from. Callers get them from
@@ -55,12 +55,14 @@ __all__ = [
     "ClaimEventRow",
     "ClaimRow",
     "ClaimSweepStats",
+    "ClaimTotal",
     "ClaimsError",
     "IllegalTransition",
     "NotClaimable",
     "UnclaimedDetection",
     "UnknownClaim",
     "claim_history",
+    "claims_total",
     "expire_overdue",
     "get_claim",
     "list_claims",
@@ -354,3 +356,8 @@ def claim_history(conn: psycopg.Connection, claim_id: UUID) -> list[ClaimEventRo
     """Every recorded transition for a claim, oldest first — the audit of what
     we did on the user's behalf and when (0006)."""
     return _repository.events_for_claim(conn, claim_id)
+
+
+def claims_total(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:
+    """Returns the total claim amount for the user"""
+    return _repository.totals_for_user(conn, user_id)
