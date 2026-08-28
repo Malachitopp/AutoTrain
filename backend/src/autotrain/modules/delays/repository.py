@@ -18,7 +18,12 @@ from uuid import UUID
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.delays.models import Band, OperatorRef, UnclaimedDetection
+from autotrain.modules.delays.models import (
+    Band,
+    DelayDecision,
+    OperatorRef,
+    UnclaimedDetection,
+)
 
 # Guarantee 1 of migration 0006: at most one detection per journey. Rowcount 0
 # means another process decided first — the caller stops, never overwrites.
@@ -62,6 +67,15 @@ _MARK_CLAIMS_PROCESSED = (
     "WHERE id = %s AND claims_processed_at IS NULL"
 )
 
+# Read path for the API. Deliberately NOT ownership-scoped: journeys owns the
+# user->journey relationship, so the caller establishes ownership through
+# journeys.service first — a JOIN to journeys here would cross the module
+# boundary (ARCHITECTURE §3).
+_DECISION_FOR_JOURNEY = (
+    "SELECT actual_arrival, delay_minutes, source, band_percent, entitlement_pence, observed_at "
+    "FROM delay_detections WHERE journey_id = %s"
+)
+
 
 def insert_detection(
     conn: psycopg.Connection,
@@ -98,3 +112,7 @@ def list_unclaimed(conn: psycopg.Connection, limit: int) -> list[UnclaimedDetect
 
 def mark_claims_processed(conn: psycopg.Connection, detection_id: UUID) -> bool:
     return db.execute(conn, _MARK_CLAIMS_PROCESSED, (detection_id,)) == 1
+
+
+def decision_for_journey(conn: psycopg.Connection, journey_id: UUID) -> DelayDecision | None:
+    return db.fetch_one(conn, _DECISION_FOR_JOURNEY, (journey_id,), row_cls=DelayDecision)

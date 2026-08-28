@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from autotrain.api.middleware import TransactionMiddleware
-from autotrain.api.routers import journeys
+from autotrain.api.routers import claims, journeys
 from autotrain.core import db
 
 
@@ -33,6 +33,7 @@ def create_app() -> FastAPI:
     # yield dependency cannot provide that ordering).
     app.add_middleware(TransactionMiddleware)
     app.include_router(journeys.router)
+    app.include_router(claims.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

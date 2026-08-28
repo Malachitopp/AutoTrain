@@ -1,4 +1,4 @@
-"""Wire shapes for the journeys endpoints.
+"""Wire shapes for the journeys and claims endpoints.
 
 Validation happens here, before any SQL runs: a request that would violate a
 0005 constraint fails as a 422 naming the offending field, not as a database
@@ -76,3 +76,71 @@ class JourneyPage(BaseModel):
     items: list[JourneyOut]
     count: int
     limit: int
+
+
+class DecisionOut(BaseModel):
+    """A journey's frozen delay decision. Built straight from a DelayDecision."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    actual_arrival: AwareDatetime
+    delay_minutes: int
+    source: str
+    band_percent: int | None
+    entitlement_pence: int
+    observed_at: AwareDatetime
+
+    @field_serializer("actual_arrival", "observed_at")
+    def _in_utc(self, value: datetime) -> datetime:
+        return value.astimezone(UTC)
+
+
+class ClaimOut(BaseModel):
+    """A claim as the API reports it. Built straight from a ClaimRow.
+
+    user_id (it is the caller), submission_token (an internal idempotency
+    key for operator submission) and detection_id (internal linkage) stay
+    off the wire deliberately.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    journey_id: UUID
+    operator_id: UUID
+    amount_pence: int
+    status: str
+    file_by: date
+    submitted_at: AwareDatetime | None
+    resolved_at: AwareDatetime | None
+    operator_reference: str | None
+    created_at: AwareDatetime
+
+    @field_serializer("submitted_at", "resolved_at", "created_at")
+    def _in_utc(self, value: datetime | None) -> datetime | None:
+        # Unlike JourneyOut's serializer these fields can be NULL (a claim
+        # not yet submitted or resolved), so None passes through.
+        return value.astimezone(UTC) if value is not None else None
+
+
+class ClaimPage(BaseModel):
+    """One page of a user's claims, newest first."""
+
+    items: list[ClaimOut]
+    count: int
+    limit: int
+
+
+class ClaimEventOut(BaseModel):
+    """One audited state transition. from_status None is the creation event."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    from_status: str | None
+    to_status: str
+    detail: str | None
+    created_at: AwareDatetime
+
+    @field_serializer("created_at")
+    def _in_utc(self, value: datetime) -> datetime:
+        return value.astimezone(UTC)

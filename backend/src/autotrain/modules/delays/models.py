@@ -56,3 +56,19 @@ class UnclaimedDetection:
     journey_id: UUID
     entitlement_pence: int
     observed_at: datetime
+
+
+@dataclass(frozen=True)
+class DelayDecision:
+    """The frozen outcome for one journey, as the API reports it: what
+    actually happened and what it is worth. A subset of delay_detections —
+    the notification and claims bookkeeping columns stay internal."""
+
+    actual_arrival: datetime
+    delay_minutes: int
+    source: str
+    # NULL when the delay fell in no band (or no scheme was known) — recorded,
+    # entitled nothing (compute_entitlement's contract).
+    band_percent: int | None
+    entitlement_pence: int
+    observed_at: datetime

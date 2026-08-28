@@ -13,7 +13,8 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query
 
 from autotrain.api.deps import ConnDep, UserIdDep
-from autotrain.api.schemas import JourneyCreate, JourneyOut, JourneyPage
+from autotrain.api.schemas import DecisionOut, JourneyCreate, JourneyOut, JourneyPage
+from autotrain.modules.delays import service as delays
 from autotrain.modules.journeys import service
 
 router = APIRouter(prefix="/journeys", tags=["journeys"])
@@ -64,3 +65,21 @@ def get_journey(journey_id: UUID, conn: ConnDep, user_id: UserIdDep) -> JourneyO
         # Absent and not-yours answer identically: existence never leaks.
         raise HTTPException(status_code=404, detail="journey not found")
     return JourneyOut.model_validate(row)
+
+
+@router.get("/{journey_id}/decision")
+def get_journey_decision(journey_id: UUID, conn: ConnDep, user_id: UserIdDep) -> DecisionOut:
+    """The journey's frozen delay decision — was it late, and what is it worth.
+
+    Ownership is journeys' knowledge and the decision is delays' — hence two
+    service calls: the first is the ownership gate (delays.decision_for_journey
+    is deliberately unscoped), the second the read. Both 404s look identical
+    to a stranger; the detail strings differ only for the journey's owner.
+    """
+    if service.get_journey(conn, journey_id, user_id) is None:
+        raise HTTPException(status_code=404, detail="journey not found")
+    decision = delays.decision_for_journey(conn, journey_id)
+    if decision is None:
+        # Owned, but not yet decided: still awaiting the sweep (or the source).
+        raise HTTPException(status_code=404, detail="no delay decision yet")
+    return DecisionOut.model_validate(decision)

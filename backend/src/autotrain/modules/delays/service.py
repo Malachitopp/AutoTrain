@@ -33,7 +33,7 @@ import psycopg
 # objects must not be reachable through this namespace, or callers could climb
 # past every import-linter contract.
 from autotrain.modules.delays import repository as _repository
-from autotrain.modules.delays.models import ArrivalReport, Band, UnclaimedDetection
+from autotrain.modules.delays.models import ArrivalReport, Band, DelayDecision, UnclaimedDetection
 from autotrain.modules.journeys import service as _journeys
 
 # Re-exported names: ArrivalReport/ArrivalsSource are the protocol surface a
@@ -50,9 +50,11 @@ __all__ = [
     "ArrivalsSource",
     "AssessableJourney",
     "Band",
+    "DelayDecision",
     "SweepStats",
     "UnclaimedDetection",
     "compute_entitlement",
+    "decision_for_journey",
     "list_unclaimed_detections",
     "mark_claims_processed",
     "run_sweep",
@@ -314,3 +316,13 @@ def mark_claims_processed(conn: psycopg.Connection, detection_id: UUID) -> bool:
     exists, or one provably cannot (0010). True if this call wrote the stamp;
     False means another claims sweep got there first."""
     return _repository.mark_claims_processed(conn, detection_id)
+
+
+def decision_for_journey(conn: psycopg.Connection, journey_id: UUID) -> DelayDecision | None:
+    """The frozen delay decision for a journey, or None while it has none.
+
+    NOT ownership-scoped — the journey's owner is journeys' knowledge, so a
+    caller acting for a user must establish ownership through
+    journeys.service.get_journey first (the api router does exactly that).
+    """
+    return _repository.decision_for_journey(conn, journey_id)
