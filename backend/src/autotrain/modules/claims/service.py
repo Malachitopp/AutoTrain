@@ -55,20 +55,20 @@ __all__ = [
     "ClaimEventRow",
     "ClaimRow",
     "ClaimSweepStats",
-    "ClaimsError",
     "ClaimTotal",
+    "ClaimsError",
     "IllegalTransition",
     "NotClaimable",
     "UnclaimedDetection",
     "UnknownClaim",
     "claim_history",
+    "claims_total",
     "expire_overdue",
     "get_claim",
     "list_claims",
     "open_claim",
     "run_claim_sweep",
     "transition",
-    "claims_total",
 ]
 
 # The claim state machine. 0006 defines the set of states; legality of a move
