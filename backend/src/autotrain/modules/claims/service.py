@@ -356,6 +356,6 @@ def claim_history(conn: psycopg.Connection, claim_id: UUID) -> list[ClaimEventRo
     return _repository.events_for_claim(conn, claim_id)
 
 
-def claims_total(conn: psycopg.Connection, user_id: UUID ) -> ClaimTotal:
+def claims_total(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:
     """Returns the total claim amount for the user"""
     return _repository.totals_for_user(conn, user_id)

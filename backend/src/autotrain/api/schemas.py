@@ -145,11 +145,11 @@ class ClaimEventOut(BaseModel):
     def _in_utc(self, value: datetime) -> datetime:
         return value.astimezone(UTC)
 
+
 class ClaimSummaryOut(BaseModel):
     """money recovered box on the home screen"""
 
-    model_config = ConfigDict(from_attributes=True) 
+    model_config = ConfigDict(from_attributes=True)
 
-    recovered_pence:int 
-    pending_pence:int 
-    
+    recovered_pence: int
+    pending_pence: int
