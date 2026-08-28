@@ -153,3 +153,13 @@ class ClaimSummaryOut(BaseModel):
 
     recovered_pence: int
     pending_pence: int
+
+
+class ClaimFilingOut(BaseModel):
+    """The deep-link handoff: where the user files this claim, and the status
+    it was left in. Built straight from a ClaimFiling."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    url: str
+    status: str

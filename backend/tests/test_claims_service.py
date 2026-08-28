@@ -23,12 +23,15 @@ import pytest
 from autotrain.modules.claims import repository as _repository
 from autotrain.modules.claims.service import (
     ClaimContext,
+    FilingUnavailable,
     IllegalTransition,
     NotClaimable,
+    NotFilable,
     UnclaimedDetection,
     UnknownClaim,
     claim_history,
     expire_overdue,
+    file_claim,
     get_claim,
     list_claims,
     open_claim,
@@ -51,18 +54,28 @@ ENTITLEMENT = 2275
 # generated "S00" would be rejected by the database, not by the test.
 DISTINCT_ORIGINS = ("MAN", "LDS", "YRK", "BHM", "LIV", "SHF", "NCL")
 
+# Not a real portal: filing tests only ever check the URL passes through.
+CLAIM_URL = "https://delayrepay.test-railways.example/claim"
+
 
 # --- Row builders ------------------------------------------------------------
 
 
 def _mk_operator(
-    conn: psycopg.Connection, atoc: str = "QQ", claim_window_days: int = CLAIM_WINDOW_DAYS
+    conn: psycopg.Connection,
+    atoc: str = "QQ",
+    claim_window_days: int = CLAIM_WINDOW_DAYS,
+    *,
+    adapter: str = "none",
+    claim_url: str | None = None,
+    is_active: bool = True,
 ) -> UUID:
     return _scalar(
         conn.execute(
-            "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days) "
-            "VALUES (%s, 'Test Railways', 15, %s) RETURNING id",
-            (atoc, claim_window_days),
+            "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days, "
+            "adapter, claim_url, is_active) "
+            "VALUES (%s, 'Test Railways', 15, %s, %s, %s, %s) RETURNING id",
+            (atoc, claim_window_days, adapter, claim_url, is_active),
         )
     )
 
@@ -526,6 +539,240 @@ def test_expire_overdue_leaves_filed_claims_alone(conn: psycopg.Connection) -> N
     assert expire_overdue(conn, claim.file_by + timedelta(days=365)) == 0
     row = _claim(conn, journey_id)
     assert row is not None and row[1] == "submitted"
+
+
+# --- Filing (v1: the deep-link handoff) ---------------------------------------
+
+
+def _filable_claim(conn: psycopg.Connection, user_id: UUID, **operator_kw) -> UUID:
+    """A draft claim whose operator has the deep-link adapter enabled (unless
+    the test overrides that via operator kwargs)."""
+    operator_kw.setdefault("adapter", "deep_link")
+    operator_kw.setdefault("claim_url", CLAIM_URL)
+    operator_id = _mk_operator(conn, **operator_kw)
+    journey_id, detection_id = _entitled_journey(conn, operator_id=operator_id, user_id=user_id)
+    claim = open_claim(conn, _detection_row(conn, detection_id), _context(conn, journey_id))
+    assert claim is not None
+    return claim.id
+
+
+def _status(conn: psycopg.Connection, claim_id: UUID) -> str:
+    return _scalar(conn.execute("SELECT status FROM claims WHERE id = %s", (claim_id,)))
+
+
+def test_file_claim_hands_over_the_link_and_parks_the_claim(conn: psycopg.Connection) -> None:
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+
+    filing = file_claim(conn, claim_id, user_id)
+
+    assert filing is not None
+    assert filing.url == CLAIM_URL
+    assert filing.status == "needs_user"
+    assert _status(conn, claim_id) == "needs_user"
+    # The move is audited like every other transition...
+    history = claim_history(conn, claim_id)
+    assert [(e.from_status, e.to_status) for e in history] == [
+        (None, "draft"),
+        ("draft", "needs_user"),
+    ]
+    assert history[-1].detail == "deep link issued to the user"
+    # ...and from here the deadline sweep leaves the claim alone (the user may
+    # have filed it) — the contract test_expire_overdue_leaves_needs_user_alone
+    # proves from the sweep's side.
+
+
+def test_file_claim_again_returns_the_same_link_and_writes_nothing(
+    conn: psycopg.Connection,
+) -> None:
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+
+    first = file_claim(conn, claim_id, user_id)
+    second = file_claim(conn, claim_id, user_id)
+
+    # Losing your link is recoverable, and recovering it is not an event.
+    assert first == second
+    assert len(claim_history(conn, claim_id)) == 2
+
+
+def test_file_claim_scopes_by_owner(conn: psycopg.Connection) -> None:
+    owner = _mk_user(conn, "owner@example.com")
+    stranger = _mk_user(conn, "stranger@example.com")
+    claim_id = _filable_claim(conn, owner)
+
+    # The stranger sees nothing AND moved nothing; the owner filing afterwards
+    # proves the claim was filable all along (the control for the None above).
+    assert file_claim(conn, claim_id, stranger) is None
+    assert _status(conn, claim_id) == "draft"
+    assert file_claim(conn, claim_id, owner) is not None
+
+
+def test_file_claim_on_an_unknown_claim_is_none(conn: psycopg.Connection) -> None:
+    assert file_claim(conn, uuid4(), _mk_user(conn)) is None
+
+
+def test_file_claim_refuses_a_claim_past_filing(conn: psycopg.Connection) -> None:
+    """ready is queued for v2 auto-submission and submitted is already with
+    the operator — handing the user the form as well would file it twice."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+    assert transition(conn, claim_id, "ready")
+
+    with pytest.raises(NotFilable):
+        file_claim(conn, claim_id, user_id)
+
+    assert transition(conn, claim_id, "submitted")
+    with pytest.raises(NotFilable):
+        file_claim(conn, claim_id, user_id)
+    # The refusals moved nothing and audited nothing.
+    assert _status(conn, claim_id) == "submitted"
+    assert len(claim_history(conn, claim_id)) == 3
+
+
+def test_file_claim_refuses_a_resolved_claim(conn: psycopg.Connection) -> None:
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+    assert transition(conn, claim_id, "expired")
+
+    with pytest.raises(NotFilable):
+        file_claim(conn, claim_id, user_id)
+
+
+def test_file_claim_refuses_an_overdue_back_claim(conn: psycopg.Connection) -> None:
+    """A back-claim past its window is created on purpose (open_claim) and
+    expired by the nightly sweep. Filing must not beat the sweep to it:
+    needs_user is a state the sweep never expires, so handing out the link
+    would leave the dead amount in pending_pence forever."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+    deadline = TRAVEL_DATE + timedelta(days=CLAIM_WINDOW_DAYS)
+
+    with pytest.raises(NotFilable):
+        file_claim(conn, claim_id, user_id, today=deadline + timedelta(days=1))
+    # Left in draft, so the deadline sweep still gives it an audited 'expired'.
+    assert _status(conn, claim_id) == "draft"
+    assert len(claim_history(conn, claim_id)) == 1
+
+
+def test_file_claim_allows_the_deadline_day_itself(conn: psycopg.Connection) -> None:
+    """file_by is the last day that still counts — the same boundary as the
+    sweep (test_expire_overdue_leaves_claims_inside_the_window)."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+    deadline = TRAVEL_DATE + timedelta(days=CLAIM_WINDOW_DAYS)
+
+    filing = file_claim(conn, claim_id, user_id, today=deadline)
+
+    assert filing is not None and filing.status == "needs_user"
+
+
+def test_file_claim_without_an_enabled_adapter(conn: psycopg.Connection) -> None:
+    """0008 seeds every operator at 'none' until its portal URL is verified —
+    those claims exist and accrue, but there is no link to hand out yet."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id, adapter="none", claim_url=None)
+
+    with pytest.raises(FilingUnavailable):
+        file_claim(conn, claim_id, user_id)
+    assert _status(conn, claim_id) == "draft"
+
+
+def test_file_claim_refuses_an_inactive_operators_stale_link(conn: psycopg.Connection) -> None:
+    """is_active gates filing, not pricing: a franchise change kills the
+    portal, so the stored link must not be handed out — even to a claim that
+    was filable before the change."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id, is_active=False)
+
+    with pytest.raises(FilingUnavailable):
+        file_claim(conn, claim_id, user_id)
+    assert _status(conn, claim_id) == "draft"
+
+
+def test_file_claim_stops_reissuing_after_the_operator_dies(conn: psycopg.Connection) -> None:
+    """The idempotent needs_user path still goes through the adapter gate: a
+    user who lost their link and asks again after a franchise change must get
+    FilingUnavailable, never the dead portal's URL. This pins the ordering —
+    the adapter check sits ABOVE the needs_user early-return."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+    assert file_claim(conn, claim_id, user_id) is not None
+    conn.execute("UPDATE operators SET is_active = false WHERE atoc_code = 'QQ'")
+
+    with pytest.raises(FilingUnavailable):
+        file_claim(conn, claim_id, user_id)
+
+
+def test_file_claim_form_submit_is_unavailable_in_v1(conn: psycopg.Connection) -> None:
+    """'form_submit' names the v2 server-side adapter, which does not exist
+    yet: the registry must miss, never fall back to handing out the form —
+    v2 would also submit it, the double filing NotFilable exists to stop."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id, adapter="form_submit")
+
+    with pytest.raises(FilingUnavailable):
+        file_claim(conn, claim_id, user_id)
+    assert _status(conn, claim_id) == "draft"
+
+
+def test_file_claim_survives_losing_the_double_tap_race(
+    conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two taps race: the loser's guarded UPDATE finds the winner already
+    parked the claim in needs_user (rowcount 0), and must degrade to handing
+    back the same link — never an error. The interleaving needs threads, so
+    the winner is injected just before the loser's UPDATE runs; every
+    statement is still real SQL against the real schema."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+    real_transition = _repository.transition
+
+    def _the_other_tap_wins_first(
+        inner: psycopg.Connection, *, claim_id: UUID, from_status: str, to_status: str
+    ) -> bool:
+        assert real_transition(conn, claim_id=claim_id, from_status="draft", to_status="needs_user")
+        return real_transition(
+            inner, claim_id=claim_id, from_status=from_status, to_status=to_status
+        )
+
+    monkeypatch.setattr(_repository, "transition", _the_other_tap_wins_first)
+
+    filing = file_claim(conn, claim_id, user_id)
+
+    assert filing is not None
+    assert filing.url == CLAIM_URL
+    assert _status(conn, claim_id) == "needs_user"
+    # The loser wrote no audit event: only the creation event exists (the
+    # injected winner drives the repository directly, so its event is not
+    # simulated). A loser that wrote 'deep link issued' despite rowcount 0
+    # would corrupt the trail — this is the assert that catches it.
+    assert len(claim_history(conn, claim_id)) == 1
+
+
+def test_file_claim_losing_to_a_real_state_change_raises(
+    conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other race branch: the winner was not a second tap but the expiry
+    sweep. The loser must refuse with the domain error the router turns into
+    a 409 — anything else escaping here is a 500 for the user."""
+    user_id = _mk_user(conn)
+    claim_id = _filable_claim(conn, user_id)
+    real_transition = _repository.transition
+
+    def _the_sweep_wins_first(
+        inner: psycopg.Connection, *, claim_id: UUID, from_status: str, to_status: str
+    ) -> bool:
+        assert real_transition(conn, claim_id=claim_id, from_status="draft", to_status="expired")
+        return real_transition(
+            inner, claim_id=claim_id, from_status=from_status, to_status=to_status
+        )
+
+    monkeypatch.setattr(_repository, "transition", _the_sweep_wins_first)
+
+    with pytest.raises(NotFilable):
+        file_claim(conn, claim_id, user_id)
+    assert _status(conn, claim_id) == "expired"
 
 
 # --- Read paths --------------------------------------------------------------

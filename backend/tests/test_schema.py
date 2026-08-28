@@ -59,6 +59,18 @@ class TestMigrationsApply:
         }
         assert expected <= tables, f"missing: {expected - tables}"
 
+    def test_launch_operators_file_by_deep_link(self, conn: psycopg.Connection) -> None:
+        """0011's payload. The UPDATE ... FROM (VALUES ...) join silently
+        matches zero rows on a mistyped ATOC code — the suite would stay green
+        while that operator's users get 'no filing link' forever. This pins
+        exactly WHO got the adapter; 0011's CHECK already guarantees each has
+        a URL."""
+        rows = conn.execute(
+            "SELECT atoc_code, claim_url FROM operators WHERE adapter = 'deep_link'"
+        ).fetchall()
+        assert {r[0] for r in rows} == {"NT", "VT", "GR", "SW", "TL", "GN", "SN", "SE", "GW"}
+        assert all(r[1] for r in rows)
+
     def test_operators_seeded_with_bands(self, conn: psycopg.Connection) -> None:
         n_ops = _scalar(conn.execute("SELECT count(*) FROM operators"))
         assert n_ops >= 20

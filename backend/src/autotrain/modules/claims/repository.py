@@ -5,9 +5,11 @@ type; values travel as `%s` parameters, never in the text. Every function takes
 the connection first and never commits — the caller owns the transaction, which
 is what lets a status change and its audit event land atomically.
 
-Scope note: only claims-owned tables (claims, claim_events) appear here. The
-detection being claimed and the journey it belongs to are read through
-delays.service and journeys.service (ARCHITECTURE §3).
+Scope note: claims-owned tables (claims, claim_events) and the operators
+reference data appear here — the same carve-out the delays repository makes
+for thresholds and bands. The detection being claimed and the journey it
+belongs to are read through delays.service and journeys.service
+(ARCHITECTURE §3).
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from uuid import UUID
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal
+from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal, OperatorFiling
 
 # The full claims column list is repeated verbatim in each statement below, for
 # the same two reasons as in the journeys repository: core.db maps rows by name
@@ -114,6 +116,12 @@ _EVENTS_FOR_CLAIM = (
     "FROM claim_events WHERE claim_id = %s ORDER BY created_at, id"
 )
 
+# Shared operator reference data, the filing slice: which adapter, where its
+# portal lives, and whether the operator still runs trains. is_active rides
+# along because it gates FILING, not pricing — delays' _OPERATOR_BY_ATOC
+# documents the pricing half of that rule.
+_OPERATOR_FILING = "SELECT adapter, claim_url, is_active FROM operators WHERE id = %s"
+
 _TOTALS_FOR_USER = (
     "SELECT COALESCE(SUM(amount_pence) FILTER (WHERE status = 'paid'), 0) AS recovered_pence,"
     "COALESCE(SUM(amount_pence) FILTER "
@@ -193,6 +201,15 @@ def list_overdue(conn: psycopg.Connection, today: date, limit: int) -> list[tupl
 
 def events_for_claim(conn: psycopg.Connection, claim_id: UUID) -> list[ClaimEventRow]:
     return db.fetch_all(conn, _EVENTS_FOR_CLAIM, (claim_id,), row_cls=ClaimEventRow)
+
+
+def operator_filing(conn: psycopg.Connection, operator_id: UUID) -> OperatorFiling:
+    row = db.fetch_one(conn, _OPERATOR_FILING, (operator_id,), row_cls=OperatorFiling)
+    if row is None:
+        # Unreachable: claims.operator_id is a NOT NULL FK, so the operator
+        # row exists for as long as the claim naming it does.
+        raise RuntimeError(f"operator {operator_id} not found")
+    return row
 
 
 def totals_for_user(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:
