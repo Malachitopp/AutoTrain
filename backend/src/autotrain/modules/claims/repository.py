@@ -1,4 +1,4 @@
-"""SQL for the claims module — same rules as the journeys and delays repositories.
+﻿"""SQL for the claims module — same rules as the journeys and delays repositories.
 
 Constants are deliberately unannotated so pyright keeps their LiteralString
 type; values travel as `%s` parameters, never in the text. Every function takes
@@ -18,7 +18,7 @@ from uuid import UUID
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.claims.models import ClaimEventRow, ClaimRow
+from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal
 
 # The full claims column list is repeated verbatim in each statement below, for
 # the same two reasons as in the journeys repository: core.db maps rows by name
@@ -114,6 +114,13 @@ _EVENTS_FOR_CLAIM = (
     "FROM claim_events WHERE claim_id = %s ORDER BY created_at, id"
 )
 
+_TOTALS_FOR_USER = (
+    "SELECT COALESCE(SUM(amount_pence) FILTER (WHERE status = 'paid'), 0) AS recovered_pence,"
+    "COALESCE(SUM(amount_pence) FILTER "
+    "(WHERE status IN ('draft', 'ready', 'needs_user', 'submitted', 'approved')), 0) AS pending_pence "
+    "FROM claims "
+    "WHERE user_id = %s"
+)
 
 def insert_claim(
     conn: psycopg.Connection,
@@ -184,3 +191,9 @@ def list_overdue(conn: psycopg.Connection, today: date, limit: int) -> list[tupl
 
 def events_for_claim(conn: psycopg.Connection, claim_id: UUID) -> list[ClaimEventRow]:
     return db.fetch_all(conn, _EVENTS_FOR_CLAIM, (claim_id,), row_cls=ClaimEventRow)
+
+def totals_for_user(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:
+    row = db.fetch_one(conn, _TOTALS_FOR_USER, (user_id,), row_cls=ClaimTotal)
+    if row is None:
+        raise RuntimeError("totals aggregate produced no row") 
+    return row 
