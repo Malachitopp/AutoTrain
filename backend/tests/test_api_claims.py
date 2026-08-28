@@ -352,7 +352,7 @@ class TestClaimSummary:
         user_id = mk_user(conn)
         operator_id = _mk_operator(conn)
         paid_claim, _ = _mk_claim(conn, user_id, operator_id)
-        _mk_claim(conn, user_id, operator_id, origin="LDS")
+        _mk_claim(conn, user_id, operator_id, origin="LDS", entitlement_pence=1000)
 
         assert transition(conn, paid_claim, "ready")
         assert transition(conn, paid_claim, "submitted")
@@ -361,7 +361,7 @@ class TestClaimSummary:
         resp = client.get("/claims/summary", headers=_hdr(user_id))
 
         assert resp.status_code == 200
-        assert resp.json() == {"recovered_pence": 2275, "pending_pence": 2275}
+        assert resp.json() == {"recovered_pence": 2275, "pending_pence": 1000}
 
     def test_scoped_to_the_requesting_user(
         self, client: TestClient, conn: psycopg.Connection
