@@ -344,7 +344,7 @@ class TestClaimSummary:
 
         resp = client.get("/claims/summary", headers=_hdr(user_id))
 
-        assert resp.status_code == 200 
+        assert resp.status_code == 200
         assert resp.json() == {"recovered_pence": 0, "pending_pence": 0 }
 
     def test_correct_buckets(self, client:TestClient, conn:psycopg.Connection)->None:
@@ -353,13 +353,13 @@ class TestClaimSummary:
         paid_claim, _ = _mk_claim(conn, user_id, operator_id)
         _mk_claim(conn, user_id, operator_id, origin = "LDS")
 
-        assert transition(conn, paid_claim, "ready") 
+        assert transition(conn, paid_claim, "ready")
         assert transition(conn, paid_claim, "submitted")
-        assert transition(conn, paid_claim, "paid") 
+        assert transition(conn, paid_claim, "paid")
 
         resp = client.get("/claims/summary", headers = _hdr(user_id))
 
-        assert resp.status_code == 200 
+        assert resp.status_code == 200
         assert resp.json() == {"recovered_pence": 2275, "pending_pence": 2275}
 
     def test_scoped_to_the_requesting_user(

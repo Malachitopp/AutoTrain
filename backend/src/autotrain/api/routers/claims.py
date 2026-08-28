@@ -31,7 +31,7 @@ def list_claims(
     return ClaimPage(items=items, count=len(items), limit=limit)
 
 @router.get("/summary")
-def total_claims(user_id: UUID, conn: ConnDep) -> ClaimSummaryOut:
+def total_claims(user_id: UserIdDep, conn: ConnDep) -> ClaimSummaryOut:
 
     return ClaimSummaryOut.model_validate(service.claims_total(conn, user_id))
 
