@@ -16,12 +16,12 @@ user's money. So the correctness path is this sweep, driven by
 constraint (0006). When the event bus lands it can call `open_claim` to cut
 latency; it will not become the thing that guarantees the claim exists.
 
-Not here yet, deliberately: the per-operator adapters (§6) and the consent gate
-on auto-filing (`users.claim_consent_at`). Both belong at the point of FILING,
-not creation — and consent lives in the identity module, which has no code to
-route the question through yet. A claim is created for every entitled
-detection; whether we may file it on the user's behalf is the next question,
-not this one.
+Filing, v1 (§6, PLAN §3 item 4): `file_claim` hands the user their operator's
+claim page and parks the claim in needs_user — the deep-link half of the
+adapter layer (adapters.py). Still absent, deliberately: the form_submit
+adapters (v2) and the consent gate on auto-filing (`users.claim_consent_at`).
+Consent gates filing ON THE USER'S BEHALF, which v2 does and a deep link the
+user opens themselves does not.
 """
 
 from __future__ import annotations
@@ -29,14 +29,16 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import psycopg
 
 # Private aliases for the same reason as in the other module services: the
 # module objects must not be reachable through this namespace, or callers could
 # climb past every import-linter contract.
+from autotrain.modules.claims import adapters as _adapters
 from autotrain.modules.claims import repository as _repository
 from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal
 from autotrain.modules.delays import service as _delays
@@ -49,21 +51,30 @@ from autotrain.modules.journeys.service import ClaimContext
 
 logger = logging.getLogger(__name__)
 
+# The filing deadline is a UK-calendar question, exactly as in the scheduler's
+# expiry job (_uk_today there): during BST, 23:30 UTC is already tomorrow in
+# London, and the window closes at UK midnight, not UTC midnight.
+_LONDON = ZoneInfo("Europe/London")
+
 __all__ = [
     "LEGAL_TRANSITIONS",
     "ClaimContext",
     "ClaimEventRow",
+    "ClaimFiling",
     "ClaimRow",
     "ClaimSweepStats",
     "ClaimTotal",
     "ClaimsError",
+    "FilingUnavailable",
     "IllegalTransition",
     "NotClaimable",
+    "NotFilable",
     "UnclaimedDetection",
     "UnknownClaim",
     "claim_history",
     "claims_total",
     "expire_overdue",
+    "file_claim",
     "get_claim",
     "list_claims",
     "open_claim",
@@ -119,6 +130,16 @@ class NotClaimable(ClaimsError):
     """The journey has no operator, so there is no scheme to file against and
     claims.operator_id (NOT NULL) cannot be satisfied. The sweep filters these
     out before calling; this exists so direct callers get a domain error."""
+
+
+class NotFilable(ClaimsError):
+    """The claim is not in a state the user can file from — already filed, or
+    already resolved. The current status rides in the message."""
+
+
+class FilingUnavailable(ClaimsError):
+    """The claim's operator has no working filing route: no adapter enabled
+    yet, or the operator is inactive and its dead portal must not be linked."""
 
 
 @dataclass
@@ -336,6 +357,88 @@ def expire_overdue(
         if len(page) < batch_size:
             break
     return expired
+
+
+# --- Filing (v1: the deep-link handoff) --------------------------------------
+
+
+@dataclass(frozen=True)
+class ClaimFiling:
+    """What file_claim hands back: where the user files, and the status the
+    claim was left in."""
+
+    url: str
+    status: str
+
+
+def file_claim(
+    conn: psycopg.Connection, claim_id: UUID, user_id: UUID, *, today: date | None = None
+) -> ClaimFiling | None:
+    """Hand the user their claim's deep link, moving it draft -> needs_user.
+
+    The v1 filing flow (§6, PLAN §3 item 4): we never touch the operator — the
+    user gets the operator's claim page and files it themselves, which is why
+    no consent gate applies here. needs_user means exactly "the user holds the
+    link now": from this moment the deadline sweep stops expiring the claim
+    (expire_overdue), because the user may have filed it.
+
+    None when the claim is absent or someone else's — the same never-leak
+    contract as get_claim. NotFilable when the claim has moved past filing OR
+    past its file_by deadline (same boundary as expire_overdue: file_by is the
+    last day that counts). FilingUnavailable when the operator has no working
+    deep link. Calling this again in needs_user returns the same link and
+    writes nothing: losing your link must always be recoverable.
+
+    `today` exists for tests; production callers leave it None and get the
+    current UK date.
+    """
+    claim = _repository.get_for_user(conn, claim_id, user_id)
+    if claim is None:
+        return None
+    if claim.status not in ("draft", "needs_user"):
+        raise NotFilable(f"claim is {claim.status} and can no longer be filed by the user")
+    if today is None:
+        today = datetime.now(tz=_LONDON).date()
+    if claim.file_by < today:
+        # A back-claim past its window, reached before the nightly sweep
+        # expired it. Handing out the link would park the claim in needs_user
+        # — a state the sweep never expires — so its dead amount would sit in
+        # pending_pence forever. Refuse instead; the sweep will give the draft
+        # an audited 'expired'.
+        raise NotFilable(f"the filing window closed on {claim.file_by.isoformat()}")
+
+    operator = _repository.operator_filing(conn, claim.operator_id)
+    adapter = _adapters.for_operator(operator)
+    if adapter is None:
+        raise FilingUnavailable("no filing link is available for this operator")
+    link = adapter.deep_link(operator, claim)
+
+    if claim.status == "needs_user":
+        return ClaimFiling(url=link.url, status="needs_user")
+
+    # Guarded on the status read above rather than through transition(), which
+    # re-reads before guarding: the race this must survive is the user's own
+    # double tap, and the losing tap has to degrade to "here is your link" —
+    # transition() would instead re-read needs_user and raise IllegalTransition
+    # on the needs_user -> needs_user edge.
+    if _repository.transition(conn, claim_id=claim.id, from_status="draft", to_status="needs_user"):
+        _repository.insert_event(
+            conn,
+            claim_id=claim.id,
+            from_status="draft",
+            to_status="needs_user",
+            detail="deep link issued to the user",
+        )
+        return ClaimFiling(url=link.url, status="needs_user")
+
+    # Lost the race. If the winner also parked it in needs_user, the link is
+    # still the right answer; anything else is a real state change.
+    current = _repository.get_by_id(conn, claim.id)
+    if current is not None and current.status == "needs_user":
+        return ClaimFiling(url=link.url, status="needs_user")
+    raise NotFilable(
+        f"claim moved to {current.status if current is not None else 'gone'} during filing"
+    )
 
 
 # --- Read paths -------------------------------------------------------------

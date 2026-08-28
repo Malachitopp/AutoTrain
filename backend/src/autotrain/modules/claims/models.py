@@ -56,3 +56,17 @@ class ClaimTotal:
 
     recovered_pence: int
     pending_pence: int
+
+
+@dataclass(frozen=True)
+class OperatorFiling:
+    """How claims are filed with one operator — the slice of the `operators`
+    reference data (0003) that filing reads, mirroring delays' OperatorRef.
+
+    is_active gates FILING, not pricing (the delays repository documents the
+    other half of that rule): a franchise change kills the claims portal, but
+    never a past entitlement."""
+
+    adapter: str
+    claim_url: str | None
+    is_active: bool

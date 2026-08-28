@@ -1,4 +1,5 @@
-"""API tests for the claims and delay-decision read endpoints.
+"""API tests for the claims endpoints — the reads, the deep-link filing
+write (POST /claims/{claim_id}/file), and the delay-decision endpoint.
 
 Same harness as test_api_journeys: the client drives HTTP through the real app
 with get_conn overridden to the rollback `conn` fixture — routing, schemas,
@@ -25,6 +26,9 @@ from conftest import mk_user, scalar
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
 ENTITLEMENT = 2275
 
+# Not a real portal: filing tests only ever check the URL passes through.
+CLAIM_URL = "https://delayrepay.test-railways.example/claim"
+
 
 # Same fixture as test_api_journeys (promote to conftest on the fourth copy —
 # the house rule recorded there).
@@ -50,12 +54,19 @@ def client(conn: psycopg.Connection) -> Iterator[TestClient]:
 # --- Row builders (through the service where a service writer exists) --------
 
 
-def _mk_operator(conn: psycopg.Connection, atoc: str = "QQ") -> UUID:
+def _mk_operator(
+    conn: psycopg.Connection,
+    atoc: str = "QQ",
+    *,
+    adapter: str = "none",
+    claim_url: str | None = None,
+) -> UUID:
     return scalar(
         conn.execute(
-            "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days) "
-            "VALUES (%s, 'Test Railways', 15, 28) RETURNING id",
-            (atoc,),
+            "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days, "
+            "adapter, claim_url) "
+            "VALUES (%s, 'Test Railways', 15, 28, %s, %s) RETURNING id",
+            (atoc, adapter, claim_url),
         )
     )
 
@@ -231,6 +242,97 @@ class TestClaimEvents:
         claim_id, _ = _mk_claim(conn, owner, _mk_operator(conn))
 
         assert client.get(f"/claims/{claim_id}/events", headers=_hdr(stranger)).status_code == 404
+
+
+class TestFileClaim:
+    def _filable_claim(self, conn: psycopg.Connection, user_id: UUID) -> UUID:
+        operator_id = _mk_operator(conn, adapter="deep_link", claim_url=CLAIM_URL)
+        claim_id, _ = _mk_claim(conn, user_id, operator_id)
+        return claim_id
+
+    def test_files_and_returns_the_link(self, client: TestClient, conn: psycopg.Connection) -> None:
+        user_id = mk_user(conn)
+        claim_id = self._filable_claim(conn, user_id)
+
+        resp = client.post(f"/claims/{claim_id}/file", headers=_hdr(user_id))
+
+        assert resp.status_code == 200
+        assert resp.json() == {"url": CLAIM_URL, "status": "needs_user"}
+        status = scalar(conn.execute("SELECT status FROM claims WHERE id = %s", (claim_id,)))
+        assert status == "needs_user"
+
+    def test_filing_twice_returns_the_same_link(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        """Losing the link must be recoverable: the second request answers
+        identically and appends nothing to the audit trail."""
+        user_id = mk_user(conn)
+        claim_id = self._filable_claim(conn, user_id)
+
+        first = client.post(f"/claims/{claim_id}/file", headers=_hdr(user_id))
+        second = client.post(f"/claims/{claim_id}/file", headers=_hdr(user_id))
+
+        assert (first.status_code, second.status_code) == (200, 200)
+        assert first.json() == second.json()
+        events = scalar(
+            conn.execute("SELECT count(*) FROM claim_events WHERE claim_id = %s", (claim_id,))
+        )
+        assert events == 2  # creation + the one handoff
+
+    def test_someone_elses_claim_is_404(self, client: TestClient, conn: psycopg.Connection) -> None:
+        owner = mk_user(conn, "owner@example.com")
+        stranger = mk_user(conn, "stranger@example.com")
+        claim_id = self._filable_claim(conn, owner)
+
+        resp = client.post(f"/claims/{claim_id}/file", headers=_hdr(stranger))
+
+        # Indistinguishable from absent — and nothing moved.
+        assert resp.status_code == 404
+        assert resp.json() == client.post(f"/claims/{uuid4()}/file", headers=_hdr(stranger)).json()
+        status = scalar(conn.execute("SELECT status FROM claims WHERE id = %s", (claim_id,)))
+        assert status == "draft"
+
+    def test_a_strangers_unfilable_claim_is_still_404(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        """Ownership is checked BEFORE any state guard: a stranger probing a
+        submitted claim gets the same 404 as for one that does not exist. A
+        409 'claim is submitted' here would leak both existence and state."""
+        owner = mk_user(conn, "owner@example.com")
+        stranger = mk_user(conn, "stranger@example.com")
+        claim_id = self._filable_claim(conn, owner)
+        assert transition(conn, claim_id, "ready")
+        assert transition(conn, claim_id, "submitted")
+
+        resp = client.post(f"/claims/{claim_id}/file", headers=_hdr(stranger))
+
+        assert resp.status_code == 404
+        assert resp.json() == client.post(f"/claims/{uuid4()}/file", headers=_hdr(stranger)).json()
+
+    def test_an_already_filed_claim_is_409(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        user_id = mk_user(conn)
+        claim_id = self._filable_claim(conn, user_id)
+        assert transition(conn, claim_id, "ready")
+        assert transition(conn, claim_id, "submitted")
+
+        resp = client.post(f"/claims/{claim_id}/file", headers=_hdr(user_id))
+
+        assert resp.status_code == 409
+        assert "submitted" in resp.json()["detail"]
+
+    def test_an_operator_without_an_adapter_is_409(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        user_id = mk_user(conn)
+        claim_id, _ = _mk_claim(conn, user_id, _mk_operator(conn))  # adapter stays 'none'
+
+        resp = client.post(f"/claims/{claim_id}/file", headers=_hdr(user_id))
+
+        assert resp.status_code == 409
+        status = scalar(conn.execute("SELECT status FROM claims WHERE id = %s", (claim_id,)))
+        assert status == "draft"
 
 
 # --- /journeys/{id}/decision --------------------------------------------------

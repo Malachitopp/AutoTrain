@@ -57,6 +57,7 @@ source_modules =
     autotrain.modules.journeys
     autotrain.sources
 forbidden_modules =
+    autotrain.modules.claims.adapters
     autotrain.modules.claims.models
     autotrain.modules.claims.repository
 allow_indirect_imports = True
