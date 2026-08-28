@@ -338,26 +338,27 @@ def test_open_claim_visible_through_api(client: TestClient, conn: psycopg.Connec
     assert resp.json()["amount_pence"] == ENTITLEMENT
     assert resp.json()["file_by"] == date(2026, 9, 7).isoformat()  # Aug 10 + 28 days
 
+
 class TestClaimSummary:
-    def test_new_users(self, client:TestClient, conn: psycopg.Connection) -> None:
+    def test_new_users(self, client: TestClient, conn: psycopg.Connection) -> None:
         user_id = mk_user(conn)
 
         resp = client.get("/claims/summary", headers=_hdr(user_id))
 
         assert resp.status_code == 200
-        assert resp.json() == {"recovered_pence": 0, "pending_pence": 0 }
+        assert resp.json() == {"recovered_pence": 0, "pending_pence": 0}
 
-    def test_correct_buckets(self, client:TestClient, conn:psycopg.Connection)->None:
+    def test_correct_buckets(self, client: TestClient, conn: psycopg.Connection) -> None:
         user_id = mk_user(conn)
         operator_id = _mk_operator(conn)
         paid_claim, _ = _mk_claim(conn, user_id, operator_id)
-        _mk_claim(conn, user_id, operator_id, origin = "LDS")
+        _mk_claim(conn, user_id, operator_id, origin="LDS")
 
         assert transition(conn, paid_claim, "ready")
         assert transition(conn, paid_claim, "submitted")
         assert transition(conn, paid_claim, "paid")
 
-        resp = client.get("/claims/summary", headers = _hdr(user_id))
+        resp = client.get("/claims/summary", headers=_hdr(user_id))
 
         assert resp.status_code == 200
         assert resp.json() == {"recovered_pence": 2275, "pending_pence": 2275}
@@ -381,7 +382,6 @@ class TestClaimSummary:
 
         assert resp.status_code == 200
         assert resp.json() == {"recovered_pence": 0, "pending_pence": 0}
-
 
     def test_summary_route_is_not_shadowed_by_the_claim_id_route(
         self, client: TestClient, conn: psycopg.Connection

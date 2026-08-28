@@ -30,6 +30,7 @@ def list_claims(
     items = [ClaimOut.model_validate(row) for row in rows]
     return ClaimPage(items=items, count=len(items), limit=limit)
 
+
 @router.get("/summary")
 def total_claims(user_id: UserIdDep, conn: ConnDep) -> ClaimSummaryOut:
 
@@ -54,5 +55,3 @@ def claim_events(claim_id: UUID, conn: ConnDep, user_id: UserIdDep) -> list[Clai
     if service.get_claim(conn, claim_id, user_id) is None:
         raise HTTPException(status_code=404, detail="claim not found")
     return [ClaimEventOut.model_validate(row) for row in service.claim_history(conn, claim_id)]
-
-

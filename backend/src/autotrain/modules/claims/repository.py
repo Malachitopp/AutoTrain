@@ -1,4 +1,4 @@
-﻿"""SQL for the claims module — same rules as the journeys and delays repositories.
+"""SQL for the claims module — same rules as the journeys and delays repositories.
 
 Constants are deliberately unannotated so pyright keeps their LiteralString
 type; values travel as `%s` parameters, never in the text. Every function takes
