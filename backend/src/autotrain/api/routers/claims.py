@@ -14,7 +14,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query
 
 from autotrain.api.deps import ConnDep, UserIdDep
-from autotrain.api.schemas import ClaimEventOut, ClaimOut, ClaimPage
+from autotrain.api.schemas import ClaimEventOut, ClaimOut, ClaimPage, ClaimSummaryOut
 from autotrain.modules.claims import service
 
 router = APIRouter(prefix="/claims", tags=["claims"])
@@ -49,3 +49,8 @@ def claim_events(claim_id: UUID, conn: ConnDep, user_id: UserIdDep) -> list[Clai
     if service.get_claim(conn, claim_id, user_id) is None:
         raise HTTPException(status_code=404, detail="claim not found")
     return [ClaimEventOut.model_validate(row) for row in service.claim_history(conn, claim_id)]
+
+@router.get("/summary")
+def total_claims(user_id:UUID, conn: ConnDep) -> ClaimSummaryOut:
+     
+    return  ClaimSummaryOut.model_validate(service.claims_total(conn, user_id))
