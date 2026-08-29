@@ -1,6 +1,5 @@
 """Process type 4 of 4: the scheduler — recurring jobs on an interval
-(ARCHITECTURE §2; the enumeration is api, ingestor, worker, scheduler, and
-the worker — type 3 — is not built yet).
+(ARCHITECTURE §2; the enumeration is api, ingestor, worker, scheduler).
 
 Two jobs today, both from the claims module, both cheap no-ops when their
 work queues are empty:
