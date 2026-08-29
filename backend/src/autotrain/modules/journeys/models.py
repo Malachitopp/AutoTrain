@@ -73,6 +73,23 @@ class ClaimContext:
 
 
 @dataclass(frozen=True)
+class NotificationContext:
+    """The journey facts a user-facing message is built from, for one journey:
+    who to tell, and which train the news is about ("your 08:14 to EUS").
+
+    Owned by journeys and consumed by the notification worker, exactly as
+    ClaimContext is consumed by claims. CRS codes, not station names — a
+    stations reference table is future work, and the code is honest until
+    then."""
+
+    journey_id: UUID
+    user_id: UUID
+    origin_crs: str
+    destination_crs: str
+    scheduled_departure: datetime
+
+
+@dataclass(frozen=True)
 class JourneyRow:
     """One row of `journeys` (migration 0005): one dated leg being monitored."""
 

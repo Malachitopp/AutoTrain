@@ -23,11 +23,16 @@ from psycopg import errors as pg_errors
 # ImportError, so the public surface is exactly the functions below.
 from autotrain.modules.journeys import repository as _repository
 
-# AssessableJourney and ClaimContext are re-exported deliberately: they are the
-# shapes this service hands the delay engine and the claims module, and
-# importing them from here keeps callers off journeys.models (the
-# journeys-privacy contract).
-from autotrain.modules.journeys.models import AssessableJourney, ClaimContext, JourneyRow
+# AssessableJourney, ClaimContext and NotificationContext are re-exported
+# deliberately: they are the shapes this service hands the delay engine, the
+# claims module and the notification worker, and importing them from here
+# keeps callers off journeys.models (the journeys-privacy contract).
+from autotrain.modules.journeys.models import (
+    AssessableJourney,
+    ClaimContext,
+    JourneyRow,
+    NotificationContext,
+)
 
 # The two constraints that mean "this journey is already tracked":
 # journeys_user_leg_departure_key (0009) is the cross-request guard — every
@@ -179,3 +184,12 @@ def claim_contexts(
     keyed by journey id. Batched so a claims sweep resolves a page in one
     round trip; ids with no journey are simply absent from the result."""
     return _repository.claim_contexts(conn, journey_ids)
+
+
+def notification_contexts(
+    conn: psycopg.Connection, journey_ids: Sequence[UUID]
+) -> dict[UUID, NotificationContext]:
+    """Who to tell and which train the news is about, for each journey, keyed
+    by journey id — the notification worker's version of claim_contexts.
+    Batched; ids with no journey are simply absent from the result."""
+    return _repository.notification_contexts(conn, journey_ids)
