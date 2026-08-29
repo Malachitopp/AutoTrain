@@ -69,6 +69,19 @@ https://raildata.org.uk, subscribe to HSP, then set `AUTOTRAIN_HSP_EMAIL`
 and `AUTOTRAIN_HSP_PASSWORD` in `.env`. The client lives in
 `sources/hsp.py`; the sweep only ever sees the `ArrivalsSource` protocol.
 
+## Run the worker
+
+```bash
+uv run python -m autotrain.entrypoints.worker --once
+```
+
+Pushes "You're owed £6.40 (50%) for your 08:14 to EUS." for every qualifying
+delay detection nobody has been told about, exactly once, to each of the
+user's registered devices. Refuses to start until `AUTOTRAIN_PUSH_SENDER`
+names a sender; `log` delivers to the process log — the development
+transport until FCM/APNs arrive with the app. Without `--once` it loops on
+`AUTOTRAIN_WORKER_INTERVAL_SECONDS`.
+
 ## Run the scheduler
 
 ```bash

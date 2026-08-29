@@ -26,6 +26,8 @@ source_modules =
     autotrain.entrypoints
     autotrain.modules.claims
     autotrain.modules.delays
+    autotrain.modules.identity
+    autotrain.modules.notifications
     autotrain.sources
 forbidden_modules =
     autotrain.modules.journeys.models
@@ -39,7 +41,9 @@ source_modules =
     autotrain.api
     autotrain.entrypoints
     autotrain.modules.claims
+    autotrain.modules.identity
     autotrain.modules.journeys
+    autotrain.modules.notifications
     autotrain.sources
 
 forbidden_modules =
@@ -54,12 +58,33 @@ source_modules =
     autotrain.api
     autotrain.entrypoints
     autotrain.modules.delays
+    autotrain.modules.identity
     autotrain.modules.journeys
+    autotrain.modules.notifications
     autotrain.sources
 forbidden_modules =
     autotrain.modules.claims.adapters
     autotrain.modules.claims.models
     autotrain.modules.claims.repository
+allow_indirect_imports = True
+
+; notifications has no privacy contract yet, deliberately: the module owns no
+; tables and so has no models.py or repository.py to protect. The contract
+; appears with the first migration that gives it state.
+[importlinter:contract:identity-privacy]
+name = identity internals are importable only via identity.service
+type = forbidden
+source_modules =
+    autotrain.api
+    autotrain.entrypoints
+    autotrain.modules.claims
+    autotrain.modules.delays
+    autotrain.modules.journeys
+    autotrain.modules.notifications
+    autotrain.sources
+forbidden_modules =
+    autotrain.modules.identity.models
+    autotrain.modules.identity.repository
 allow_indirect_imports = True
 
 [importlinter:contract:api-does-not-import-repositories]
@@ -71,6 +96,7 @@ forbidden_modules =
     autotrain.modules.journeys.repository
     autotrain.modules.delays.repository
     autotrain.modules.claims.repository
+    autotrain.modules.identity.repository
 allow_indirect_imports = True
 
 ; --- Layer direction --------------------------------------------------------

@@ -51,7 +51,9 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 # Tests may assert and may build throwaway SQL against a disposable database.
-"tests/**" = ["S101", "S608"]
+# S105/S106: bandit reads the word "token" as a hardcoded password — test
+# fixtures pass fake push tokens by that name on purpose.
+"tests/**" = ["S101", "S105", "S106", "S608"]
 
 [tool.pyright]
 venvPath = "."
