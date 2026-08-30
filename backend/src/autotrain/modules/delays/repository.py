@@ -75,7 +75,7 @@ _MARK_CLAIMS_PROCESSED = (
 # worker glide past them instead of blocking — two workers can drain the same
 # queue without ever picking up the same detection.
 _LIST_UNNOTIFIED = (
-    "SELECT id, journey_id, delay_minutes, band_percent, entitlement_pence, observed_at "
+    "SELECT id, journey_id, band_percent, entitlement_pence, observed_at "
     "FROM delay_detections "
     "WHERE notified_at IS NULL AND entitlement_pence > 0 "
     "ORDER BY observed_at, id LIMIT %s "

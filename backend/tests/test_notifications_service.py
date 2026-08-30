@@ -86,13 +86,17 @@ def _mk_detection(
     *,
     entitlement_pence: int = ENTITLEMENT,
     band_percent: int | None = 50,
+    observed_at: datetime | None = None,
 ) -> UUID:
+    # observed_at defaults to now(), which is TRANSACTION time — every
+    # detection a test creates shares it, so queue order tie-breaks on random
+    # uuids. A test that depends on which row heads the queue must say so.
     return _scalar(
         conn.execute(
             "INSERT INTO delay_detections (journey_id, actual_arrival, delay_minutes, "
-            "source, band_percent, entitlement_pence) "
-            "VALUES (%s, now(), 45, 'hsp', %s, %s) RETURNING id",
-            (journey_id, band_percent, entitlement_pence),
+            "source, band_percent, entitlement_pence, observed_at) "
+            "VALUES (%s, now(), 45, 'hsp', %s, %s, COALESCE(%s, now())) RETURNING id",
+            (journey_id, band_percent, entitlement_pence, observed_at),
         )
     )
 
@@ -265,7 +269,13 @@ def test_one_failing_detection_does_not_block_the_rest(conn: psycopg.Connection)
     lucky = _mk_user(conn, "lucky@example.com")
     _mk_device(conn, unlucky, token="tok-bad")
     _mk_device(conn, lucky, token="tok-good")
-    bad_detection = _mk_detection(conn, _mk_journey(conn, unlucky))
+    # The bad detection must deterministically HEAD the queue: this test
+    # exists to prove the widened fetch sees past a poisoned first row, and
+    # with a shared transaction-time observed_at the order would be a uuid
+    # coin flip — half of all runs would never enter the widening path.
+    bad_detection = _mk_detection(
+        conn, _mk_journey(conn, unlucky), observed_at=_SUMMER_DEP_UTC + timedelta(hours=3)
+    )
     good_detection = _mk_detection(conn, _mk_journey(conn, lucky, origin="LDS"))
     sender = _OneBadToken()
 
@@ -275,6 +285,39 @@ def test_one_failing_detection_does_not_block_the_rest(conn: psycopg.Connection)
     assert sender.sent == ["tok-good"]
     assert _notified_at(conn, good_detection) is not None
     assert _notified_at(conn, bad_detection) is None
+
+
+def test_partial_multi_device_failure_keeps_the_detection_queued(
+    conn: psycopg.Connection,
+) -> None:
+    """The module docstring's explicit trade, pinned: when one of a user's
+    devices fails, the detection is NOT stamped — the retry will push the
+    successful device again (annoying) rather than letting the failed device
+    never hear about the money (silence)."""
+
+    class _SecondSendFails:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send(self, *, token: str, platform: str, title: str, body: str) -> None:
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("apns hiccup")
+
+    user_id = _mk_user(conn)
+    _mk_device(conn, user_id, token="tok-phone", platform="ios")
+    _mk_device(conn, user_id, token="tok-tablet", platform="android")
+    detection_id = _mk_detection(conn, _mk_journey(conn, user_id))
+
+    stats = run_notification_sweep(conn, _SecondSendFails())
+
+    assert (stats.errors, stats.notified) == (1, 0)
+    assert _notified_at(conn, detection_id) is None
+
+    # The retry delivers to BOTH devices — the documented duplicate residue.
+    recovered = _RecordingSender()
+    assert run_notification_sweep(conn, recovered).notified == 1
+    assert len(recovered.sent) == 2
 
 
 def test_sweep_pages_through_more_than_one_batch(conn: psycopg.Connection) -> None:

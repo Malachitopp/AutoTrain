@@ -62,13 +62,12 @@ class UnclaimedDetection:
 class PendingNotification:
     """One qualifying detection the user has not been told about yet
     (notified_at IS NULL, 0006). Narrow like UnclaimedDetection, but it keeps
-    delay_minutes and band_percent: they are part of the message ("50%"),
-    while the journey facts the message also needs — who, which train, where
-    to — belong to journeys and reach the worker through journeys.service."""
+    band_percent: the message renders it ("50%"). The journey facts the
+    message also needs — who, which train, where to — belong to journeys and
+    reach the worker through journeys.service."""
 
     id: UUID
     journey_id: UUID
-    delay_minutes: int
     band_percent: int | None
     entitlement_pence: int
     observed_at: datetime

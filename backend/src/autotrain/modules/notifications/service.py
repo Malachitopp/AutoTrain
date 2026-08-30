@@ -61,13 +61,24 @@ _LONDON = ZoneInfo("Europe/London")
 
 _TITLE = "Delay Repay"
 
+# A sweep gives up after this many distinct send failures: past a handful the
+# provider is down, not the rows. It bounds the widened fetch below (limit
+# never exceeds batch_size + this), and turns an outage into "attempt a few,
+# defer the backlog to the next interval" instead of a sweep that re-locks and
+# re-sorts every failed row again on every page for as long as the queue lasts.
+_MAX_FAILURES_PER_SWEEP = 25
+
 
 class PushSender(Protocol):
     """Anything that can deliver one push notification to one device.
 
     Implementations may raise; the sweep isolates the failure to that one
-    detection and retries it next pass. Delivery is fire-and-forget — no
-    receipt comes back, which is why the stamp, not the send, is the record.
+    detection and retries it next pass. They MUST bound their own delivery
+    time (connect/read timeouts): the sweep holds row locks on the whole page
+    while send() runs, and a hung send would hold them indefinitely — locks
+    the claims sweep's stamp on the same rows queues behind. Delivery is
+    fire-and-forget — no receipt comes back, which is why the stamp, not the
+    send, is the record.
     """
 
     def send(self, *, token: str, platform: str, title: str, body: str) -> None: ...
@@ -101,7 +112,11 @@ def run_notification_sweep(
     commits at each PAGE boundary — not per detection, because the row locks
     are what hold the exactly-once guarantee together and they only release
     at commit. A crash therefore re-delivers at most one page; batch_size is
-    the duplicate ceiling as much as it is a memory bound.
+    the duplicate ceiling as much as it is a memory bound. The flip side:
+    the locks are held WHILE sending, so batch_size also bounds how long a
+    concurrent writer to the same rows (the claims sweep's stamp) can queue
+    behind a page of real network sends — keep it modest, and see the
+    PushSender timeout requirement.
 
     A detection whose user has no registered device is stamped and counted in
     no_target: tokens arrive when the user installs the app, and week-old news
@@ -124,6 +139,11 @@ def run_notification_sweep(
         fresh = [d for d in page if d.id not in failed]
         if not fresh:
             break
+        # However wide the fetch, at most batch_size sends share one commit —
+        # that keeps the crash-duplicate ceiling at one page even when another
+        # worker has stamped our failures and the widened page is all fresh.
+        overflow = len(fresh) > batch_size
+        fresh = fresh[:batch_size]
         contexts = _journeys.notification_contexts(conn, [d.journey_id for d in fresh])
         targets = _identity.push_targets(conn, [c.user_id for c in contexts.values()])
 
@@ -142,7 +162,14 @@ def run_notification_sweep(
                 failed.add(detection.id)
         if commit_each:
             conn.commit()
-        if len(page) < limit:
+        if len(failed) >= _MAX_FAILURES_PER_SWEEP:
+            logger.warning(
+                "notification sweep: %d send failures — provider trouble, deferring the "
+                "rest of the queue to the next pass",
+                len(failed),
+            )
+            break
+        if len(page) < limit and not overflow:
             # This page reached the end of the queue, and everything in it is
             # now stamped or failed — the next fetch could only repeat failures.
             break

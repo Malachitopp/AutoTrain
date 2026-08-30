@@ -18,9 +18,11 @@ from uuid import UUID
 import psycopg
 import pytest
 
+from autotrain.core import db
 from autotrain.core.config import get_settings
 from autotrain.entrypoints import worker
 from autotrain.modules.delays import service as delays
+from autotrain.modules.notifications import service as notifications
 from autotrain.sources.push import LogPushSender
 from conftest import TEST_DATABASE_URL
 from conftest import mk_user as _mk_user
@@ -119,6 +121,66 @@ def test_skip_locked_hides_in_flight_rows_from_a_second_worker() -> None:
             worker_b.rollback()
 
 
+@pytest.mark.usefixtures("pool")
+def test_page_boundary_commits_survive_multiple_pages() -> None:
+    """The production transaction shape, which the rollback-conn tests cannot
+    reach: batch_size=1 with commit_each=True forces a real conn.commit()
+    BETWEEN pages inside one db.transaction() context — the exact seam a
+    refactor to the usual with-block pattern would break, and only on the
+    second page."""
+
+    class _Recording:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def send(self, *, token: str, platform: str, title: str, body: str) -> None:
+            self.sent.append(token)
+
+    with _committed_world() as (setup, user_id, first_detection):
+        ticket_id = _scalar(
+            setup.execute(
+                "INSERT INTO tickets (user_id, kind, price_pence, source) "
+                "VALUES (%s, 'single', 1280, 'manual') RETURNING id",
+                (user_id,),
+            )
+        )
+        second_journey = _scalar(
+            setup.execute(
+                "INSERT INTO journeys (user_id, ticket_id, origin_crs, destination_crs, "
+                "travel_date, scheduled_departure, scheduled_arrival, status) "
+                "VALUES (%s, %s, 'LDS', 'KGX', %s, %s, %s, 'assessed') RETURNING id",
+                (user_id, ticket_id, _DEP.date(), _DEP, _DEP + timedelta(hours=2)),
+            )
+        )
+        second_detection = _scalar(
+            setup.execute(
+                "INSERT INTO delay_detections (journey_id, actual_arrival, delay_minutes, "
+                "source, band_percent, entitlement_pence) "
+                "VALUES (%s, %s, 45, 'hsp', 50, 640) RETURNING id",
+                (second_journey, _DEP + timedelta(hours=2, minutes=45)),
+            )
+        )
+        sender = _Recording()
+
+        with db.transaction() as conn:
+            stats = notifications.run_notification_sweep(
+                conn, sender, batch_size=1, commit_each=True
+            )
+
+        assert (stats.notified, stats.pushes) == (2, 2)
+        assert len(sender.sent) == 2
+        for detection_id in (first_detection, second_detection):
+            assert (
+                _scalar(
+                    setup.execute(
+                        "SELECT notified_at FROM delay_detections WHERE id = %s",
+                        (detection_id,),
+                    )
+                )
+                is not None
+            )
+
+
 # --- The entrypoint end to end ------------------------------------------------
 
 
@@ -147,15 +209,26 @@ def test_sweep_once_delivers_and_stamps(caplog: pytest.LogCaptureFixture) -> Non
 
 
 @pytest.mark.usefixtures("migrated_database")
-def test_main_once_runs_and_exits(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_once_runs_and_exits(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     """The documented operational entrypoint: sender built, pool opened, one
     sweep, pool closed, clean return. No pool fixture — main() owns the pool
-    lifecycle itself, and an empty queue is a fine sweep."""
+    lifecycle itself, and an empty queue is a fine sweep.
+
+    The log assertions are what make this discriminate: main() swallows sweep
+    exceptions by design (retry-next-interval), so a worker whose every sweep
+    failed would still exit cleanly — only the 'complete' line proves the
+    sweep actually ran."""
     monkeypatch.setenv("AUTOTRAIN_PUSH_SENDER", "log")
     monkeypatch.setattr(sys, "argv", ["autotrain-worker", "--once"])
     get_settings.cache_clear()
     try:
-        worker.main()  # raising (or hanging without --once) is the failure mode
+        with caplog.at_level(logging.INFO, logger="autotrain.entrypoints.worker"):
+            worker.main()
     finally:
         # Never leak push_sender=log into other tests' cached settings.
         get_settings.cache_clear()
+
+    assert "notification sweep complete" in caplog.text
+    assert "notification sweep failed" not in caplog.text
