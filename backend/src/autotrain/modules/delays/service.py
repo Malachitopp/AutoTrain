@@ -33,7 +33,13 @@ import psycopg
 # objects must not be reachable through this namespace, or callers could climb
 # past every import-linter contract.
 from autotrain.modules.delays import repository as _repository
-from autotrain.modules.delays.models import ArrivalReport, Band, DelayDecision, UnclaimedDetection
+from autotrain.modules.delays.models import (
+    ArrivalReport,
+    Band,
+    DelayDecision,
+    PendingNotification,
+    UnclaimedDetection,
+)
 from autotrain.modules.journeys import service as _journeys
 
 # Re-exported names: ArrivalReport/ArrivalsSource are the protocol surface a
@@ -51,12 +57,15 @@ __all__ = [
     "AssessableJourney",
     "Band",
     "DelayDecision",
+    "PendingNotification",
     "SweepStats",
     "UnclaimedDetection",
     "compute_entitlement",
     "decision_for_journey",
     "list_unclaimed_detections",
+    "list_unnotified_detections",
     "mark_claims_processed",
+    "mark_notified",
     "run_sweep",
 ]
 
@@ -297,11 +306,13 @@ def _minutes_late(scheduled: datetime, actual: datetime) -> int:
     return max(0, int(seconds // 60))
 
 
-# --- Detection lifecycle for the claims module -----------------------------
-# delays owns delay_detections, so the claims module reads and stamps them
-# through here rather than with its own SQL — the mirror image of the sweep
-# above driving journey status transitions through journeys.service
-# (ARCHITECTURE §3: no cross-module table access).
+# --- Detection lifecycle for the downstream consumers ----------------------
+# delays owns delay_detections, so the claims module and the notification
+# worker read and stamp them through here rather than with their own SQL —
+# the mirror image of the sweep above driving journey status transitions
+# through journeys.service (ARCHITECTURE §3: no cross-module table access).
+# Each consumer has its own stamp column and partial-index queue:
+# claims_processed_at (0010) and notified_at (0006).
 
 
 def list_unclaimed_detections(conn: psycopg.Connection, limit: int) -> list[UnclaimedDetection]:
@@ -316,6 +327,25 @@ def mark_claims_processed(conn: psycopg.Connection, detection_id: UUID) -> bool:
     exists, or one provably cannot (0010). True if this call wrote the stamp;
     False means another claims sweep got there first."""
     return _repository.mark_claims_processed(conn, detection_id)
+
+
+def list_unnotified_detections(conn: psycopg.Connection, limit: int) -> list[PendingNotification]:
+    """Qualifying detections the user has not been told about yet, oldest
+    observation first — the notification worker's queue (0006 guarantee 3).
+
+    The returned rows are LOCKED (FOR UPDATE SKIP LOCKED) until the caller's
+    transaction commits or rolls back: the caller must stamp each row with
+    mark_notified in the same transaction as the send, and a concurrent
+    worker skips the locked rows instead of double-sending. Entitlement-0
+    detections are excluded: 'late but under threshold' is recorded, never
+    notified (0006)."""
+    return _repository.list_unnotified(conn, limit)
+
+
+def mark_notified(conn: psycopg.Connection, detection_id: UUID) -> bool:
+    """Record that the user has been told about this detection. True if this
+    call wrote the stamp; False means another worker got there first."""
+    return _repository.mark_notified(conn, detection_id)
 
 
 def decision_for_journey(conn: psycopg.Connection, journey_id: UUID) -> DelayDecision | None:

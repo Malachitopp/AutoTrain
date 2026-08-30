@@ -22,6 +22,7 @@ from autotrain.modules.delays.models import (
     Band,
     DelayDecision,
     OperatorRef,
+    PendingNotification,
     UnclaimedDetection,
 )
 
@@ -65,6 +66,26 @@ _LIST_UNCLAIMED = (
 _MARK_CLAIMS_PROCESSED = (
     "UPDATE delay_detections SET claims_processed_at = now() "
     "WHERE id = %s AND claims_processed_at IS NULL"
+)
+
+# The notification worker's queue, exactly as 0006 prescribed it ("worker:
+# WHERE notified_at IS NULL FOR UPDATE SKIP LOCKED") and as
+# delay_detections_pending_idx serves it. FOR UPDATE locks the returned rows
+# until the caller's transaction settles, and SKIP LOCKED makes a second
+# worker glide past them instead of blocking — two workers can drain the same
+# queue without ever picking up the same detection.
+_LIST_UNNOTIFIED = (
+    "SELECT id, journey_id, band_percent, entitlement_pence, observed_at "
+    "FROM delay_detections "
+    "WHERE notified_at IS NULL AND entitlement_pence > 0 "
+    "ORDER BY observed_at, id LIMIT %s "
+    "FOR UPDATE SKIP LOCKED"
+)
+
+# Guarded like the claims stamp: the exactly-once guarantee (0006 guarantee 3)
+# is the row lock above plus this stamp committing with the send.
+_MARK_NOTIFIED = (
+    "UPDATE delay_detections SET notified_at = now() WHERE id = %s AND notified_at IS NULL"
 )
 
 # Read path for the API. Deliberately NOT ownership-scoped: journeys owns the
@@ -112,6 +133,14 @@ def list_unclaimed(conn: psycopg.Connection, limit: int) -> list[UnclaimedDetect
 
 def mark_claims_processed(conn: psycopg.Connection, detection_id: UUID) -> bool:
     return db.execute(conn, _MARK_CLAIMS_PROCESSED, (detection_id,)) == 1
+
+
+def list_unnotified(conn: psycopg.Connection, limit: int) -> list[PendingNotification]:
+    return db.fetch_all(conn, _LIST_UNNOTIFIED, (limit,), row_cls=PendingNotification)
+
+
+def mark_notified(conn: psycopg.Connection, detection_id: UUID) -> bool:
+    return db.execute(conn, _MARK_NOTIFIED, (detection_id,)) == 1
 
 
 def decision_for_journey(conn: psycopg.Connection, journey_id: UUID) -> DelayDecision | None:

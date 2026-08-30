@@ -18,7 +18,12 @@ from uuid import UUID
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.journeys.models import AssessableJourney, ClaimContext, JourneyRow
+from autotrain.modules.journeys.models import (
+    AssessableJourney,
+    ClaimContext,
+    JourneyRow,
+    NotificationContext,
+)
 
 # The full journeys column list is repeated verbatim in each statement below:
 # core.db maps rows by name and treats an unexpected column as an error, so
@@ -127,6 +132,14 @@ _CLAIM_CONTEXTS = (
     "WHERE j.id = ANY(%s)"
 )
 
+# Batched and un-scoped for the same reasons as _CLAIM_CONTEXTS — the caller
+# is the notification worker acting for every user, and the user to notify is
+# an answer, not an input.
+_NOTIFICATION_CONTEXTS = (
+    "SELECT id AS journey_id, user_id, origin_crs, destination_crs, scheduled_departure "
+    "FROM journeys WHERE id = ANY(%s)"
+)
+
 
 def list_awaiting_assessment(
     conn: psycopg.Connection,
@@ -221,4 +234,13 @@ def claim_contexts(
     conn: psycopg.Connection, journey_ids: Sequence[UUID]
 ) -> dict[UUID, ClaimContext]:
     rows = db.fetch_all(conn, _CLAIM_CONTEXTS, (list(journey_ids),), row_cls=ClaimContext)
+    return {row.journey_id: row for row in rows}
+
+
+def notification_contexts(
+    conn: psycopg.Connection, journey_ids: Sequence[UUID]
+) -> dict[UUID, NotificationContext]:
+    rows = db.fetch_all(
+        conn, _NOTIFICATION_CONTEXTS, (list(journey_ids),), row_cls=NotificationContext
+    )
     return {row.journey_id: row for row in rows}

@@ -59,6 +59,21 @@ class UnclaimedDetection:
 
 
 @dataclass(frozen=True)
+class PendingNotification:
+    """One qualifying detection the user has not been told about yet
+    (notified_at IS NULL, 0006). Narrow like UnclaimedDetection, but it keeps
+    band_percent: the message renders it ("50%"). The journey facts the
+    message also needs — who, which train, where to — belong to journeys and
+    reach the worker through journeys.service."""
+
+    id: UUID
+    journey_id: UUID
+    band_percent: int | None
+    entitlement_pence: int
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
 class DelayDecision:
     """The frozen outcome for one journey, as the API reports it: what
     actually happened and what it is worth. A subset of delay_detections —

@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     # 'unmatched' and leaves the sweep.
     ingestor_give_up_days: int = Field(default=7, ge=1)
 
+    # Worker (notification delivery) — process type 3. 'none' makes the worker
+    # refuse to start; 'log' delivers to the process log — the development
+    # transport until FCM/APNs arrive with the app.
+    push_sender: Literal["none", "log"] = "none"
+    worker_batch_size: int = Field(default=100, ge=1)
+    # Shorter than the sweeps: a push is the product's magic moment, and its
+    # value decays by the minute. Each idle poll is one indexed no-op query.
+    worker_interval_seconds: float = Field(default=60.0, gt=0)
+
     # Scheduler (claims jobs) — process type 4. Interval matches the ingestor:
     # both jobs are cheap no-op sweeps when their partial-index work queues are
     # empty, so a short interval costs almost nothing.
