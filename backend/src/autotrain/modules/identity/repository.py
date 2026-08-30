@@ -17,6 +17,7 @@ import psycopg
 
 from autotrain.core import db
 from autotrain.modules.identity.models import PushTarget
+from datetime import datetime 
 
 # Batched like journeys' _CLAIM_CONTEXTS: the worker resolves a whole page of
 # detections' users in one round trip. Ordered so a user's devices come back
@@ -24,6 +25,18 @@ from autotrain.modules.identity.models import PushTarget
 _PUSH_TARGETS = (
     "SELECT user_id, platform, push_token FROM devices "
     "WHERE user_id = ANY(%s) ORDER BY user_id, created_at, id"
+)
+
+_INSERT_LOGIN_TOKEN = (
+    "INSERT INTO login_tokens (email, token_hash, expires_at) "
+    "VALUES (%s, %s, %s)"
+)
+
+_SPEND_LOGIN_TOKEN = (  
+    "UPDATE login_tokens "
+    "SET used_at = now() " 
+    "WHERE token_hash = %s AND used_at IS NULL AND expires_at > now()" 
+    "RETURNING email"
 )
 
 
@@ -35,3 +48,12 @@ def push_targets(
     for row in rows:
         grouped.setdefault(row.user_id, []).append(row)
     return grouped
+
+def insert_login_token(conn:psycopg.Connection, email:str,
+                        token_hash:str, expires_at:datetime) -> None:
+    
+    db.execute(conn, _INSERT_LOGIN_TOKEN, (email, token_hash, expires_at))
+
+
+def spend_login_token(conn:psycopg.Connection, token_hash:str)-> str | None:
+    return db.fetch_value(conn, _SPEND_LOGIN_TOKEN, (token_hash,))
