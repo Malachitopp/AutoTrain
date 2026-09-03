@@ -163,3 +163,21 @@ class ClaimFilingOut(BaseModel):
 
     url: str
     status: str
+
+
+class LoginRequest(BaseModel):
+    """A request to log in, which the service turns into a one-time token."""
+
+    email: str
+
+
+class LoginVerify(BaseModel):
+    """A one-time token the service turns into a session token."""
+
+    token: str
+
+
+class SessionOut(BaseModel):
+    """A session token the client can use to authenticate future requests."""
+
+    access_token: str

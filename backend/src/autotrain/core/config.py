@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # transport until FCM/APNs arrive with the app.
     push_sender: Literal["none", "log"] = "none"
     worker_batch_size: int = Field(default=100, ge=1)
+
+    email_sender: Literal["none", "log"] = "none"
+    jwt_secret: SecretStr | None = None
+
     # Shorter than the sweeps: a push is the product's magic moment, and its
     # value decays by the minute. Each idle poll is one indexed no-op query.
     worker_interval_seconds: float = Field(default=60.0, gt=0)
