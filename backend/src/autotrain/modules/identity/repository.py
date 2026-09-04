@@ -27,10 +27,12 @@ _PUSH_TARGETS = (
     "WHERE user_id = ANY(%s) ORDER BY user_id, created_at, id"
 )
 
-_INSERT_LOGIN_TOKEN = "INSERT INTO login_tokens (email, token_hash, expires_at) VALUES (%s, %s, %s)"
+# The two noqas: bandit's S105 sees "TOKEN" in a name and suspects a hardcoded
+# credential — these are SQL statements about tokens, not tokens.
+_INSERT_LOGIN_TOKEN = "INSERT INTO login_tokens (email, token_hash, expires_at) VALUES (%s, %s, %s)"  # noqa: S105
 
 _SPEND_LOGIN_TOKEN = (
-    "UPDATE login_tokens "
+    "UPDATE login_tokens "  # noqa: S105 — the directive sits on the diagnostic's line
     "SET used_at = now() "
     "WHERE token_hash = %s AND used_at IS NULL AND expires_at > now() "
     "RETURNING email"

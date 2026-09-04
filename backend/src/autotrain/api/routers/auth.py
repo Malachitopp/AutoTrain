@@ -8,7 +8,6 @@ from autotrain.core.config import get_settings
 from autotrain.modules.identity import service
 from autotrain.sources.email import LogEmailSender
 
-
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 

@@ -5,8 +5,9 @@ Identity owns users, auth and devices (ARCHITECTURE §3). Two faces today:
 * Magic-link auth (§9): request_login mints a single-use token, stores only
   its hash, and mails the raw token through an injected EmailSender;
   verify_login spends the token and answers with a user id, creating the
-  account on first login. The api layer's X-User-Id stub dies when the auth
-  routes land on top of these.
+  account on first login. issue_session_token/session_user mint and verify
+  the JWTs that deps.current_user_id now checks on every request — these
+  functions replaced the api layer's X-User-Id stub.
 * push_targets: where a user's push notifications can be delivered, for the
   notification worker.
 """
@@ -15,12 +16,12 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-import jwt
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
+import jwt
 import psycopg
 
 # Private alias for the same reason as in the other module services: the
@@ -35,11 +36,11 @@ from autotrain.modules.identity.models import PushTarget
 __all__ = [
     "EmailSender",
     "PushTarget",
+    "issue_session_token",
     "push_targets",
     "request_login",
-    "verify_login",
-    "issue_session_token",
     "session_user",
+    "verify_login",
 ]
 
 

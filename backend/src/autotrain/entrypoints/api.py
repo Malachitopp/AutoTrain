@@ -8,6 +8,7 @@ configuration, so the same image runs locally and in ECS unchanged.
 from __future__ import annotations
 
 import logging
+
 import uvicorn
 
 from autotrain.core.config import get_settings

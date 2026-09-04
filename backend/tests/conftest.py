@@ -25,9 +25,20 @@ DEFAULT_TEST_URL = "postgresql://autotrain:autotrain@localhost:5433/autotrain_te
 TEST_DATABASE_URL = os.environ.get("AUTOTRAIN_TEST_DATABASE_URL", DEFAULT_TEST_URL)
 os.environ["AUTOTRAIN_DATABASE_URL"] = TEST_DATABASE_URL
 
+# Session tokens are minted and verified with this fixed secret — 32+ bytes,
+# the RFC 7518 floor pyjwt warns below. Forced (not setdefault) so a
+# developer's .env can never leak into what the suite signs with; set before
+# any autotrain import so the cached Settings sees it. email_sender is pinned
+# to 'none' for the same reason: the 503 refusal path must be the suite's
+# reality regardless of what the developer's .env turned on.
+TEST_JWT_SECRET = "test-secret-not-for-production-padded-to-32-bytes"
+os.environ["AUTOTRAIN_JWT_SECRET"] = TEST_JWT_SECRET
+os.environ["AUTOTRAIN_EMAIL_SENDER"] = "none"
+
 from autotrain.core import db  # noqa: E402
 from autotrain.core.config import get_settings  # noqa: E402
 from autotrain.core.migrate import migrate_up  # noqa: E402
+from autotrain.modules.identity import service as identity  # noqa: E402
 
 get_settings.cache_clear()
 
@@ -126,3 +137,11 @@ def mk_user(conn: psycopg.Connection, email: str = "user@example.com") -> Any:
             (email,),
         )
     )
+
+
+def auth_header(user_id: Any) -> dict[str, str]:
+    """Authorization header for user_id — a real JWT minted with the suite's
+    fixed secret, so API tests authenticate exactly the way production does
+    (signature and expiry checked per request, no dependency overrides)."""
+    token = identity.issue_session_token(user_id, secret=TEST_JWT_SECRET)
+    return {"Authorization": f"Bearer {token}"}

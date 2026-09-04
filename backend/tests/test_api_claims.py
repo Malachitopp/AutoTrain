@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 from autotrain.api.app import create_app
 from autotrain.api.deps import get_conn
 from autotrain.modules.claims.service import open_claim, run_claim_sweep, transition
-from conftest import mk_user, scalar
+from conftest import auth_header, mk_user, scalar
 
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
 ENTITLEMENT = 2275
@@ -127,7 +127,7 @@ def _mk_claim(
 
 
 def _hdr(user_id: UUID) -> dict[str, str]:
-    return {"X-User-Id": str(user_id)}
+    return auth_header(user_id)
 
 
 # --- /claims ------------------------------------------------------------------

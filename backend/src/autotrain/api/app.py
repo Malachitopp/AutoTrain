@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from autotrain.api.middleware import TransactionMiddleware
-from autotrain.api.routers import claims, journeys, auth
+from autotrain.api.routers import auth, claims, journeys
 from autotrain.core import db
 
 
