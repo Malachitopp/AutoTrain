@@ -1,4 +1,4 @@
-"""Wire shapes for the journeys and claims endpoints.
+"""Wire shapes for the journeys, claims and auth endpoints.
 
 Validation happens here, before any SQL runs: a request that would violate a
 0005 constraint fails as a 422 naming the offending field, not as a database
@@ -181,3 +181,23 @@ class SessionOut(BaseModel):
     """A session token the client can use to authenticate future requests."""
 
     access_token: str
+
+
+class UserOut(BaseModel):
+    """The signed-in user as /auth/me reports it. Built straight from a
+    UserProfile. claim_consent_at is on the wire so the frontend knows
+    whether to show the auto-filing consent screen."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    email: str
+    claim_consent_at: AwareDatetime | None
+    created_at: AwareDatetime
+
+    @field_serializer("claim_consent_at", "created_at")
+    def _in_utc(self, value: datetime | None) -> datetime | None:
+        # Same rule as every other Out model: the API speaks UTC only.
+        # claim_consent_at is NULL until the user consents, so None passes
+        # through (as in ClaimOut).
+        return value.astimezone(UTC) if value is not None else None

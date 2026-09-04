@@ -17,7 +17,7 @@ import jwt
 import psycopg
 
 from autotrain.modules.identity import service as identity
-from conftest import TEST_JWT_SECRET, mk_user, scalar
+from conftest import TEST_APP_BASE_URL, TEST_JWT_SECRET, mk_user, scalar
 
 _EMAIL = "magic-link@example.com"
 
@@ -34,11 +34,12 @@ def _request_token(conn: psycopg.Connection, email: str = _EMAIL) -> str:
     """Run request_login and pull the raw token back out of the 'email' —
     the same move a real user makes in their inbox."""
     sender = _RecordingEmailSender()
-    identity.request_login(conn, email, sender)
+    identity.request_login(conn, email, sender, app_base_url=TEST_APP_BASE_URL)
     assert len(sender.sent) == 1
     to, _subject, body = sender.sent[0]
     assert to == email
-    assert "token=" in body
+    # The link's shape is a contract with the frontend's /login route.
+    assert body.startswith(f"{TEST_APP_BASE_URL}/login?token=")
     return body.split("token=")[1]
 
 
@@ -68,7 +69,7 @@ class TestRequestLogin:
         mk_user(conn, "known@example.com")
         for email in ("known@example.com", "stranger@example.com"):
             sender = _RecordingEmailSender()
-            identity.request_login(conn, email, sender)
+            identity.request_login(conn, email, sender, app_base_url=TEST_APP_BASE_URL)
             assert len(sender.sent) == 1
             count = scalar(
                 conn.execute("SELECT count(*) FROM login_tokens WHERE email = %s", (email,))

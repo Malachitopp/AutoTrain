@@ -11,10 +11,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from autotrain.api.middleware import TransactionMiddleware
 from autotrain.api.routers import auth, claims, journeys
 from autotrain.core import db
+from autotrain.core.config import get_settings
 
 
 @asynccontextmanager
@@ -28,10 +30,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="AutoTrain API", version="0.1.0", lifespan=_lifespan)
+    settings = get_settings()
     # Owns the per-request transaction so the COMMIT happens before the
     # response's first bytes leave the server (see middleware.py for why a
     # yield dependency cannot provide that ordering).
     app.add_middleware(TransactionMiddleware)
+    # Outermost on purpose (the last middleware added wraps everything):
+    # browser preflight OPTIONS requests are answered here and never open a
+    # transaction. Origins come from config and default to none.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["*"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
     app.include_router(journeys.router)
     app.include_router(claims.router)
     app.include_router(auth.router)

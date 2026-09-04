@@ -1,6 +1,6 @@
 """The identity module's public API.
 
-Identity owns users, auth and devices (ARCHITECTURE §3). Two faces today:
+Identity owns users, auth and devices (ARCHITECTURE §3). Three faces today:
 
 * Magic-link auth (§9): request_login mints a single-use token, stores only
   its hash, and mails the raw token through an injected EmailSender;
@@ -8,6 +8,7 @@ Identity owns users, auth and devices (ARCHITECTURE §3). Two faces today:
   account on first login. issue_session_token/session_user mint and verify
   the JWTs that deps.current_user_id now checks on every request — these
   functions replaced the api layer's X-User-Id stub.
+* user_profile: who a verified session belongs to, for the api's /auth/me.
 * push_targets: where a user's push notifications can be delivered, for the
   notification worker.
 """
@@ -29,17 +30,19 @@ import psycopg
 # climb past every import-linter contract.
 from autotrain.modules.identity import repository as _repository
 
-# Re-exported: the shape this service hands the notification worker, so
+# Re-exported: the shapes this service hands the worker and the api layer, so
 # callers stay off identity.models (the identity-privacy contract).
-from autotrain.modules.identity.models import PushTarget
+from autotrain.modules.identity.models import PushTarget, UserProfile
 
 __all__ = [
     "EmailSender",
     "PushTarget",
+    "UserProfile",
     "issue_session_token",
     "push_targets",
     "request_login",
     "session_user",
+    "user_profile",
     "verify_login",
 ]
 
@@ -62,14 +65,6 @@ _TOKEN_TTL = timedelta(minutes=15)
 _SESSION_TTL = timedelta(days=30)
 
 
-class IdentityError(Exception):
-    """Base for identity domain failures."""
-
-
-class EmailSendFailure(IdentityError):
-    """The email sender failed to deliver the login link."""
-
-
 def push_targets(
     conn: psycopg.Connection, user_ids: Sequence[UUID]
 ) -> dict[UUID, list[PushTarget]]:
@@ -79,7 +74,9 @@ def push_targets(
     return _repository.push_targets(conn, user_ids)
 
 
-def request_login(conn: psycopg.Connection, email: str, sender: EmailSender) -> None:
+def request_login(
+    conn: psycopg.Connection, email: str, sender: EmailSender, *, app_base_url: str
+) -> None:
     """Start a magic-link login: mint an unguessable single-use token, store
     only its hash (a leaked database can recognise tokens, never mint them),
     and email the raw token — the inbox holds the only copy in existence.
@@ -88,6 +85,9 @@ def request_login(conn: psycopg.Connection, email: str, sender: EmailSender) -> 
     request a link for any address; only the inbox's owner can use it, and
     the uniform behaviour gives an attacker no way to probe which emails
     exist here (user enumeration).
+
+    The link is <app_base_url>/login?token=<token>: /login is the frontend's
+    route, a contract with the app rather than a detail of this module.
     """
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
@@ -96,8 +96,8 @@ def request_login(conn: psycopg.Connection, email: str, sender: EmailSender) -> 
     sender.send_email(
         to=email,
         subject="Your AutoTrain login link",
-        body=f"Click here to log in: https://autotrain.example.com/login?token={token}",
-    )  # TODO: real link once frontend exists
+        body=f"{app_base_url}/login?token={token}",
+    )
 
 
 def verify_login(conn: psycopg.Connection, token: str) -> UUID | None:
@@ -131,3 +131,9 @@ def session_user(encoded_token: str, *, secret: str) -> UUID | None:
         return UUID(payload["sub"])
     except (jwt.InvalidTokenError, KeyError, ValueError):
         return None
+
+
+def user_profile(conn: psycopg.Connection, user_id: UUID) -> UserProfile | None:
+    """The signed-in user's profile — None if the account is unknown or was
+    erased after the session was issued."""
+    return _repository.user_profile(conn, user_id)

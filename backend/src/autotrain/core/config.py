@@ -66,10 +66,6 @@ class Settings(BaseSettings):
     # transport until FCM/APNs arrive with the app.
     push_sender: Literal["none", "log"] = "none"
     worker_batch_size: int = Field(default=100, ge=1)
-
-    email_sender: Literal["none", "log"] = "none"
-    jwt_secret: SecretStr | None = None
-
     # Shorter than the sweeps: a push is the product's magic moment, and its
     # value decays by the minute. Each idle poll is one indexed no-op query.
     worker_interval_seconds: float = Field(default=60.0, gt=0)
@@ -79,6 +75,25 @@ class Settings(BaseSettings):
     # empty, so a short interval costs almost nothing.
     scheduler_batch_size: int = Field(default=200, ge=1)
     scheduler_interval_seconds: float = Field(default=900.0, gt=0)
+
+    # Auth and the browser frontend (identity module, api process).
+    # 'none' makes /auth/login/request refuse; 'log' writes the email to the
+    # process log — the development transport until a real provider arrives.
+    email_sender: Literal["none", "log"] = "none"
+    # Signs session JWTs. SecretStr: a logged Settings shows '**********'.
+    # Whoever holds it can mint a session for any user.
+    jwt_secret: SecretStr | None = None
+    # The frontend origin magic links point at (<app_base_url>/login?token=...).
+    # None on purpose rather than a localhost default: an email carrying a
+    # localhost link in production is a silent failure; the 503 is loud. The
+    # route treats blank as unset too — an interpolated-but-unset env var
+    # arrives as '' (see the HSP check below).
+    app_base_url: str | None = None
+    # Browser origins allowed to call the API (CORS). Empty by default: no
+    # browser may call us until a deployment says so; curl and servers are
+    # unaffected, since CORS is enforced only by browsers. The env value is
+    # JSON, because the field is a list: AUTOTRAIN_CORS_ORIGINS=["http://..."]
+    cors_origins: list[str] = Field(default_factory=list)
 
     # Only read by the integration test suite, which drops and recreates it.
     test_database_url: str | None = None
