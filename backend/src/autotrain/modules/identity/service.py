@@ -62,13 +62,6 @@ _TOKEN_TTL = timedelta(minutes=15)
 _SESSION_TTL = timedelta(days=30)
 
 
-class IdentityError(Exception):
-    """Base for identity domain failures."""
-
-
-class EmailSendFailure(IdentityError):
-    """The email sender failed to deliver the login link."""
-
 
 def push_targets(
     conn: psycopg.Connection, user_ids: Sequence[UUID]
