@@ -98,11 +98,13 @@ class TestRequestLink:
     def test_link_points_at_the_frontend_login_route(
         self, client: TestClient, sender: _RecordingEmailSender
     ) -> None:
-        """The email body IS the link, and its shape — <app base url>/login?
-        token=<token> — is the contract the frontend's login page implements."""
+        """The email body IS the link, and its shape — <app base url>/login#
+        token=<token> — is the contract the frontend's login page implements.
+        The token rides in the fragment, which a browser never sends to any
+        server, so it stays out of the frontend host's request logs."""
         client.post("/auth/login/request", json={"email": _EMAIL})
         token = _token_from(sender)
-        assert sender.sent[0][2] == f"{TEST_APP_BASE_URL}/login?token={token}"
+        assert sender.sent[0][2] == f"{TEST_APP_BASE_URL}/login#token={token}"
 
     @pytest.mark.parametrize("unset", [None, ""], ids=["absent", "blank"])
     def test_unconfigured_app_base_url_is_503(
@@ -195,6 +197,23 @@ class TestSessionGate:
         resp = client.get("/journeys", headers={"Authorization": f"Bearer {forged}"})
         assert resp.status_code == 401
 
+    def test_erased_account_is_401(self, client: TestClient, conn: psycopg.Connection) -> None:
+        """A session outlives GDPR erasure by up to 30 days. The gate checks
+        the account is still live on every request, so the ghost is refused
+        everywhere — not only where a handler happens to load the user."""
+        user_id = mk_user(conn, "gone@example.com")
+        conn.execute("UPDATE users SET email = NULL, deleted_at = now() WHERE id = %s", (user_id,))
+        resp = client.get("/journeys", headers=auth_header(user_id))
+        assert resp.status_code == 401
+        # Indistinguishable from any other bad credential, on purpose.
+        assert resp.json()["detail"] == "invalid token"
+
+    def test_never_created_account_is_401(self, client: TestClient) -> None:
+        # Validly signed, but the subject was never a row: same refusal.
+        resp = client.get("/journeys", headers=auth_header(uuid4()))
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "invalid token"
+
     def test_auth_endpoints_themselves_need_no_session(self, client: TestClient) -> None:
         # The two doors into the building are outside the gate — a fresh
         # client with no token can always start a login.
@@ -225,14 +244,15 @@ class TestMe:
         # Only the profile shape crosses the wire — never the table.
         assert set(body) == {"id", "email", "claim_consent_at", "created_at"}
 
-    def test_erased_user_is_404(self, client: TestClient, conn: psycopg.Connection) -> None:
-        """A session outlives GDPR erasure; the erased account must read as
-        gone, exactly like the journeys router's UnknownUser."""
+    def test_erased_user_is_401(self, client: TestClient, conn: psycopg.Connection) -> None:
+        """The bearer gate refuses an erased account before this route runs,
+        so its own 404 branch is now defence in depth the wire never shows.
+        Pinned here so a gate regression surfaces on /auth/me too."""
         user_id = mk_user(conn, "gone@example.com")
         conn.execute("UPDATE users SET email = NULL, deleted_at = now() WHERE id = %s", (user_id,))
         resp = client.get("/auth/me", headers=auth_header(user_id))
-        assert resp.status_code == 404
-        assert resp.json()["detail"] == "unknown user"
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "invalid token"
 
     def test_requires_a_session(self, client: TestClient) -> None:
         assert client.get("/auth/me").status_code == 401

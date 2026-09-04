@@ -32,14 +32,21 @@ def get_conn(request: Request) -> Connection:
     return txn.conn()
 
 
-def current_user_id(authorization: Annotated[str | None, Header()] = None) -> UUID:
+ConnDep = Annotated[Connection, Depends(get_conn)]
+
+
+def current_user_id(conn: ConnDep, authorization: Annotated[str | None, Header()] = None) -> UUID:
     """The authenticated user, from the `Authorization: Bearer <jwt>` header.
 
     Replaced the X-User-Id development stub. Every credential failure —
-    missing header, wrong scheme, tampered or expired token — collapses to
-    the same 401 on purpose: distinguishing WHY a token failed only helps an
-    attacker probing. The one exception is 503 for a missing signing secret,
-    which is an operations problem, not the caller's.
+    missing header, wrong scheme, tampered or expired token, a session whose
+    account has since been erased — collapses to the same 401 on purpose:
+    distinguishing WHY a token failed only helps an attacker probing. The
+    one exception is 503 for a missing signing secret, which is an
+    operations problem, not the caller's.
+
+    The liveness check is the gate's one database read. Without it a
+    session would outlive GDPR erasure on every route but /auth/me.
     """
     if authorization is None:
         raise HTTPException(status_code=401, detail="missing Bearer token")
@@ -51,11 +58,10 @@ def current_user_id(authorization: Annotated[str | None, Header()] = None) -> UU
         raise HTTPException(status_code=503, detail="no JWT secret configured")
 
     user_id = identity.session_user(token, secret=secret.get_secret_value())
-    if user_id is None:
+    if user_id is None or not identity.user_is_live(conn, user_id=user_id):
         raise HTTPException(status_code=401, detail="invalid token")
 
     return user_id
 
 
-ConnDep = Annotated[Connection, Depends(get_conn)]
 UserIdDep = Annotated[UUID, Depends(current_user_id)]

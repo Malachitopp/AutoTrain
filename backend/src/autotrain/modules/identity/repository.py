@@ -45,6 +45,9 @@ _CREATE_USER = "INSERT INTO users (email) VALUES (%s) RETURNING id"
 _USER_PROFILE = (
     "SELECT id, email, claim_consent_at, created_at FROM users WHERE id = %s AND deleted_at IS NULL"
 )
+# The bearer gate's per-request question. EXISTS rather than the profile
+# row: the gate needs one bit, and it runs on every authenticated request.
+_USER_IS_LIVE = "SELECT EXISTS (SELECT 1 FROM users WHERE id = %s AND deleted_at IS NULL)"
 
 
 def push_targets(
@@ -86,3 +89,10 @@ def create_user(conn: psycopg.Connection, email: str) -> UUID:
 def user_profile(conn: psycopg.Connection, user_id: UUID) -> UserProfile | None:
     """The /auth/me row for a user — None if unknown or erased."""
     return db.fetch_one(conn, _USER_PROFILE, (user_id,), row_cls=UserProfile)
+
+
+def user_is_live(conn: psycopg.Connection, user_id: UUID) -> bool:
+    """Whether user_id names an account that may still act — False if it
+    was never created or has been erased. Always a bool: EXISTS yields a
+    row either way, so this never has a None arm to handle."""
+    return db.fetch_value(conn, _USER_IS_LIVE, (user_id,))
