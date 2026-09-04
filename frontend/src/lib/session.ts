@@ -1,5 +1,6 @@
 /**
- * Where the session token lives in the browser.
+ * The session's lifecycle in the browser: it begins with a login link and
+ * then lives in storage.
  *
  * The API issues a bearer JWT (POST /auth/login/verify) and expects it back on
  * every request as `Authorization: Bearer <jwt>`. This module is the only
@@ -33,4 +34,17 @@ export function store(jwt: string): void {
 
 export function clear(): void {
   window.localStorage.removeItem(KEY);
+}
+
+/** The login token carried by an emailed link, or null if the address bar
+ * holds none.
+ *
+ * The link is <app base url>/login#token=<token> — a contract with the
+ * backend's identity.request_login. The token rides in the fragment (after
+ * the '#') because a browser never sends that part to any server, so it
+ * stays out of request logs; only this code, running in the page, sees it.
+ * Pass `window.location.hash`, which includes the leading '#'. */
+export function tokenFromHash(hash: string): string | null {
+  const token = new URLSearchParams(hash.replace(/^#/, "")).get("token");
+  return token ? token : null;
 }
