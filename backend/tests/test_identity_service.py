@@ -39,7 +39,7 @@ def _request_token(conn: psycopg.Connection, email: str = _EMAIL) -> str:
     to, _subject, body = sender.sent[0]
     assert to == email
     # The link's shape is a contract with the frontend's /login route.
-    assert body.startswith(f"{TEST_APP_BASE_URL}/login?token=")
+    assert body.startswith(f"{TEST_APP_BASE_URL}/login#token=")
     return body.split("token=")[1]
 
 
@@ -123,6 +123,24 @@ class TestVerifyLogin:
             conn.execute("SELECT used_at FROM login_tokens WHERE email = %s", (_EMAIL,))
         )
         assert used_at is None
+
+
+class TestUserIsLive:
+    """The bearer gate's per-request question, answered at the service seam."""
+
+    def test_live_account(self, conn: psycopg.Connection) -> None:
+        assert identity.user_is_live(conn, mk_user(conn, _EMAIL)) is True
+
+    def test_erased_account_reads_as_gone(self, conn: psycopg.Connection) -> None:
+        # GDPR erasure keeps the row (claims must stay auditable) but stamps
+        # deleted_at; the gate must see the stamp, not the surviving row.
+        user_id = mk_user(conn, _EMAIL)
+        conn.execute("UPDATE users SET email = NULL, deleted_at = now() WHERE id = %s", (user_id,))
+        assert identity.user_is_live(conn, user_id) is False
+
+    def test_unknown_account(self, conn: psycopg.Connection) -> None:
+        # A bool either way: EXISTS never yields None for a missing row.
+        assert identity.user_is_live(conn, uuid4()) is False
 
 
 # --- Session tokens (no database: pure signature math) ------------------------

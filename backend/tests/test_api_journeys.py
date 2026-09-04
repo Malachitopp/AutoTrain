@@ -158,12 +158,14 @@ class TestCreateJourney:
         )
         assert client.post("/journeys", json=second, headers=headers).status_code == 201
 
-    def test_unknown_user_is_404_not_500(self, client: TestClient) -> None:
+    def test_unknown_user_is_401(self, client: TestClient) -> None:
         # A validly signed session for a user row that no longer exists (GDPR
-        # erasure outlives sessions): services surface UnknownUser, not a 500.
+        # erasure outlives sessions) is refused by the bearer gate before the
+        # handler runs. The service's UnknownUser -> 404 stays as defence in
+        # depth, but the wire shows the gate's uniform 401.
         resp = client.post("/journeys", json=_payload(), headers=auth_header(uuid4()))
-        assert resp.status_code == 404
-        assert resp.json()["detail"] == "unknown user"
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "invalid token"
 
     def test_naive_datetime_is_rejected(self, client: TestClient, conn: psycopg.Connection) -> None:
         headers = auth_header(_mk_user(conn))
@@ -324,15 +326,13 @@ class TestReadJourneys:
         assert page["count"] == 1
         assert page["items"][0]["travel_date"] == "2026-08-14"  # newest survives the cut
 
-    def test_list_for_unknown_user_is_empty_200(self, client: TestClient) -> None:
-        """Pinned as intentional: listing never checks user existence, so a
-        valid session whose user row has since been erased reads as "no
-        journeys yet" while POST answers 404 (its FK proves nonexistence for
-        free). A client cannot use this endpoint to distinguish "no user"
-        from "no journeys"."""
+    def test_list_for_unknown_user_is_401(self, client: TestClient) -> None:
+        """Listing never checks user existence itself, and no longer has to:
+        the bearer gate settles it for every route, so a session whose user
+        row has since been erased is refused here exactly as on POST."""
         resp = client.get("/journeys", headers=auth_header(uuid4()))
-        assert resp.status_code == 200
-        assert resp.json() == {"items": [], "count": 0, "limit": 50}
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "invalid token"
 
     def test_get_by_id(self, client: TestClient, conn: psycopg.Connection) -> None:
         headers = auth_header(_mk_user(conn))

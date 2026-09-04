@@ -8,7 +8,8 @@ Identity owns users, auth and devices (ARCHITECTURE §3). Three faces today:
   account on first login. issue_session_token/session_user mint and verify
   the JWTs that deps.current_user_id now checks on every request — these
   functions replaced the api layer's X-User-Id stub.
-* user_profile: who a verified session belongs to, for the api's /auth/me.
+* user_profile: who a verified session belongs to, for the api's /auth/me;
+  user_is_live: whether it still belongs to anyone, for the bearer gate.
 * push_targets: where a user's push notifications can be delivered, for the
   notification worker.
 """
@@ -42,6 +43,7 @@ __all__ = [
     "push_targets",
     "request_login",
     "session_user",
+    "user_is_live",
     "user_profile",
     "verify_login",
 ]
@@ -86,7 +88,7 @@ def request_login(
     the uniform behaviour gives an attacker no way to probe which emails
     exist here (user enumeration).
 
-    The link is <app_base_url>/login?token=<token>: /login is the frontend's
+    The link is <app_base_url>/login#token=<token>: /login is the frontend's
     route, a contract with the app rather than a detail of this module.
     """
     token = secrets.token_urlsafe(32)
@@ -96,7 +98,7 @@ def request_login(
     sender.send_email(
         to=email,
         subject="Your AutoTrain login link",
-        body=f"{app_base_url}/login?token={token}",
+        body=f"{app_base_url}/login#token={token}",
     )
 
 
@@ -137,3 +139,12 @@ def user_profile(conn: psycopg.Connection, user_id: UUID) -> UserProfile | None:
     """The signed-in user's profile — None if the account is unknown or was
     erased after the session was issued."""
     return _repository.user_profile(conn, user_id)
+
+
+def user_is_live(conn: psycopg.Connection, user_id: UUID) -> bool:
+    """Whether a verified session still names a usable account — False once
+    the user is erased (GDPR) or was never created. A session outlives
+    erasure by up to _SESSION_TTL, so the bearer gate asks this on every
+    request: the ghost is refused everywhere, not only where a handler
+    happens to load the user. One primary-key lookup per request."""
+    return _repository.user_is_live(conn, user_id)
