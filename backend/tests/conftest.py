@@ -34,6 +34,10 @@ os.environ["AUTOTRAIN_DATABASE_URL"] = TEST_DATABASE_URL
 TEST_JWT_SECRET = "test-secret-not-for-production-padded-to-32-bytes"
 os.environ["AUTOTRAIN_JWT_SECRET"] = TEST_JWT_SECRET
 os.environ["AUTOTRAIN_EMAIL_SENDER"] = "none"
+# Where magic links point. Pinned so the link format the auth suites assert
+# on is deterministic; the missing-config 503 path patches it away per test.
+TEST_APP_BASE_URL = "http://frontend.test"
+os.environ["AUTOTRAIN_APP_BASE_URL"] = TEST_APP_BASE_URL
 
 from autotrain.core import db  # noqa: E402
 from autotrain.core.config import get_settings  # noqa: E402

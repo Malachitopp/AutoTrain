@@ -4,8 +4,8 @@ Constants are deliberately unannotated so pyright keeps their LiteralString
 type; values travel as `%s` parameters, never in the text. Functions take the
 connection first and never commit — the caller owns the transaction.
 
-Scope note: only identity-owned tables appear here (users, devices — 0004, login_tokens -- 0012).
-Today that is one read; auth's queries land beside it.
+Scope note: only identity-owned tables appear here (users, devices — 0004;
+login_tokens — 0012).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from uuid import UUID
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.identity.models import PushTarget
+from autotrain.modules.identity.models import PushTarget, UserProfile
 
 # Batched like journeys' _CLAIM_CONTEXTS: the worker resolves a whole page of
 # detections' users in one round trip. Ordered so a user's devices come back
@@ -40,6 +40,12 @@ _SPEND_LOGIN_TOKEN = (
 _USER_ID_EMAIL = "SELECT id FROM users WHERE email = %s AND deleted_at IS NULL"
 _CREATE_USER = "INSERT INTO users (email) VALUES (%s) RETURNING id"
 
+# deleted_at IS NULL: a session can outlive GDPR erasure, and an erased
+# account must read as gone (None) — never resurrect through a stale token.
+_USER_PROFILE = (
+    "SELECT id, email, claim_consent_at, created_at FROM users WHERE id = %s AND deleted_at IS NULL"
+)
+
 
 def push_targets(
     conn: psycopg.Connection, user_ids: Sequence[UUID]
@@ -54,19 +60,29 @@ def push_targets(
 def insert_login_token(
     conn: psycopg.Connection, email: str, token_hash: str, expires_at: datetime
 ) -> None:
+    """Store a pending magic-link login: the token hash, never the token."""
 
     db.execute(conn, _INSERT_LOGIN_TOKEN, (email, token_hash, expires_at))
 
 
 def spend_login_token(conn: psycopg.Connection, token_hash: str) -> str | None:
+    """Stamp the token used and return its email — None if unknown, expired,
+    or already spent. Race-safe: two concurrent clicks yield exactly one email."""
     return db.fetch_value(conn, _SPEND_LOGIN_TOKEN, (token_hash,))
 
 
 def user_id_by_email(conn: psycopg.Connection, email: str) -> UUID | None:
+    """The living account for an email, if any; erased accounts never match."""
     return db.fetch_value(conn, _USER_ID_EMAIL, (email,))
 
 
 def create_user(conn: psycopg.Connection, email: str) -> UUID:
-    """consent forms for legality. Starts empty since users have to fill it in
-    and it cant exist without a users input"""
+    """Create a user knowing only their email. Consent columns start NULL:
+    signup is not consent — that is granted explicitly in the app and stamped
+    when it happens."""
     return db.fetch_value(conn, _CREATE_USER, (email,))
+
+
+def user_profile(conn: psycopg.Connection, user_id: UUID) -> UserProfile | None:
+    """The /auth/me row for a user — None if unknown or erased."""
+    return db.fetch_one(conn, _USER_PROFILE, (user_id,), row_cls=UserProfile)

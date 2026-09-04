@@ -48,7 +48,10 @@ Host and port come from `AUTOTRAIN_API_HOST` / `AUTOTRAIN_API_PORT` (defaults
 login link (with `AUTOTRAIN_EMAIL_SENDER=log` the "email" is a line in the
 process log — copy the token out of it); `POST /auth/login/verify` exchanges
 that token for a session JWT. Every other endpoint expects the JWT as a
-bearer token. Requires `AUTOTRAIN_JWT_SECRET` to be set (see `.env.example`).
+bearer token. Requires `AUTOTRAIN_JWT_SECRET` (signs sessions) and
+`AUTOTRAIN_APP_BASE_URL` (the frontend origin the emailed link points at); a
+browser frontend must also be listed in `AUTOTRAIN_CORS_ORIGINS`. All three are
+documented in `.env.example`, and `GET /auth/me` answers who a session belongs to.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/auth/login/request \

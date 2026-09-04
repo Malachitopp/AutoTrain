@@ -1,5 +1,6 @@
-"""API tests for the auth vertical slice: the magic-link endpoints and the
-bearer-token gate they put in front of every other route.
+"""API tests for the auth vertical slice: the magic-link endpoints, the
+bearer-token gate they put in front of every other route, and the CORS gate
+a browser frontend has to pass first.
 
 Same harness as test_api_journeys (get_conn overridden to the rollback conn),
 with one more substitution at the same kind of seam: the router's email-sender
@@ -19,10 +20,12 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
+from autotrain.api import app as app_module
 from autotrain.api.app import create_app
 from autotrain.api.deps import get_conn
 from autotrain.api.routers import auth as auth_router
-from conftest import TEST_JWT_SECRET, auth_header, mk_user
+from autotrain.core.config import get_settings
+from conftest import TEST_APP_BASE_URL, TEST_JWT_SECRET, auth_header, mk_user
 
 _EMAIL = "rider@example.com"
 
@@ -92,6 +95,37 @@ class TestRequestLink:
         assert known.content == unknown.content == b""
         assert len(sender.sent) == 2
 
+    def test_link_points_at_the_frontend_login_route(
+        self, client: TestClient, sender: _RecordingEmailSender
+    ) -> None:
+        """The email body IS the link, and its shape — <app base url>/login?
+        token=<token> — is the contract the frontend's login page implements."""
+        client.post("/auth/login/request", json={"email": _EMAIL})
+        token = _token_from(sender)
+        assert sender.sent[0][2] == f"{TEST_APP_BASE_URL}/login?token={token}"
+
+    @pytest.mark.parametrize("unset", [None, ""], ids=["absent", "blank"])
+    def test_unconfigured_app_base_url_is_503(
+        self,
+        client: TestClient,
+        sender: _RecordingEmailSender,
+        monkeypatch: pytest.MonkeyPatch,
+        unset: str | None,
+    ) -> None:
+        # The router looks get_settings up at call time; hand it a copy with
+        # the knob unset. No link can be built, so no email is sent either.
+        # Blank is what a deployment template produces for a missing value;
+        # it must refuse the same way, not email a host-less link.
+        monkeypatch.setattr(
+            auth_router,
+            "get_settings",
+            lambda: get_settings().model_copy(update={"app_base_url": unset}),
+        )
+        resp = client.post("/auth/login/request", json={"email": _EMAIL})
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "no app base URL configured"
+        assert sender.sent == []
+
     def test_unconfigured_email_transport_is_503(self, conn: psycopg.Connection) -> None:
         # No sender patch: settings leave email_sender at 'none', and the
         # refusal is scoped to this endpoint, not the whole app.
@@ -116,9 +150,16 @@ class TestVerify:
         assert verified.status_code == 200, verified.text
         session = verified.json()["access_token"]
 
-        journeys = client.get("/journeys", headers={"Authorization": f"Bearer {session}"})
+        headers = {"Authorization": f"Bearer {session}"}
+        journeys = client.get("/journeys", headers=headers)
         assert journeys.status_code == 200
         assert journeys.json() == {"items": [], "count": 0, "limit": 50}
+
+        # And the session knows who it is: a first-login account, not yet
+        # consented to auto-filing.
+        me = client.get("/auth/me", headers=headers).json()
+        assert me["email"] == _EMAIL
+        assert me["claim_consent_at"] is None
 
     def test_token_is_single_use(self, client: TestClient, sender: _RecordingEmailSender) -> None:
         client.post("/auth/login/request", json={"email": _EMAIL})
@@ -162,3 +203,97 @@ class TestSessionGate:
         resp = client.get("/journeys")
         assert resp.status_code == 401  # everything else IS gated
         assert auth_header(uuid4())["Authorization"].startswith("Bearer ")
+
+
+class TestMe:
+    def test_returns_the_verified_users_profile(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        user_id = mk_user(conn, "me@example.com")
+        # A non-UTC session zone (no DST, so the offset is never zero by
+        # luck): without UserOut's serializer the wire would read +09:00.
+        conn.execute("SET LOCAL TIME ZONE 'Asia/Tokyo'")
+        resp = client.get("/auth/me", headers=auth_header(user_id))
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["id"] == str(user_id)
+        assert body["email"] == "me@example.com"
+        assert body["claim_consent_at"] is not None  # mk_user consents
+        # The API speaks UTC only, whatever zone the database session is in.
+        for stamp in (body["created_at"], body["claim_consent_at"]):
+            assert datetime.fromisoformat(stamp).utcoffset() == timedelta(0)
+        # Only the profile shape crosses the wire — never the table.
+        assert set(body) == {"id", "email", "claim_consent_at", "created_at"}
+
+    def test_erased_user_is_404(self, client: TestClient, conn: psycopg.Connection) -> None:
+        """A session outlives GDPR erasure; the erased account must read as
+        gone, exactly like the journeys router's UnknownUser."""
+        user_id = mk_user(conn, "gone@example.com")
+        conn.execute("UPDATE users SET email = NULL, deleted_at = now() WHERE id = %s", (user_id,))
+        resp = client.get("/auth/me", headers=auth_header(user_id))
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "unknown user"
+
+    def test_requires_a_session(self, client: TestClient) -> None:
+        assert client.get("/auth/me").status_code == 401
+
+
+# What a browser sends before a cross-origin GET that carries Authorization.
+_PREFLIGHT = {
+    "Access-Control-Request-Method": "GET",
+    "Access-Control-Request-Headers": "authorization",
+}
+
+
+class TestCors:
+    """The browser's gate. Origins come from config and default to none; the
+    list is pinned per test because nothing else in the suite sends an Origin
+    header. Settings are read inside create_app(), so the seam is the app
+    module's get_settings, patched before the client is built."""
+
+    @staticmethod
+    def _client(
+        conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch, origins: list[str]
+    ) -> TestClient:
+        monkeypatch.setattr(
+            app_module,
+            "get_settings",
+            lambda: get_settings().model_copy(update={"cors_origins": origins}),
+        )
+        return _client_for(conn)
+
+    def test_listed_origin_may_send_a_bearer_token(
+        self, conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._client(conn, monkeypatch, [TEST_APP_BASE_URL])
+        # The preflight: the browser asks whether it may send Authorization.
+        resp = client.options("/auth/me", headers={"Origin": TEST_APP_BASE_URL, **_PREFLIGHT})
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["access-control-allow-origin"] == TEST_APP_BASE_URL
+        assert "authorization" in resp.headers["access-control-allow-headers"].lower()
+        # The real request carries the header back even on a 401 — without
+        # it the browser hides the response from the page entirely.
+        denied = client.get("/auth/me", headers={"Origin": TEST_APP_BASE_URL})
+        assert denied.status_code == 401
+        assert denied.headers["access-control-allow-origin"] == TEST_APP_BASE_URL
+
+    def test_unlisted_origin_is_refused(
+        self, conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._client(conn, monkeypatch, [TEST_APP_BASE_URL])
+        resp = client.options("/auth/me", headers={"Origin": "http://evil.test", **_PREFLIGHT})
+        assert resp.status_code == 400
+        assert "access-control-allow-origin" not in resp.headers
+        # Simple requests are still served (CORS is the browser's rule, not
+        # ours), but without the header the browser withholds the response.
+        simple = client.get("/healthz", headers={"Origin": "http://evil.test"})
+        assert simple.status_code == 200
+        assert "access-control-allow-origin" not in simple.headers
+
+    def test_default_is_closed(
+        self, conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._client(conn, monkeypatch, [])
+        resp = client.options("/auth/me", headers={"Origin": TEST_APP_BASE_URL, **_PREFLIGHT})
+        assert resp.status_code == 400
+        assert "access-control-allow-origin" not in resp.headers
