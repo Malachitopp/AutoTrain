@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from autotrain.api.middleware import TransactionMiddleware
-from autotrain.api.routers import claims, journeys
+from autotrain.api.routers import auth, claims, journeys
 from autotrain.core import db
 
 
@@ -34,6 +34,7 @@ def create_app() -> FastAPI:
     app.add_middleware(TransactionMiddleware)
     app.include_router(journeys.router)
     app.include_router(claims.router)
+    app.include_router(auth.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

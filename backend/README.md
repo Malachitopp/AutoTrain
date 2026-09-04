@@ -44,13 +44,19 @@ uv run python -m autotrain.entrypoints.api   # http://127.0.0.1:8000 — docs at
 Host and port come from `AUTOTRAIN_API_HOST` / `AUTOTRAIN_API_PORT` (defaults
 `127.0.0.1:8000`).
 
-**Auth is a development stub.** Every request identifies itself with an
-`X-User-Id` header carrying an existing user's UUID — the server trusts it
-outright. Real authentication (magic-link + JWT) arrives with the identity
-module and replaces the stub wholesale; do not build anything on that header.
+**Auth is magic-link + JWT.** `POST /auth/login/request` emails a single-use
+login link (with `AUTOTRAIN_EMAIL_SENDER=log` the "email" is a line in the
+process log — copy the token out of it); `POST /auth/login/verify` exchanges
+that token for a session JWT. Every other endpoint expects the JWT as a
+bearer token. Requires `AUTOTRAIN_JWT_SECRET` to be set (see `.env.example`).
 
 ```bash
-curl -s http://127.0.0.1:8000/journeys -H "X-User-Id: <uuid>"
+curl -s -X POST http://127.0.0.1:8000/auth/login/request \
+  -H "Content-Type: application/json" -d '{"email":"you@example.com"}'
+# copy <token> from the log line, then:
+curl -s -X POST http://127.0.0.1:8000/auth/login/verify \
+  -H "Content-Type: application/json" -d '{"token":"<token>"}'
+curl -s http://127.0.0.1:8000/journeys -H "Authorization: Bearer <jwt>"
 ```
 
 ## Run the ingestor

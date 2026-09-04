@@ -4,6 +4,8 @@ The client drives HTTP through the real app — routing, validation, service,
 repository, real Postgres — with exactly one substitution: `get_conn` is
 overridden to the suite's rollback `conn` fixture, so these tests leave the
 database untouched and the connection pool is never opened. No mocks anywhere.
+Every request authenticates with a real bearer token (conftest.auth_header),
+so the JWT verification in deps.current_user_id runs in every test here.
 
 The exception is TestProductionTransactionPath at the bottom: it runs the real
 wiring (lifespan, pool, TransactionMiddleware commit) with no overrides, so
@@ -24,7 +26,7 @@ from fastapi.testclient import TestClient
 
 from autotrain.api.app import create_app
 from autotrain.api.deps import get_conn
-from conftest import mk_user
+from conftest import auth_header, mk_user
 
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
 
@@ -101,7 +103,7 @@ class TestCreateJourney:
         self, client: TestClient, conn: psycopg.Connection
     ) -> None:
         uid = _mk_user(conn)
-        resp = client.post("/journeys", json=_payload(), headers={"X-User-Id": uid})
+        resp = client.post("/journeys", json=_payload(), headers=auth_header(uid))
         assert resp.status_code == 201, resp.text
         body = resp.json()
 
@@ -131,7 +133,7 @@ class TestCreateJourney:
         self, client: TestClient, conn: psycopg.Connection
     ) -> None:
         uid = _mk_user(conn)
-        headers = {"X-User-Id": uid}
+        headers = auth_header(uid)
         assert client.post("/journeys", json=_payload(), headers=headers).status_code == 201
         resp = client.post("/journeys", json=_payload(), headers=headers)
         assert resp.status_code == 409
@@ -147,7 +149,7 @@ class TestCreateJourney:
         08:14 out and the 18:14 back on a different route happen; so does
         twice-daily travel). 0005 scopes uniqueness to allow this and 0009
         keys on scheduled_departure to keep allowing it."""
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         assert client.post("/journeys", json=_payload(), headers=headers).status_code == 201
         evening = _DEP + timedelta(hours=10)
         second = _payload(
@@ -157,12 +159,14 @@ class TestCreateJourney:
         assert client.post("/journeys", json=second, headers=headers).status_code == 201
 
     def test_unknown_user_is_404_not_500(self, client: TestClient) -> None:
-        resp = client.post("/journeys", json=_payload(), headers={"X-User-Id": str(uuid4())})
+        # A validly signed session for a user row that no longer exists (GDPR
+        # erasure outlives sessions): services surface UnknownUser, not a 500.
+        resp = client.post("/journeys", json=_payload(), headers=auth_header(uuid4()))
         assert resp.status_code == 404
         assert resp.json()["detail"] == "unknown user"
 
     def test_naive_datetime_is_rejected(self, client: TestClient, conn: psycopg.Connection) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         bad = _payload(scheduled_departure="2026-08-10T08:14:00")  # no offset
         resp = client.post("/journeys", json=bad, headers=headers)
         assert resp.status_code == 422
@@ -171,7 +175,7 @@ class TestCreateJourney:
         assert err["type"] == "timezone_aware"
 
     def test_naive_arrival_is_rejected(self, client: TestClient, conn: psycopg.Connection) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         bad = _payload(scheduled_arrival="2026-08-10T10:14:00")  # no offset
         resp = client.post("/journeys", json=bad, headers=headers)
         assert resp.status_code == 422
@@ -180,7 +184,7 @@ class TestCreateJourney:
         assert err["type"] == "timezone_aware"
 
     def test_bad_crs_is_rejected(self, client: TestClient, conn: psycopg.Connection) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         bad = _payload(origin_crs="Manchester")
         resp = client.post("/journeys", json=bad, headers=headers)
         assert resp.status_code == 422
@@ -191,7 +195,7 @@ class TestCreateJourney:
     def test_arrival_before_departure_is_rejected(
         self, client: TestClient, conn: psycopg.Connection
     ) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         bad = _payload(scheduled_arrival=(_DEP - timedelta(minutes=5)).isoformat())
         resp = client.post("/journeys", json=bad, headers=headers)
         assert resp.status_code == 422
@@ -203,7 +207,7 @@ class TestCreateJourney:
         self, client: TestClient, conn: psycopg.Connection
     ) -> None:
         # The boundary case: the validator is `<=`, matching the DB's strict `>`.
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         bad = _payload(scheduled_arrival=_DEP.isoformat())
         resp = client.post("/journeys", json=bad, headers=headers)
         assert resp.status_code == 422
@@ -215,7 +219,7 @@ class TestCreateJourney:
         """Python ints are unbounded; tickets.price_pence is int4. Without the
         schema ceiling this reached the INSERT and surfaced as a driver range
         error — a 500 for plainly invalid input."""
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         resp = client.post("/journeys", json=_payload(price_pence=3_000_000_000), headers=headers)
         assert resp.status_code == 422
         err = _single_error(resp)
@@ -225,7 +229,7 @@ class TestCreateJourney:
     def test_free_ticket_is_rejected(self, client: TestClient, conn: psycopg.Connection) -> None:
         # The API is stricter than the DB (> 0 vs >= 0): a manual add with no
         # price is a data-entry error.
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         resp = client.post("/journeys", json=_payload(price_pence=0), headers=headers)
         assert resp.status_code == 422
         err = _single_error(resp)
@@ -233,29 +237,36 @@ class TestCreateJourney:
         assert err["type"] == "greater_than"
 
     def test_unknown_kind_is_rejected(self, client: TestClient, conn: psycopg.Connection) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         resp = client.post("/journeys", json=_payload(kind="flex"), headers=headers)
         assert resp.status_code == 422
         err = _single_error(resp)
         assert err["loc"] == ["body", "kind"]
         assert err["type"] == "literal_error"
 
-    def test_missing_user_header_is_401(self, client: TestClient) -> None:
+    def test_missing_bearer_token_is_401(self, client: TestClient) -> None:
         resp = client.post("/journeys", json=_payload())
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "missing X-User-Id header"
+        assert resp.json()["detail"] == "missing Bearer token"
 
-    def test_malformed_user_header_is_401(self, client: TestClient) -> None:
-        resp = client.post("/journeys", json=_payload(), headers={"X-User-Id": "not-a-uuid"})
+    def test_non_bearer_authorization_is_401(self, client: TestClient) -> None:
+        resp = client.post("/journeys", json=_payload(), headers={"Authorization": "Basic dXNlcg"})
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "malformed X-User-Id header"
+        assert resp.json()["detail"] == "invalid Authorization header"
+
+    def test_garbage_bearer_token_is_401(self, client: TestClient) -> None:
+        resp = client.post(
+            "/journeys", json=_payload(), headers={"Authorization": "Bearer not-a-jwt"}
+        )
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "invalid token"
 
 
 class TestReadJourneys:
     def test_list_orders_newest_travel_date_first(
         self, client: TestClient, conn: psycopg.Connection
     ) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         for day in ("2026-08-10", "2026-08-14", "2026-08-12"):  # deliberately unordered
             dep = datetime.fromisoformat(f"{day}T08:00:00+00:00")
             body = _payload(
@@ -281,8 +292,8 @@ class TestReadJourneys:
     ) -> None:
         """Both users have rows, and each list returns exactly its own —
         dropping WHERE user_id from the list SQL must fail here, not ship."""
-        owner = {"X-User-Id": _mk_user(conn, "owner@example.com")}
-        snoop = {"X-User-Id": _mk_user(conn, "snoop@example.com")}
+        owner = auth_header(_mk_user(conn, "owner@example.com"))
+        snoop = auth_header(_mk_user(conn, "snoop@example.com"))
         owner_id = client.post("/journeys", json=_payload(), headers=owner).json()["id"]
         snoop_id = client.post("/journeys", json=_payload(), headers=snoop).json()["id"]
 
@@ -296,7 +307,7 @@ class TestReadJourneys:
     def test_limit_bounds_and_truncation(
         self, client: TestClient, conn: psycopg.Connection
     ) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         for day in ("2026-08-10", "2026-08-14"):
             dep = datetime.fromisoformat(f"{day}T08:00:00+00:00")
             body = _payload(
@@ -314,24 +325,24 @@ class TestReadJourneys:
         assert page["items"][0]["travel_date"] == "2026-08-14"  # newest survives the cut
 
     def test_list_for_unknown_user_is_empty_200(self, client: TestClient) -> None:
-        """Pinned as intentional: listing never checks user existence, so the
-        stub auth header's unknown id reads as "no journeys yet" while POST
-        answers 404 (its FK proves nonexistence for free). A client cannot use
-        this endpoint to distinguish "no user" from "no journeys"; the real
-        identity module replaces the contract wholesale."""
-        resp = client.get("/journeys", headers={"X-User-Id": str(uuid4())})
+        """Pinned as intentional: listing never checks user existence, so a
+        valid session whose user row has since been erased reads as "no
+        journeys yet" while POST answers 404 (its FK proves nonexistence for
+        free). A client cannot use this endpoint to distinguish "no user"
+        from "no journeys"."""
+        resp = client.get("/journeys", headers=auth_header(uuid4()))
         assert resp.status_code == 200
         assert resp.json() == {"items": [], "count": 0, "limit": 50}
 
     def test_get_by_id(self, client: TestClient, conn: psycopg.Connection) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         created = client.post("/journeys", json=_payload(), headers=headers).json()
         resp = client.get(f"/journeys/{created['id']}", headers=headers)
         assert resp.status_code == 200
         assert resp.json() == created
 
     def test_get_absent_id_is_404(self, client: TestClient, conn: psycopg.Connection) -> None:
-        headers = {"X-User-Id": _mk_user(conn)}
+        headers = auth_header(_mk_user(conn))
         resp = client.get(f"/journeys/{uuid4()}", headers=headers)
         assert resp.status_code == 404
         assert resp.json()["detail"] == "journey not found"
@@ -339,8 +350,8 @@ class TestReadJourneys:
     def test_get_someone_elses_journey_is_404(
         self, client: TestClient, conn: psycopg.Connection
     ) -> None:
-        owner = {"X-User-Id": _mk_user(conn, "owner@example.com")}
-        snoop = {"X-User-Id": _mk_user(conn, "snoop@example.com")}
+        owner = auth_header(_mk_user(conn, "owner@example.com"))
+        snoop = auth_header(_mk_user(conn, "snoop@example.com"))
         created = client.post("/journeys", json=_payload(), headers=owner).json()
         # The owner sees it; the other user gets the same 404 as for a
         # nonexistent id — existence must not leak.
@@ -368,11 +379,11 @@ class TestProductionTransactionPath:
             setup.commit()
         try:
             with TestClient(create_app()) as client:
-                resp = client.post("/journeys", json=_payload(), headers={"X-User-Id": uid})
+                resp = client.post("/journeys", json=_payload(), headers=auth_header(uid))
                 assert resp.status_code == 201, resp.text
                 jid = resp.json()["id"]
                 # The 409 path rolls back rather than committing half a request.
-                dup = client.post("/journeys", json=_payload(), headers={"X-User-Id": uid})
+                dup = client.post("/journeys", json=_payload(), headers=auth_header(uid))
                 assert dup.status_code == 409
 
             # Visible from a second, fresh connection => a real COMMIT happened.

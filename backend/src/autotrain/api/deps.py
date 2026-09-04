@@ -13,7 +13,9 @@ from uuid import UUID
 from fastapi import Depends, Header, HTTPException, Request
 
 from autotrain.api.middleware import RequestTransaction
+from autotrain.core.config import get_settings
 from autotrain.core.db import Connection
+from autotrain.modules.identity import service as identity
 
 
 def get_conn(request: Request) -> Connection:
@@ -30,21 +32,29 @@ def get_conn(request: Request) -> Connection:
     return txn.conn()
 
 
-def current_user_id(x_user_id: Annotated[str | None, Header()] = None) -> UUID:
-    """DEVELOPMENT STUB — this is NOT authentication.
+def current_user_id(authorization: Annotated[str | None, Header()] = None) -> UUID:
+    """The authenticated user, from the `Authorization: Bearer <jwt>` header.
 
-    It trusts an `X-User-Id` header outright so the API is exercisable before
-    the identity module lands (magic-link + JWT, ARCHITECTURE §9). The identity
-    PR replaces this dependency wholesale; nothing else may read the header.
-    Note the stub can name a user that does not exist — services surface that
-    as UnknownUser and routers answer 404, never a 500.
+    Replaced the X-User-Id development stub. Every credential failure —
+    missing header, wrong scheme, tampered or expired token — collapses to
+    the same 401 on purpose: distinguishing WHY a token failed only helps an
+    attacker probing. The one exception is 503 for a missing signing secret,
+    which is an operations problem, not the caller's.
     """
-    if x_user_id is None:
-        raise HTTPException(status_code=401, detail="missing X-User-Id header")
-    try:
-        return UUID(x_user_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail="malformed X-User-Id header") from exc
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="missing Bearer token")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="invalid Authorization header")
+    token = authorization.removeprefix("Bearer ")
+    secret = get_settings().jwt_secret
+    if secret is None:
+        raise HTTPException(status_code=503, detail="no JWT secret configured")
+
+    user_id = identity.session_user(token, secret=secret.get_secret_value())
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    return user_id
 
 
 ConnDep = Annotated[Connection, Depends(get_conn)]
