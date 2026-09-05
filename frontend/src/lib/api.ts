@@ -55,9 +55,18 @@ export type Journey = {
   scheduled_arrival: string;
   status: string;
   created_at: string;
+  /** The operator, once the journey has been matched to a train (null before
+   * then), and whether AutoTrain can file with it. false is the case the
+   * list labels "X isn't supported yet". */
+  operator_name: string | null;
+  operator_supported: boolean | null;
 };
 
 export type Page<T> = { items: T[]; count: number; limit: number };
+
+/** GET /operators: one operator AutoTrain can file with. Public — the landing
+ * page shows the list before anyone signs in. */
+export type Operator = { atoc_code: string; name: string; min_delay_minutes: number };
 
 /** GET /journeys/{id}/decision: the frozen delay decision for one journey.
  * band_percent is null when the delay earned nothing. */
@@ -205,4 +214,9 @@ export const claims = {
   /** Hands the claim to the operator's form: returns the URL to open. */
   file: (id: string) => request<ClaimFiling>("POST", `/claims/${id}/file`),
   events: (id: string) => request<ClaimEvent[]>("GET", `/claims/${id}/events`),
+};
+
+export const operators = {
+  /** The operators AutoTrain can file with, by name. Needs no session. */
+  list: () => request<Operator[]>("GET", "/operators"),
 };

@@ -5,7 +5,15 @@ import { describeJourney } from "@/lib/journey-status";
 
 const NOW = new Date("2026-09-05T12:00:00Z");
 
-function journey(status: string, arrival = "2026-09-04T10:22:00Z"): Journey {
+type OperatorFields = Pick<Journey, "operator_name" | "operator_supported">;
+const UNMATCHED: OperatorFields = { operator_name: null, operator_supported: null };
+const UNSUPPORTED: OperatorFields = { operator_name: "CrossCountry", operator_supported: false };
+
+function journey(
+  status: string,
+  arrival = "2026-09-04T10:22:00Z",
+  operator: OperatorFields = UNMATCHED,
+): Journey {
   return {
     id: "j1",
     ticket_id: "t1",
@@ -16,6 +24,7 @@ function journey(status: string, arrival = "2026-09-04T10:22:00Z"): Journey {
     scheduled_arrival: arrival,
     status,
     created_at: "2026-09-01T00:00:00Z",
+    ...operator,
   };
 }
 
@@ -55,6 +64,20 @@ describe("a journey with no claim", () => {
       label: "Couldn't find this train",
       tone: "bad",
     });
+  });
+
+  it("names an operator AutoTrain cannot file with, whatever the journey's state", () => {
+    // The backend opens no claim for these, so "No claim" would read as
+    // "you were owed nothing". Known before the train has even run.
+    const label = "CrossCountry isn't supported yet";
+    expect(describeJourney(journey("assessed", undefined, UNSUPPORTED), undefined, NOW).label).toBe(label);
+    expect(
+      describeJourney(journey("pending", "2026-09-06T10:22:00Z", UNSUPPORTED), undefined, NOW).label,
+    ).toBe(label);
+    // A claim that exists anyway (opened before the rule) is still a claim.
+    expect(describeJourney(journey("assessed", undefined, UNSUPPORTED), claim("draft"), NOW).label).toBe(
+      "Ready to file",
+    );
   });
 });
 
