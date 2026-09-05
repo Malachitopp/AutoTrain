@@ -8,8 +8,8 @@
  *    or not the address has an account, and so does this screen.
  * 2. A visit from the emailed link carries #token=... in the address bar.
  *    The screen shows a Continue button; pressing it exchanges the token for
- *    a session (POST /auth/login/verify), stores it, and lands on the home
- *    page. A dead link falls back to the form with an explanation.
+ *    a session (POST /auth/login/verify), stores it, and lands on the
+ *    journeys page. A dead link falls back to the form with an explanation.
  *
  * The exchange waits for a click on purpose. Email security scanners open
  * links, and an attacker can send someone a link for the attacker's own
@@ -20,7 +20,7 @@
  */
 
 import { useRouter } from "next/navigation";
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useState, type ReactNode, type SubmitEvent } from "react";
 
 import { Brand } from "@/components/brand";
 import { ApiError, auth, describeError } from "@/lib/api";
@@ -55,7 +55,7 @@ export function Login() {
       const { access_token } = await auth.verifyLogin(token);
       session.store(access_token);
       scrubLink();
-      router.replace("/");
+      router.replace("/journeys");
     } catch (error: unknown) {
       if (error instanceof ApiError && error.status === 401) {
         // The API has judged the link dead: nothing to retry.
@@ -77,7 +77,7 @@ export function Login() {
     }
   }
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     setPhase({ kind: "sending" });
     try {

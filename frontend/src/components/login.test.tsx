@@ -97,7 +97,7 @@ describe("a visit from the emailed link", () => {
     expect(calls).toHaveLength(0);
     fireEvent.click(go);
 
-    await waitFor(() => expect(replace).toHaveBeenCalledWith("/"));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("/journeys"));
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe("http://api.test/auth/login/verify");
     expect(calls[0].init.body).toBe(JSON.stringify({ token: "magic-123" }));

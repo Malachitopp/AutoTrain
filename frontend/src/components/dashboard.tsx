@@ -17,9 +17,11 @@ export function Dashboard() {
   const router = useRouter();
 
   function signOut() {
-    // Forget the token here; the API keeps no session state to tell.
+    // Forget the token here; the API keeps no session state to tell. Then
+    // the front door, not the login form: signing out is not a request to
+    // sign in again.
     session.clear();
-    router.replace("/login");
+    router.replace("/");
   }
 
   return (
