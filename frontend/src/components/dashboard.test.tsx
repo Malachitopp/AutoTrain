@@ -44,7 +44,7 @@ describe("Dashboard", () => {
     await screen.findByText("rider@example.com");
   });
 
-  it("sign out forgets the token and goes to /login", async () => {
+  it("sign out forgets the token and goes to the front door", async () => {
     // The only place the session is ever forgotten on purpose: if this
     // stopped clearing storage, the button would still navigate and look
     // right, and the next visit would be signed in.
@@ -56,6 +56,6 @@ describe("Dashboard", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "Sign out" }));
     expect(session.token()).toBeNull();
-    expect(replace).toHaveBeenCalledWith("/login");
+    expect(replace).toHaveBeenCalledWith("/");
   });
 });
