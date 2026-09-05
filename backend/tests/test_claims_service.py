@@ -35,9 +35,11 @@ from autotrain.modules.claims.service import (
     get_claim,
     list_claims,
     open_claim,
+    operator_filings,
     run_claim_sweep,
     transition,
 )
+from conftest import mk_operator
 from conftest import mk_user as _mk_user
 from conftest import scalar as _scalar
 
@@ -70,13 +72,13 @@ def _mk_operator(
     claim_url: str | None = None,
     is_active: bool = True,
 ) -> UUID:
-    return _scalar(
-        conn.execute(
-            "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days, "
-            "adapter, claim_url, is_active) "
-            "VALUES (%s, 'Test Railways', 15, %s, %s, %s, %s) RETURNING id",
-            (atoc, claim_window_days, adapter, claim_url, is_active),
-        )
+    return mk_operator(
+        conn,
+        atoc,
+        adapter=adapter,
+        claim_url=claim_url,
+        is_active=is_active,
+        claim_window_days=claim_window_days,
     )
 
 
@@ -876,3 +878,20 @@ def test_list_claims_is_newest_first(conn: psycopg.Connection) -> None:
 
     assert len(claims) == 3
     assert [c.created_at for c in claims] == sorted((c.created_at for c in claims), reverse=True)
+
+
+# --- Operator lookups for the API --------------------------------------------
+
+
+def test_operator_filings_is_keyed_by_id_and_skips_unknown_ids(conn: psycopg.Connection) -> None:
+    supported = _mk_filable_operator(conn)
+    unsupported = _mk_operator(conn, "QX")
+
+    found = operator_filings(conn, [supported, unsupported, uuid4(), supported])
+
+    assert set(found) == {supported, unsupported}
+    assert found[supported].name == "Test Railways"
+    assert found[supported].is_supported
+    assert not found[unsupported].is_supported
+    # And nothing to look up is an empty answer, not a query for nothing.
+    assert operator_filings(conn, []) == {}

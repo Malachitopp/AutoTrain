@@ -14,6 +14,7 @@ belongs to are read through delays.service and journeys.service
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date
 from uuid import UUID
 
@@ -126,7 +127,14 @@ _EVENTS_FOR_CLAIM = (
 # portal lives, and whether the operator still runs trains. is_active rides
 # along because it gates FILING, not pricing — delays' _OPERATOR_BY_ATOC
 # documents the pricing half of that rule.
-_OPERATOR_FILING = "SELECT adapter, claim_url, is_active FROM operators WHERE id = %s"
+_OPERATOR_FILING = "SELECT id, name, adapter, claim_url, is_active FROM operators WHERE id = %s"
+
+# The same slice for a set of operators at once: the API's one lookup per page
+# of journeys. `= ANY(%s)` compares against an array; psycopg sends a Python
+# list as one.
+_OPERATORS_BY_ID = (
+    "SELECT id, name, adapter, claim_url, is_active FROM operators WHERE id = ANY(%s)"
+)
 
 _TOTALS_FOR_USER = (
     "SELECT COALESCE(SUM(amount_pence) FILTER (WHERE status = 'paid'), 0) AS recovered_pence,"
@@ -224,6 +232,10 @@ def operator_filing(conn: psycopg.Connection, operator_id: UUID) -> OperatorFili
         # row exists for as long as the claim naming it does.
         raise RuntimeError(f"operator {operator_id} not found")
     return row
+
+
+def operators_by_id(conn: psycopg.Connection, operator_ids: Sequence[UUID]) -> list[OperatorFiling]:
+    return db.fetch_all(conn, _OPERATORS_BY_ID, (list(operator_ids),), row_cls=OperatorFiling)
 
 
 def totals_for_user(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:

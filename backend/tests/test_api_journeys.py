@@ -23,7 +23,7 @@ import psycopg
 from fastapi.testclient import TestClient
 
 from autotrain.api.app import create_app
-from conftest import auth_header, mk_user
+from conftest import auth_header, mk_operator, mk_user
 
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
 
@@ -332,6 +332,105 @@ class TestReadJourneys:
         resp = client.get(f"/journeys/{created['id']}", headers=snoop)
         assert resp.status_code == 404
         assert resp.json()["detail"] == "journey not found"
+
+
+def _match(conn: psycopg.Connection, journey_id: str, operator_id: Any) -> None:
+    """Matching a journey to its train (and so its operator) is the ingestor's
+    job and not exercised here; the test plays it with one UPDATE."""
+    conn.execute("UPDATE journeys SET operator_id = %s WHERE id = %s", (operator_id, journey_id))
+
+
+def _added(client: TestClient, headers: dict[str, str], day: str) -> dict[str, Any]:
+    dep = datetime.fromisoformat(f"{day}T08:00:00+00:00")
+    body = _payload(
+        travel_date=day,
+        scheduled_departure=dep.isoformat(),
+        scheduled_arrival=(dep + timedelta(hours=2)).isoformat(),
+    )
+    resp = client.post("/journeys", json=body, headers=headers)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def _operator_fields(journey: dict[str, Any]) -> tuple[Any, Any]:
+    return journey["operator_name"], journey["operator_supported"]
+
+
+class TestOperatorFields:
+    """operator_name / operator_supported: the router's composition of the
+    journey row with the claims module's view of its operator. This is what
+    lets the client say "X isn't supported yet" rather than "no claim"."""
+
+    def test_list_answers_for_every_journey_on_the_page(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        """Every kind on one page, from one claims lookup: matched to a
+        supported operator; to one with no adapter; to one whose link is dead
+        (inactive); and not matched to a train yet."""
+        headers = auth_header(_mk_user(conn))
+        supported = _added(client, headers, "2026-08-10")
+        no_adapter = _added(client, headers, "2026-08-11")
+        inactive = _added(client, headers, "2026-08-12")
+        unmatched = _added(client, headers, "2026-08-13")
+        _match(
+            conn,
+            supported["id"],
+            mk_operator(
+                conn,
+                "QQ",
+                name="Test Railways",
+                adapter="deep_link",
+                claim_url="https://delayrepay.test-railways.example/",
+            ),
+        )
+        _match(conn, no_adapter["id"], mk_operator(conn, "QX", name="No Link Railways"))
+        _match(
+            conn,
+            inactive["id"],
+            mk_operator(
+                conn,
+                "QY",
+                name="Gone Railways",
+                adapter="deep_link",
+                claim_url="https://delayrepay.gone-railways.example/",
+                is_active=False,
+            ),
+        )
+
+        fields = {
+            item["id"]: _operator_fields(item)
+            for item in client.get("/journeys", headers=headers).json()["items"]
+        }
+
+        assert fields == {
+            supported["id"]: ("Test Railways", True),
+            no_adapter["id"]: ("No Link Railways", False),
+            inactive["id"]: ("Gone Railways", False),
+            unmatched["id"]: (None, None),
+        }
+
+    def test_create_and_get_carry_the_same_fields(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        """A journey just added has no operator (both null); once matched, GET
+        by id answers exactly as the list does."""
+        headers = auth_header(_mk_user(conn))
+        created = _added(client, headers, "2026-08-10")
+        assert _operator_fields(created) == (None, None)
+
+        _match(
+            conn,
+            created["id"],
+            mk_operator(
+                conn,
+                name="Test Railways",
+                adapter="deep_link",
+                claim_url="https://delayrepay.test-railways.example/",
+            ),
+        )
+        fetched = client.get(f"/journeys/{created['id']}", headers=headers).json()
+
+        assert _operator_fields(fetched) == ("Test Railways", True)
 
 
 class TestProductionTransactionPath:

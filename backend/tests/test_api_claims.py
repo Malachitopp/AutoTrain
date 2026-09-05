@@ -17,7 +17,7 @@ import psycopg
 from fastapi.testclient import TestClient
 
 from autotrain.modules.claims.service import open_claim, run_claim_sweep, transition
-from conftest import auth_header, mk_user, scalar
+from conftest import auth_header, mk_operator, mk_user, scalar
 
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
 ENTITLEMENT = 2275
@@ -39,14 +39,7 @@ def _mk_operator(
     # Supported by default: _mk_claim runs the real sweep, and the sweep opens
     # claims only for operators it can file with. Pass adapter='none' to build
     # one it skips.
-    return scalar(
-        conn.execute(
-            "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days, "
-            "adapter, claim_url) "
-            "VALUES (%s, 'Test Railways', 15, 28, %s, %s) RETURNING id",
-            (atoc, adapter, claim_url),
-        )
-    )
+    return mk_operator(conn, atoc, adapter=adapter, claim_url=claim_url)
 
 
 def _mk_entitled_journey(

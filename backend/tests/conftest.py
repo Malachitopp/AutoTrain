@@ -146,6 +146,29 @@ def mk_user(conn: psycopg.Connection, email: str = "user@example.com") -> Any:
     )
 
 
+def mk_operator(
+    conn: psycopg.Connection,
+    atoc: str = "QQ",
+    *,
+    name: str = "Test Railways",
+    adapter: str = "none",
+    claim_url: str | None = None,
+    is_active: bool = True,
+    claim_window_days: int = 28,
+) -> Any:
+    """An operator row. 'QQ' is not a real TOC, so it never collides with the
+    seeded reference data. adapter 'none' by default — the kind AutoTrain
+    cannot file with; pass adapter='deep_link' and a claim_url for one it can."""
+    return scalar(
+        conn.execute(
+            "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days, "
+            "adapter, claim_url, is_active) "
+            "VALUES (%s, %s, 15, %s, %s, %s, %s) RETURNING id",
+            (atoc, name, claim_window_days, adapter, claim_url, is_active),
+        )
+    )
+
+
 def auth_header(user_id: Any) -> dict[str, str]:
     """Authorization header for user_id — a real JWT minted with the suite's
     fixed secret, so API tests authenticate exactly the way production does

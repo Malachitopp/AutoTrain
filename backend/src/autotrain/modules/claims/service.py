@@ -33,7 +33,7 @@ money shown as pending for ever.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from uuid import UUID
@@ -46,7 +46,13 @@ import psycopg
 # climb past every import-linter contract.
 from autotrain.modules.claims import adapters as _adapters
 from autotrain.modules.claims import repository as _repository
-from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal, SupportedOperator
+from autotrain.modules.claims.models import (
+    ClaimEventRow,
+    ClaimRow,
+    ClaimTotal,
+    OperatorFiling,
+    SupportedOperator,
+)
 from autotrain.modules.delays import service as _delays
 
 # Re-exported: the two row shapes a claim is built from. Callers get them from
@@ -75,6 +81,7 @@ __all__ = [
     "IllegalTransition",
     "NotClaimable",
     "NotFilable",
+    "OperatorFiling",
     "SupportedOperator",
     "UnclaimedDetection",
     "UnknownClaim",
@@ -85,6 +92,7 @@ __all__ = [
     "get_claim",
     "list_claims",
     "open_claim",
+    "operator_filings",
     "run_claim_sweep",
     "supported_operators",
     "transition",
@@ -500,3 +508,19 @@ def claims_total(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:
 def supported_operators(conn: psycopg.Connection) -> list[SupportedOperator]:
     """The operators AutoTrain can file with, by name — what GET /operators shows."""
     return _repository.supported_operators(conn)
+
+
+def operator_filings(
+    conn: psycopg.Connection, operator_ids: Iterable[UUID]
+) -> dict[UUID, OperatorFiling]:
+    """The operators behind a set of journeys, keyed by id — for the API to say
+    which operator each journey is on and whether AutoTrain can file with it
+    (OperatorFiling.is_supported), without journeys learning the rule.
+
+    Ids naming no operator are simply absent from the result. No ids, no
+    query: a page of journeys none of which has been matched yet costs nothing
+    here."""
+    ids = list(dict.fromkeys(operator_ids))  # de-duplicated, order kept
+    if not ids:
+        return {}
+    return {row.id: row for row in _repository.operators_by_id(conn, ids)}

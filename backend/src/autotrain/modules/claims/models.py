@@ -65,8 +65,13 @@ class OperatorFiling:
 
     is_active gates FILING, not pricing (the delays repository documents the
     other half of that rule): a franchise change kills the claims portal, but
-    never a past entitlement."""
+    never a past entitlement.
 
+    id and name ride along for the API, which looks these rows up by journey to
+    say which operator a journey is on and whether we can file with it."""
+
+    id: UUID
+    name: str
     adapter: str
     claim_url: str | None
     is_active: bool
