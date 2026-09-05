@@ -67,7 +67,12 @@ function JourneyRow({
       setFiling({ kind: "opened", url });
       onChanged();
     } catch (error: unknown) {
+      // The API's reason, as it gives it: "no filing link is available for
+      // this operator" (most operators, today), or the claim has moved on
+      // (filed elsewhere, expired). Either way the button goes, and the row
+      // re-reads the claim so the label catches up.
       setFiling({ kind: "failed", error: describeError(error) });
+      onChanged();
     }
   }
 
@@ -92,7 +97,7 @@ function JourneyRow({
             <span className="text-[11px] text-muted">by {shortDate(view.fileBy)}</span>
           )}
         </div>
-        {view.canFile && (
+        {view.canFile && filing.kind !== "failed" && (
           <button
             type="button"
             onClick={file}

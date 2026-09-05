@@ -19,14 +19,14 @@ function journey(status: string, arrival = "2026-09-04T10:22:00Z"): Journey {
   };
 }
 
-function claim(status: string): Claim {
+function claim(status: string, fileBy = "2026-10-02"): Claim {
   return {
     id: "c1",
     journey_id: "j1",
     operator_id: "o1",
     amount_pence: 640,
     status,
-    file_by: "2026-10-02",
+    file_by: fileBy,
     submitted_at: null,
     resolved_at: null,
     operator_reference: null,
@@ -44,8 +44,10 @@ describe("a journey with no claim", () => {
     expect(describeJourney(journey("matched"), undefined, NOW).label).toBe("Checking");
   });
 
-  it("owes nothing once assessed", () => {
-    expect(describeJourney(journey("assessed"), undefined, NOW).label).toBe("No refund due");
+  it("says only what is known once assessed without a claim", () => {
+    // Could be on time, under threshold, a claim not yet opened by the
+    // scheduler, or an operator with no scheme: "No claim" fits all four.
+    expect(describeJourney(journey("assessed"), undefined, NOW).label).toBe("No claim");
   });
 
   it("says so when the train could not be found", () => {
@@ -56,11 +58,11 @@ describe("a journey with no claim", () => {
   });
 });
 
-describe("a journey with a claim", () => {
+describe("a journey with a claim, before the deadline", () => {
   it.each([
     ["draft", "Ready to file", true, "2026-10-02"],
-    ["ready", "Ready to file", true, "2026-10-02"],
     ["needs_user", "File it with the operator", true, "2026-10-02"],
+    ["ready", "Being filed for you", false, "2026-10-02"],
     ["submitted", "Claim sent", false, null],
     ["approved", "Claim sent", false, null],
     ["paid", "Paid", false, null],
@@ -78,5 +80,28 @@ describe("a journey with a claim", () => {
     expect(describeJourney(journey("assessed"), claim("something_new"), NOW).label).toBe(
       "something_new",
     );
+  });
+});
+
+describe("a claim past its deadline", () => {
+  // The API refuses a user filing once file_by is before today's UK date,
+  // so the button must go, whatever the status says.
+  it("a draft can no longer be filed", () => {
+    const view = describeJourney(journey("assessed"), claim("draft", "2026-09-04"), NOW);
+    expect(view).toMatchObject({ label: "Deadline passed", tone: "bad", canFile: false, fileBy: null });
+  });
+
+  it("a needs_user claim asks, because the backend cannot know", () => {
+    const view = describeJourney(journey("assessed"), claim("needs_user", "2026-09-04"), NOW);
+    expect(view.label).toBe("Deadline passed — did you file it?");
+    expect(view.canFile).toBe(false);
+  });
+
+  it("uses the London date, not the UTC one, for 'today'", () => {
+    // 23:30 UTC on 4 Sep is already 5 Sep in London: a 4 Sep deadline has passed.
+    const lateNight = new Date("2026-09-04T23:30:00Z");
+    expect(describeJourney(journey("assessed"), claim("draft", "2026-09-04"), lateNight).canFile).toBe(false);
+    // A deadline of today itself is still open.
+    expect(describeJourney(journey("assessed"), claim("draft", "2026-09-05"), lateNight).canFile).toBe(true);
   });
 });

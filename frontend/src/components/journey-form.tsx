@@ -42,7 +42,9 @@ export function JourneyForm() {
     setPhase({ kind: "saving" });
     const departure = londonToIso(date, departs);
     let arrival = londonToIso(date, arrives);
-    if (arrival <= departure) arrival = londonToIso(nextDay(date), arrives);
+    // Strictly earlier: an arrival equal to the departure is a typo, and the
+    // API says so (422) rather than this form turning it into a day's travel.
+    if (arrival < departure) arrival = londonToIso(nextDay(date), arrives);
     try {
       await journeys.create({
         origin_crs: from.toUpperCase(),
@@ -176,9 +178,11 @@ export function JourneyForm() {
                 onChange={(event) => setKind(event.target.value as JourneyKind)}
                 className={FIELD}
               >
+                {/* No Season option: the API accepts it, but the delay
+                    sweep skips season tickets (journeys.repository), so
+                    such a journey would read "Checking" for ever. */}
                 <option value="single">Single</option>
                 <option value="return">Return</option>
-                <option value="season">Season</option>
               </select>
             </div>
           </div>

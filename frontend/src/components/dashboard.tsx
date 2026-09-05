@@ -39,6 +39,14 @@ export function Dashboard() {
 
         {state.status === "ready" && (
           <>
+            {state.reloadError !== null && (
+              <p role="alert" className="mb-4 rounded-control border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-800">
+                Could not refresh: {state.reloadError}{" "}
+                <button type="button" onClick={state.reload} className="font-semibold underline">
+                  Try again
+                </button>
+              </p>
+            )}
             <MoneyBox summary={state.data.summary} />
 
             <div className="mt-10 flex items-center justify-between">

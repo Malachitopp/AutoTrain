@@ -138,14 +138,48 @@ describe("Dashboard", () => {
     expect(screen.getByRole("link", { name: "open it here" })).toBeDefined();
   });
 
-  it("shows the API's reason when filing is not possible", async () => {
-    page({ recovered_pence: 0, pending_pence: 640 }, [JOURNEY], [CLAIM], {
-      "/claims/c1/file": { status: 409, body: { detail: "this operator has no claim link yet" } },
+  it("shows the API's reason when filing is not possible, drops the button, and re-reads the claim", async () => {
+    const api = page({ recovered_pence: 0, pending_pence: 640 }, [JOURNEY], [CLAIM], {
+      "/claims/c1/file": { status: 409, body: { detail: "no filing link is available for this operator" } },
     });
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: "File" }));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toBe("this operator has no claim link yet");
+    expect(alert.textContent).toBe("no filing link is available for this operator");
+    // No button left to press again for the same answer.
+    expect(screen.queryByRole("button", { name: "File" })).toBeNull();
+    // And the claim is re-read, in case the 409 meant it had moved on.
+    await waitFor(() => expect(api.calls.filter((c) => c === "GET /claims")).toHaveLength(2));
+  });
+
+  it("keeps the page and the claim link when a reload fails", async () => {
+    // First load succeeds; the reload after filing fails. The person must
+    // still have the operator's link and the rest of the page.
+    let journeyCalls = 0;
+    vi.stubGlobal("fetch", async (url: string) => {
+      const path = new URL(url).pathname;
+      const json = (status: number, body: unknown) =>
+        new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+      if (path === "/auth/me") return json(200, RIDER);
+      if (path === "/claims/summary") return json(200, { recovered_pence: 0, pending_pence: 640 });
+      if (path === "/claims") return json(200, { items: [CLAIM], count: 1, limit: 50 });
+      if (path === "/claims/c1/file") return json(200, { url: "https://operator.test/claim", status: "needs_user" });
+      if (path === "/journeys") {
+        journeyCalls += 1;
+        return journeyCalls === 1
+          ? json(200, { items: [JOURNEY], count: 1, limit: 50 })
+          : json(503, { detail: "database unavailable" });
+      }
+      return json(404, { detail: "not found" });
+    });
+    vi.stubGlobal("open", vi.fn());
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "File" }));
+
+    await screen.findByText(/Could not refresh/);
+    expect(screen.getByRole("link", { name: "open it here" })).toBeDefined();
+    expect(screen.getByText("EUS → MAN")).toBeDefined();
+    expect(screen.queryByText("Could not load your journeys")).toBeNull();
   });
 
   it("explains and offers a retry when the page cannot load", async () => {

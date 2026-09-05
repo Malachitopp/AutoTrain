@@ -8,6 +8,11 @@
  *
  * No library: the browser's Intl already knows Europe/London's offset at
  * any instant, so the conversion is "take the offset away from the reading".
+ *
+ * Known limit: on the night the clocks go back (late October) the hour
+ * 01:00–01:59 happens twice in London. A reading in that hour is taken as
+ * the second, GMT occurrence. One hour a year, and only for trains timed in
+ * it; noted here rather than solved.
  */
 
 const LONDON = "Europe/London";

@@ -41,3 +41,18 @@ const timeFormat = new Intl.DateTimeFormat("en-GB", {
 export function clockTime(isoInstant: string): string {
   return timeFormat.format(new Date(isoInstant));
 }
+
+// en-CA writes dates as YYYY-MM-DD, which is the ISO shape the API uses.
+const isoDateFormat = new Intl.DateTimeFormat("en-CA", {
+  timeZone: LONDON,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+/** The London calendar date of an instant, as "2026-09-05". Deadlines
+ * (file_by) are UK dates, so "is it past the deadline" compares this with
+ * them, not the UTC date — they differ for an hour a night in summer. */
+export function londonDate(instant: Date): string {
+  return isoDateFormat.format(instant);
+}

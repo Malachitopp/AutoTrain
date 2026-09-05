@@ -5,6 +5,11 @@
  * claims. Claims are matched to journeys in the browser by journey_id, so
  * no request depends on another and the page appears as soon as the slowest
  * one answers. `reload` runs all three again — after filing a claim, say.
+ *
+ * Once the page has good data it never blanks out: a reload keeps the last
+ * good copy on screen while the new one is fetched, and a reload that fails
+ * keeps it too, with the failure reported alongside. Only a page that has
+ * never loaded shows the full error screen.
  */
 
 import { useEffect, useState } from "react";
@@ -16,30 +21,35 @@ export type Dashboard = { summary: ClaimSummary; journeys: Journey[]; claims: Cl
 export type DashboardState =
   | { status: "loading" }
   | { status: "error"; message: string; retry: () => void }
-  /** `reloading` is true while a reload is in flight: the data shown is the
-   * last good copy, so the page never blanks out under the person. */
-  | { status: "ready"; data: Dashboard; reload: () => void; reloading: boolean };
+  | {
+      status: "ready";
+      data: Dashboard;
+      reload: () => void;
+      /** A reload is in flight; `data` is the last good copy. */
+      reloading: boolean;
+      /** The last reload failed; `data` is still the last good copy. */
+      reloadError: string | null;
+    };
 
-/** What came back, and for which attempt: an answer to an earlier attempt
- * is stale once a reload has started. */
-type Result = { attempt: number; data: Dashboard } | { attempt: number; error: string };
+/** Each answer remembers which attempt it answers: an answer to an earlier
+ * attempt is stale once a newer one has started. */
+type Good = { attempt: number; data: Dashboard };
+type Failed = { attempt: number; message: string };
 
 export function useDashboard(): DashboardState {
   const [attempt, setAttempt] = useState(0);
-  const [result, setResult] = useState<Result | null>(null);
+  const [good, setGood] = useState<Good | null>(null);
+  const [failed, setFailed] = useState<Failed | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     Promise.all([claims.summary(), journeys.list(), claims.list()])
       .then(([summary, journeyPage, claimPage]) => {
         if (cancelled) return;
-        setResult({
-          attempt,
-          data: { summary, journeys: journeyPage.items, claims: claimPage.items },
-        });
+        setGood({ attempt, data: { summary, journeys: journeyPage.items, claims: claimPage.items } });
       })
       .catch((error: unknown) => {
-        if (!cancelled) setResult({ attempt, error: describeError(error) });
+        if (!cancelled) setFailed({ attempt, message: describeError(error) });
       });
     return () => {
       cancelled = true;
@@ -47,15 +57,19 @@ export function useDashboard(): DashboardState {
   }, [attempt]);
 
   const again = () => setAttempt((n) => n + 1);
+  const failedNow = failed !== null && failed.attempt === attempt ? failed.message : null;
 
-  if (result === null) return { status: "loading" };
-  if ("error" in result) {
-    // A retry after an error has nothing to show meanwhile.
-    if (result.attempt !== attempt) return { status: "loading" };
-    return { status: "error", message: result.error, retry: again };
+  if (good === null) {
+    // Nothing has ever loaded: a failure is the whole screen.
+    return failedNow !== null
+      ? { status: "error", message: failedNow, retry: again }
+      : { status: "loading" };
   }
-  // A reload after good data keeps showing that data until the new copy
-  // lands; rows keep their own state (an opened claim link, say) because
-  // they are never unmounted.
-  return { status: "ready", data: result.data, reload: again, reloading: result.attempt !== attempt };
+  return {
+    status: "ready",
+    data: good.data,
+    reload: again,
+    reloading: good.attempt !== attempt && failedNow === null,
+    reloadError: failedNow,
+  };
 }
