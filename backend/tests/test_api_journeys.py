@@ -15,18 +15,15 @@ least one test. It commits for real and cleans up after itself.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 import psycopg
-import pytest
 from fastapi.testclient import TestClient
 
 from autotrain.api.app import create_app
-from autotrain.api.deps import get_conn
-from conftest import auth_header, mk_user
+from conftest import auth_header, mk_operator, mk_user
 
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
 
@@ -65,30 +62,6 @@ def _single_error(resp: Any) -> dict[str, Any]:
     detail = resp.json()["detail"]
     assert len(detail) == 1, detail
     return detail[0]
-
-
-@pytest.fixture
-def client(conn: psycopg.Connection) -> Iterator[TestClient]:
-    app = create_app()
-
-    def _rollback_conn() -> Iterator[psycopg.Connection]:
-        # A savepoint per request: a request that dies mid-transaction (409
-        # duplicate, 404 on the users FK) must not poison the connection for
-        # the next request in the same test. The fixture rolls back the outer
-        # transaction afterwards, so nothing ever commits.
-        with conn.transaction():
-            yield conn
-
-    # Pin the outer transaction open BEFORE any request runs: psycopg only
-    # issues BEGIN on first use, and conn.transaction() on an idle connection
-    # opens a real top-level transaction whose exit would COMMIT — the
-    # "nothing ever commits" comment above is only true once this has run.
-    conn.execute("SELECT 1")
-
-    app.dependency_overrides[get_conn] = _rollback_conn
-    # Deliberately no `with`: entering the client would run the lifespan and
-    # open the real pool, which these tests must never touch.
-    yield TestClient(app)
 
 
 class TestHealth:
@@ -359,6 +332,105 @@ class TestReadJourneys:
         resp = client.get(f"/journeys/{created['id']}", headers=snoop)
         assert resp.status_code == 404
         assert resp.json()["detail"] == "journey not found"
+
+
+def _match(conn: psycopg.Connection, journey_id: str, operator_id: Any) -> None:
+    """Matching a journey to its train (and so its operator) is the ingestor's
+    job and not exercised here; the test plays it with one UPDATE."""
+    conn.execute("UPDATE journeys SET operator_id = %s WHERE id = %s", (operator_id, journey_id))
+
+
+def _added(client: TestClient, headers: dict[str, str], day: str) -> dict[str, Any]:
+    dep = datetime.fromisoformat(f"{day}T08:00:00+00:00")
+    body = _payload(
+        travel_date=day,
+        scheduled_departure=dep.isoformat(),
+        scheduled_arrival=(dep + timedelta(hours=2)).isoformat(),
+    )
+    resp = client.post("/journeys", json=body, headers=headers)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def _operator_fields(journey: dict[str, Any]) -> tuple[Any, Any]:
+    return journey["operator_name"], journey["operator_supported"]
+
+
+class TestOperatorFields:
+    """operator_name / operator_supported: the router's composition of the
+    journey row with the claims module's view of its operator. This is what
+    lets the client say "X isn't supported yet" rather than "no claim"."""
+
+    def test_list_answers_for_every_journey_on_the_page(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        """Every kind on one page, from one claims lookup: matched to a
+        supported operator; to one with no adapter; to one whose link is dead
+        (inactive); and not matched to a train yet."""
+        headers = auth_header(_mk_user(conn))
+        supported = _added(client, headers, "2026-08-10")
+        no_adapter = _added(client, headers, "2026-08-11")
+        inactive = _added(client, headers, "2026-08-12")
+        unmatched = _added(client, headers, "2026-08-13")
+        _match(
+            conn,
+            supported["id"],
+            mk_operator(
+                conn,
+                "QQ",
+                name="Test Railways",
+                adapter="deep_link",
+                claim_url="https://delayrepay.test-railways.example/",
+            ),
+        )
+        _match(conn, no_adapter["id"], mk_operator(conn, "QX", name="No Link Railways"))
+        _match(
+            conn,
+            inactive["id"],
+            mk_operator(
+                conn,
+                "QY",
+                name="Gone Railways",
+                adapter="deep_link",
+                claim_url="https://delayrepay.gone-railways.example/",
+                is_active=False,
+            ),
+        )
+
+        fields = {
+            item["id"]: _operator_fields(item)
+            for item in client.get("/journeys", headers=headers).json()["items"]
+        }
+
+        assert fields == {
+            supported["id"]: ("Test Railways", True),
+            no_adapter["id"]: ("No Link Railways", False),
+            inactive["id"]: ("Gone Railways", False),
+            unmatched["id"]: (None, None),
+        }
+
+    def test_create_and_get_carry_the_same_fields(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        """A journey just added has no operator (both null); once matched, GET
+        by id answers exactly as the list does."""
+        headers = auth_header(_mk_user(conn))
+        created = _added(client, headers, "2026-08-10")
+        assert _operator_fields(created) == (None, None)
+
+        _match(
+            conn,
+            created["id"],
+            mk_operator(
+                conn,
+                name="Test Railways",
+                adapter="deep_link",
+                claim_url="https://delayrepay.test-railways.example/",
+            ),
+        )
+        fetched = client.get(f"/journeys/{created['id']}", headers=headers).json()
+
+        assert _operator_fields(fetched) == ("Test Railways", True)
 
 
 class TestProductionTransactionPath:

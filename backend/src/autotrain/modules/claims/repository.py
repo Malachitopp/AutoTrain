@@ -14,13 +14,20 @@ belongs to are read through delays.service and journeys.service
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date
 from uuid import UUID
 
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal, OperatorFiling
+from autotrain.modules.claims.models import (
+    ClaimEventRow,
+    ClaimRow,
+    ClaimTotal,
+    OperatorFiling,
+    SupportedOperator,
+)
 
 # The full claims column list is repeated verbatim in each statement below, for
 # the same two reasons as in the journeys repository: core.db maps rows by name
@@ -120,7 +127,14 @@ _EVENTS_FOR_CLAIM = (
 # portal lives, and whether the operator still runs trains. is_active rides
 # along because it gates FILING, not pricing — delays' _OPERATOR_BY_ATOC
 # documents the pricing half of that rule.
-_OPERATOR_FILING = "SELECT adapter, claim_url, is_active FROM operators WHERE id = %s"
+_OPERATOR_FILING = "SELECT id, name, adapter, claim_url, is_active FROM operators WHERE id = %s"
+
+# The same slice for a set of operators at once: the API's one lookup per page
+# of journeys. `= ANY(%s)` compares against an array; psycopg sends a Python
+# list as one.
+_OPERATORS_BY_ID = (
+    "SELECT id, name, adapter, claim_url, is_active FROM operators WHERE id = ANY(%s)"
+)
 
 _TOTALS_FOR_USER = (
     "SELECT COALESCE(SUM(amount_pence) FILTER (WHERE status = 'paid'), 0) AS recovered_pence,"
@@ -129,6 +143,14 @@ _TOTALS_FOR_USER = (
     "'submitted', 'approved')), 0) AS pending_pence "
     "FROM claims "
     "WHERE user_id = %s"
+)
+
+# The public operator list: the operators claims can file with, by name.
+# `adapter <> 'none' AND is_active` is the SQL half of
+# OperatorFiling.is_supported; the sweep applies the Python half per row.
+_SUPPORTED_OPERATORS = (
+    "SELECT atoc_code, name, min_delay_minutes FROM operators "
+    "WHERE adapter <> 'none' AND is_active ORDER BY name"
 )
 
 
@@ -212,8 +234,17 @@ def operator_filing(conn: psycopg.Connection, operator_id: UUID) -> OperatorFili
     return row
 
 
+def operators_by_id(conn: psycopg.Connection, operator_ids: Sequence[UUID]) -> list[OperatorFiling]:
+    return db.fetch_all(conn, _OPERATORS_BY_ID, (list(operator_ids),), row_cls=OperatorFiling)
+
+
 def totals_for_user(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:
     row = db.fetch_one(conn, _TOTALS_FOR_USER, (user_id,), row_cls=ClaimTotal)
     if row is None:
         raise RuntimeError("totals aggregate produced no row")
     return row
+
+
+def supported_operators(conn: psycopg.Connection) -> list[SupportedOperator]:
+    """Every operator claims can file with, sorted by name for display."""
+    return db.fetch_all(conn, _SUPPORTED_OPERATORS, (), row_cls=SupportedOperator)

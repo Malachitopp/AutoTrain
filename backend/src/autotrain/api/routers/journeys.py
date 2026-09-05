@@ -3,10 +3,17 @@
 Thin by rule (ARCHITECTURE §3): parse the request, call the journeys service,
 shape the response. Domain exceptions map to status codes here; SQL and psycopg
 stay behind the service.
+
+A journey names its operator; whether that operator is one AutoTrain can file
+with is the claims module's rule. The two are composed here, the way
+get_journey_decision composes journeys and delays: one claims lookup per
+request, then every JourneyOut is built from its row plus that answer.
 """
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Iterable, Mapping
 from typing import Annotated
 from uuid import UUID
 
@@ -14,10 +21,34 @@ from fastapi import APIRouter, HTTPException, Query
 
 from autotrain.api.deps import ConnDep, UserIdDep
 from autotrain.api.schemas import DecisionOut, JourneyCreate, JourneyOut, JourneyPage
+from autotrain.modules.claims import service as claims
 from autotrain.modules.delays import service as delays
 from autotrain.modules.journeys import service
 
 router = APIRouter(prefix="/journeys", tags=["journeys"])
+
+
+def _operator_ids(rows: Iterable[service.JourneyRow]) -> list[UUID]:
+    """The operators a page of journeys needs looked up. A journey not yet
+    matched to a train has none."""
+    return [row.operator_id for row in rows if row.operator_id is not None]
+
+
+def _journey_out(
+    row: service.JourneyRow, operators: Mapping[UUID, claims.OperatorFiling]
+) -> JourneyOut:
+    """A JourneyOut from its row plus the claims lookup — the composition that
+    keeps "supported" the claims module's rule and out of journeys."""
+    operator = operators.get(row.operator_id) if row.operator_id is not None else None
+    return JourneyOut.model_validate(
+        {
+            # The row's other columns (user_id, darwin_*) are not wire fields;
+            # pydantic ignores keys the model does not declare.
+            **dataclasses.asdict(row),
+            "operator_name": None if operator is None else operator.name,
+            "operator_supported": None if operator is None else operator.is_supported,
+        }
+    )
 
 
 @router.post("", status_code=201)
@@ -44,7 +75,8 @@ def create_journey(payload: JourneyCreate, conn: ConnDep, user_id: UserIdDep) ->
         # Backstop only: JourneyCreate mirrors every constraint that can raise
         # this, so a request should fail as a schema 422 before any SQL runs.
         raise HTTPException(status_code=422, detail="invalid journey values") from exc
-    return JourneyOut.model_validate(row)
+    # Just added, so not yet matched to a train: no operator to look up.
+    return _journey_out(row, {})
 
 
 @router.get("")
@@ -54,7 +86,8 @@ def list_journeys(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> JourneyPage:
     rows = service.list_journeys(conn, user_id, limit=limit)
-    items = [JourneyOut.model_validate(row) for row in rows]
+    operators = claims.operator_filings(conn, _operator_ids(rows))
+    items = [_journey_out(row, operators) for row in rows]
     return JourneyPage(items=items, count=len(items), limit=limit)
 
 
@@ -64,7 +97,7 @@ def get_journey(journey_id: UUID, conn: ConnDep, user_id: UserIdDep) -> JourneyO
     if row is None:
         # Absent and not-yours answer identically: existence never leaks.
         raise HTTPException(status_code=404, detail="journey not found")
-    return JourneyOut.model_validate(row)
+    return _journey_out(row, claims.operator_filings(conn, _operator_ids([row])))
 
 
 @router.get("/{journey_id}/decision")

@@ -1,4 +1,4 @@
-"""Wire shapes for the journeys, claims and auth endpoints.
+"""Wire shapes for the journeys, claims, auth and operators endpoints.
 
 Validation happens here, before any SQL runs: a request that would violate a
 0005 constraint fails as a 422 naming the offending field, not as a database
@@ -49,7 +49,8 @@ class JourneyCreate(BaseModel):
 
 
 class JourneyOut(BaseModel):
-    """A journey as the API reports it. Built straight from a JourneyRow."""
+    """A journey as the API reports it: its JourneyRow, plus the operator lookup
+    the router adds (routers/journeys.py)."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -62,6 +63,12 @@ class JourneyOut(BaseModel):
     scheduled_arrival: AwareDatetime
     status: str
     created_at: AwareDatetime
+    # The operator, once the journey has been matched to a train, and whether
+    # AutoTrain can file with it — the claims module's rule, composed in by
+    # the router. Both null until the match. A false is what lets a client
+    # say "X isn't supported yet" instead of "no claim".
+    operator_name: str | None
+    operator_supported: bool | None
 
     @field_serializer("scheduled_departure", "scheduled_arrival", "created_at")
     def _in_utc(self, value: datetime) -> datetime:
@@ -201,3 +208,15 @@ class UserOut(BaseModel):
         # claim_consent_at is NULL until the user consents, so None passes
         # through (as in ClaimOut).
         return value.astimezone(UTC) if value is not None else None
+
+
+class OperatorOut(BaseModel):
+    """One operator AutoTrain can file a claim with — the public list behind
+    GET /operators. Exactly these three fields: no id, no claim_url, nothing
+    a signed-out visitor has no business seeing."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    atoc_code: str
+    name: str
+    min_delay_minutes: int
