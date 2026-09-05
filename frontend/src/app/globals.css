@@ -1,26 +1,194 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+/* Soft Modern tokens, from the design handoff (screen 4a). Declared in
+   Tailwind's @theme so they become utilities: bg-brand, text-muted,
+   border-line, rounded-card, shadow-soft, and so on. Change a value here
+   and every screen follows. */
+@theme {
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --color-ink: #0f172a;
+  --color-muted: #64748b;
+  --color-line: #e2e8f0;
+  --color-brand: #2563eb;
+  --color-cta: #ec4899;
+  --shadow-soft: 0 10px 30px rgb(2 6 23 / 0.1);
+  --shadow-card: 0 1px 3px rgb(2 6 23 / 0.06);
+  --radius-card: 16px;
+  --radius-control: 12px;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: #ffffff;
+  color: var(--color-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
+
+/* ── Backdrop (design screen 4a) ──────────────────────────────────────────
+   Rendered once by components/backdrop.tsx, fixed behind every page. The
+   pointer writes --mx and --my (each -0.5 … 0.5) onto .backdrop; each layer
+   drifts a few pixels against them, further layers less than nearer ones. */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background: #ffffff;
+}
+
+.backdrop-orb {
+  position: absolute;
+  border-radius: 50%;
+}
+.backdrop-orb-1 {
+  left: -120px;
+  top: -120px;
+  width: 420px;
+  height: 420px;
+  background: rgb(37 99 235 / 0.15);
+  filter: blur(64px);
+  translate: calc(var(--mx, 0) * -8px) calc(var(--my, 0) * -6px);
+}
+.backdrop-orb-2 {
+  right: -140px;
+  top: 60px;
+  width: 440px;
+  height: 440px;
+  background: rgb(236 72 153 / 0.15);
+  filter: blur(64px);
+  translate: calc(var(--mx, 0) * 10px) calc(var(--my, 0) * -4px);
+}
+.backdrop-orb-3 {
+  left: 34%;
+  top: 250px;
+  width: 520px;
+  height: 520px;
+  background: rgb(37 99 235 / 0.1);
+  filter: blur(72px);
+  translate: calc(var(--mx, 0) * -5px) calc(var(--my, 0) * -3px);
+}
+
+/* Hills: a strip twice the viewport wide slides left by half its width,
+   forever. Every hill has a twin 50% further along, so the moment the loop
+   wraps looks identical to the moment before it — drop a twin and a shape
+   pops into view at the seam. */
+.backdrop-hills {
+  position: absolute;
+  inset: 0;
+  translate: calc(var(--mx, 0) * -6px) calc(var(--my, 0) * -3px);
+}
+.backdrop-hill-strip {
+  position: absolute;
+  bottom: 300px;
+  left: 0;
+  width: 200%;
+  height: 220px;
+  animation: at-drift 180s linear infinite;
+}
+.backdrop-hill {
+  position: absolute;
+  border-radius: 50%;
+  width: 700px;
+  height: 300px;
+  bottom: -120px;
+  background: rgb(37 99 235 / 0.07);
+}
+.backdrop-hill:nth-child(2),
+.backdrop-hill:nth-child(4) {
+  width: 820px;
+  height: 330px;
+  bottom: -140px;
+  background: rgb(37 99 235 / 0.05);
+}
+.backdrop-hill:nth-child(1) {
+  left: -4%;
+}
+.backdrop-hill:nth-child(2) {
+  left: 28%;
+}
+.backdrop-hill:nth-child(3) {
+  left: 46%;
+}
+.backdrop-hill:nth-child(4) {
+  left: 78%;
+}
+
+/* Rail: a clip window at the bottom of the screen holds a ground plane
+   tilted 75° away from the viewer. Inside, a strip twice the plane's height
+   slides downward — downward in plane space reads as toward the viewer.
+   The plane is anchored at the window's bottom edge on purpose: anchored at
+   the top it projects entirely above the window and nothing shows. */
+.backdrop-rail {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 300px;
+  overflow: hidden;
+  perspective: 560px;
+  perspective-origin: 50% 0;
+}
+.backdrop-rail-plane {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  width: 2400px;
+  height: 1400px;
+  margin-left: -1200px;
+  transform-origin: 50% 100%;
+  transform: rotateX(75deg);
+}
+.backdrop-rail-strip {
+  width: 100%;
+  height: 200%;
+  background-color: #f8fafc;
+  /* Ties every 118px, and two rail bands either side of the centre line. */
+  background-image:
+    repeating-linear-gradient(0deg, rgb(15 23 42 / 0.1) 0 22px, transparent 22px 118px),
+    linear-gradient(
+      90deg,
+      transparent 0 46.4%,
+      rgb(37 99 235 / 0.45) 46.4% 47.6%,
+      transparent 47.6% 52.4%,
+      rgb(37 99 235 / 0.45) 52.4% 53.6%,
+      transparent 53.6%
+    );
+  animation: at-forward 6.5s linear infinite;
+}
+.backdrop-rail-scrim {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 150px;
+  background: linear-gradient(180deg, #ffffff, rgb(255 255 255 / 0));
+}
+
+@keyframes at-drift {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+@keyframes at-forward {
+  from {
+    transform: translateY(-50%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+/* People who ask their system for less motion get a still picture. */
+@media (prefers-reduced-motion: reduce) {
+  [data-anim] {
+    animation: none !important;
+  }
 }

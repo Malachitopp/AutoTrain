@@ -113,6 +113,13 @@ export class ApiError extends Error {
   }
 }
 
+/** What to show a person when a call fails. ApiError carries the API's own
+ * words; anything else is almost always the API being unreachable. */
+export function describeError(error: unknown): string {
+  if (error instanceof ApiError) return error.detail;
+  return "Could not reach the API. Is it running?";
+}
+
 // --- The single request path --------------------------------------------
 
 /** Read at build time for browser bundles: only NEXT_PUBLIC_ variables are
