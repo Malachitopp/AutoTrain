@@ -1,49 +1,77 @@
 "use client";
 
 /**
- * The home screen's frame: the header from the design (screen 4a) with who
- * is signed in and how to sign out. The journey card and the refund ledger
- * (screen 1e) arrive in the next step and slot in below.
+ * The journeys page: the money box, then every journey with its status.
+ * With no journeys yet the list is replaced by the one thing to do next.
+ * Layout follows the design's screen 1e (a trip list over a refund ledger)
+ * in the Soft Modern skin.
  */
 
-import { useRouter } from "next/navigation";
+import Link from "next/link";
 
-import { Brand } from "@/components/brand";
-import { useCurrentUser } from "@/components/require-session";
-import * as session from "@/lib/session";
+import { AppHeader } from "@/components/app-header";
+import { JourneyList } from "@/components/journey-list";
+import { MoneyBox } from "@/components/money-box";
+import { useDashboard } from "@/lib/use-dashboard";
+
+const ADD = "rounded-control bg-cta px-5 py-2.5 text-sm font-semibold text-white shadow-soft transition-colors hover:bg-pink-700";
 
 export function Dashboard() {
-  const user = useCurrentUser();
-  const router = useRouter();
-
-  function signOut() {
-    // Forget the token here; the API keeps no session state to tell. Then
-    // the front door, not the login form: signing out is not a request to
-    // sign in again.
-    session.clear();
-    router.replace("/");
-  }
+  const state = useDashboard();
 
   return (
     <>
-      <header className="flex items-center gap-7 border-b border-line/70 bg-white/80 px-10 py-4 backdrop-blur">
-        <Brand />
-        <span className="ml-3.5 text-sm font-semibold">Journeys</span>
-        <span className="ml-auto text-sm text-muted">{user.email}</span>
-        <button
-          type="button"
-          onClick={signOut}
-          className="rounded-control border border-line bg-white px-4 py-2 text-sm font-semibold transition-colors hover:bg-slate-50"
-        >
-          Sign out
-        </button>
-      </header>
-      <main className="mx-auto w-full max-w-4xl px-10 py-16">
-        <h1 className="text-4xl font-extrabold tracking-[-0.03em]">Your journeys</h1>
-        <p className="mt-3 max-w-[60ch] text-lg leading-relaxed text-muted">
-          Add a journey. When the train runs late, we work out what you are owed and get the
-          claim ready. Your journeys and claims will appear here.
-        </p>
+      <AppHeader />
+      <main className="mx-auto w-full max-w-3xl px-6 py-10 sm:px-10">
+        {state.status === "loading" && <p className="text-muted">Loading your journeys…</p>}
+
+        {state.status === "error" && (
+          <section className="rounded-card border border-line bg-white/90 p-8 shadow-soft backdrop-blur">
+            <h1 className="text-2xl font-extrabold tracking-[-0.02em]">Could not load your journeys</h1>
+            <p role="alert" className="mt-2 text-sm text-red-700">
+              {state.message}
+            </p>
+            <button type="button" onClick={state.retry} className={`mt-6 ${ADD}`}>
+              Try again
+            </button>
+          </section>
+        )}
+
+        {state.status === "ready" && (
+          <>
+            <MoneyBox summary={state.data.summary} />
+
+            <div className="mt-10 flex items-center justify-between">
+              <h1 className="text-2xl font-extrabold tracking-[-0.02em]">Your journeys</h1>
+              {state.data.journeys.length > 0 && (
+                <Link href="/journeys/new" className={ADD}>
+                  Add a journey
+                </Link>
+              )}
+            </div>
+
+            {state.data.journeys.length === 0 ? (
+              <section className="mt-4 rounded-card border border-line bg-white/90 p-8 text-center shadow-soft backdrop-blur">
+                <h2 className="text-xl font-bold">No journeys yet</h2>
+                <p className="mx-auto mt-2 max-w-[44ch] text-muted">
+                  Add the first one and we will watch the train for you. If it runs late enough,
+                  the claim appears here with the amount and the deadline.
+                </p>
+                <Link href="/journeys/new" className={`mt-6 inline-block ${ADD}`}>
+                  Add your first journey
+                </Link>
+              </section>
+            ) : (
+              <div className="mt-4">
+                <JourneyList
+                  journeys={state.data.journeys}
+                  claims={state.data.claims}
+                  onChanged={state.reload}
+                />
+              </div>
+            )}
+          </>
+        )}
       </main>
     </>
   );
