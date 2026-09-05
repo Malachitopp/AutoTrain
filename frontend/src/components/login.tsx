@@ -112,7 +112,7 @@ export function Login() {
         <button
           type="button"
           onClick={() => finishSignIn(linkToken)}
-          className="mt-6 w-full rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-600"
+          className="mt-6 w-full rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-700"
         >
           Continue
         </button>
@@ -157,7 +157,7 @@ export function Login() {
         <button
           type="submit"
           disabled={phase.kind === "sending"}
-          className="mt-3 rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-600 disabled:opacity-50"
+          className="mt-3 rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-700 disabled:opacity-50"
         >
           {phase.kind === "sending" ? "Sending…" : "Email me a link"}
         </button>

@@ -7,10 +7,16 @@
 @theme {
   --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
   --color-ink: #0f172a;
-  --color-muted: #64748b;
+  /* The design's muted (#64748b) is 4.76:1 on white but drops under 4.5:1
+     where text sits on a backdrop orb; one shade darker keeps every use of
+     it readable (WCAG AA). */
+  --color-muted: #475569;
   --color-line: #e2e8f0;
   --color-brand: #2563eb;
-  --color-cta: #ec4899;
+  /* The design's pink (#ec4899) gives white button text 3.5:1, below the
+     4.5:1 the standard asks for. One shade darker (4.6:1) is still the
+     design's pink; buttons hover one shade darker again. */
+  --color-cta: #db2777;
   --shadow-soft: 0 10px 30px rgb(2 6 23 / 0.1);
   --shadow-card: 0 1px 3px rgb(2 6 23 / 0.06);
   --radius-card: 16px;

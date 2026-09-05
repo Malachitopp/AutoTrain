@@ -41,8 +41,8 @@ export function Dashboard() {
       <main className="mx-auto w-full max-w-4xl px-10 py-16">
         <h1 className="text-4xl font-extrabold tracking-[-0.03em]">Your journeys</h1>
         <p className="mt-3 max-w-[60ch] text-lg leading-relaxed text-muted">
-          Add a journey, and when the train runs late the claim files itself. Your journeys and
-          claims will appear here.
+          Add a journey. When the train runs late, we work out what you are owed and get the
+          claim ready. Your journeys and claims will appear here.
         </p>
       </main>
     </>

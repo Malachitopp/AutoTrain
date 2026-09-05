@@ -46,7 +46,7 @@ export function RequireSession({ children }: { children: ReactNode }) {
           <button
             type="button"
             onClick={state.retry}
-            className="mt-6 rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-600"
+            className="mt-6 rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-700"
           >
             Try again
           </button>

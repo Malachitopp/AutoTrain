@@ -22,7 +22,7 @@ afterEach(() => {
 describe("the front door", () => {
   it("says what AutoTrain does and offers one way in", () => {
     render(<LandingPage />);
-    expect(screen.getByRole("heading", { level: 1 }).textContent).toContain("refund files itself");
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toContain("worked out for you");
     // Header button and hero button, both to /login for a visitor.
     const ways_in = screen.getAllByRole("link", { name: "Sign in" });
     expect(ways_in).toHaveLength(2);
