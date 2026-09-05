@@ -22,6 +22,12 @@ adapter layer (adapters.py). Still absent, deliberately: the form_submit
 adapters (v2) and the consent gate on auto-filing (`users.claim_consent_at`).
 Consent gates filing ON THE USER'S BEHALF, which v2 does and a deep link the
 user opens themselves does not.
+
+Only operators AutoTrain can file with are in the product
+(OperatorFiling.is_supported: a live adapter, still active).
+`supported_operators` is that list for the public API, and the creation sweep
+opens no claim for any other operator — a claim that can never be filed is
+money shown as pending for ever.
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ import psycopg
 # climb past every import-linter contract.
 from autotrain.modules.claims import adapters as _adapters
 from autotrain.modules.claims import repository as _repository
-from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal
+from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal, SupportedOperator
 from autotrain.modules.delays import service as _delays
 
 # Re-exported: the two row shapes a claim is built from. Callers get them from
@@ -69,6 +75,7 @@ __all__ = [
     "IllegalTransition",
     "NotClaimable",
     "NotFilable",
+    "SupportedOperator",
     "UnclaimedDetection",
     "UnknownClaim",
     "claim_history",
@@ -79,6 +86,7 @@ __all__ = [
     "list_claims",
     "open_claim",
     "run_claim_sweep",
+    "supported_operators",
     "transition",
 ]
 
@@ -152,6 +160,7 @@ class ClaimSweepStats:
     opened: int = 0  # a new claim row exists because of this sweep
     already_claimed: int = 0  # another sweep created it first
     no_operator: int = 0  # unclaimable; stamped so it leaves the work queue
+    unsupported: int = 0  # operator has no adapter or is inactive; stamped likewise
     errors: int = 0  # detection failed and was rolled back; sweep continued
 
 
@@ -242,6 +251,13 @@ def run_claim_sweep(
     stamped processed, so the work set strictly shrinks and the head always
     advances. The one thing that can stall it is a page in which every row
     raises, which is what the no-progress guard below catches.
+
+    Only supported operators get a claim (OperatorFiling.is_supported); a
+    detection on any other operator is stamped and counted as unsupported, so
+    the user never sees money that cannot be recovered. The stamp is final:
+    when an operator gains a link later, the migration that enables its adapter
+    must also reset claims_processed_at on that operator's detections, or the
+    sweep never looks at them again (test_sweep_backfills_only_when_the_stamp_is_reset).
     """
     stats = ClaimSweepStats()
     while True:
@@ -293,6 +309,21 @@ def _open_one(
         # from journeys, so a deleted journey takes its detection with it.)
         logger.info("claim sweep: detection %s has no operator; not claimable", detection.id)
         stats.no_operator += 1
+        _delays.mark_claims_processed(conn, detection.id)
+        return
+
+    filing = _repository.operator_filing(conn, context.operator_id)
+    if not filing.is_supported:
+        # Nowhere to send the claim (no adapter), or nowhere that still takes
+        # it (inactive). Stamped for the same reason as above: left in the
+        # queue it would come back with every page and the sweep would never
+        # finish. The absent claims row is, again, the record. (One primary-key
+        # read per detection; the sweep is nightly over a handful of rows.)
+        logger.info(
+            "claim sweep: detection %s is on an operator AutoTrain cannot file with; not claimable",
+            detection.id,
+        )
+        stats.unsupported += 1
         _delays.mark_claims_processed(conn, detection.id)
         return
 
@@ -464,3 +495,8 @@ def claim_history(conn: psycopg.Connection, claim_id: UUID) -> list[ClaimEventRo
 def claims_total(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:
     """Returns the total claim amount for the user"""
     return _repository.totals_for_user(conn, user_id)
+
+
+def supported_operators(conn: psycopg.Connection) -> list[SupportedOperator]:
+    """The operators AutoTrain can file with, by name — what GET /operators shows."""
+    return _repository.supported_operators(conn)

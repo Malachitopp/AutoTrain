@@ -20,7 +20,13 @@ from uuid import UUID
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.claims.models import ClaimEventRow, ClaimRow, ClaimTotal, OperatorFiling
+from autotrain.modules.claims.models import (
+    ClaimEventRow,
+    ClaimRow,
+    ClaimTotal,
+    OperatorFiling,
+    SupportedOperator,
+)
 
 # The full claims column list is repeated verbatim in each statement below, for
 # the same two reasons as in the journeys repository: core.db maps rows by name
@@ -131,6 +137,14 @@ _TOTALS_FOR_USER = (
     "WHERE user_id = %s"
 )
 
+# The public operator list: the operators claims can file with, by name.
+# `adapter <> 'none' AND is_active` is the SQL half of
+# OperatorFiling.is_supported; the sweep applies the Python half per row.
+_SUPPORTED_OPERATORS = (
+    "SELECT atoc_code, name, min_delay_minutes FROM operators "
+    "WHERE adapter <> 'none' AND is_active ORDER BY name"
+)
+
 
 def insert_claim(
     conn: psycopg.Connection,
@@ -217,3 +231,8 @@ def totals_for_user(conn: psycopg.Connection, user_id: UUID) -> ClaimTotal:
     if row is None:
         raise RuntimeError("totals aggregate produced no row")
     return row
+
+
+def supported_operators(conn: psycopg.Connection) -> list[SupportedOperator]:
+    """Every operator claims can file with, sorted by name for display."""
+    return db.fetch_all(conn, _SUPPORTED_OPERATORS, (), row_cls=SupportedOperator)

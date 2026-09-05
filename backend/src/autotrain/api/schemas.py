@@ -1,4 +1,4 @@
-"""Wire shapes for the journeys, claims and auth endpoints.
+"""Wire shapes for the journeys, claims, auth and operators endpoints.
 
 Validation happens here, before any SQL runs: a request that would violate a
 0005 constraint fails as a 422 naming the offending field, not as a database
@@ -201,3 +201,15 @@ class UserOut(BaseModel):
         # claim_consent_at is NULL until the user consents, so None passes
         # through (as in ClaimOut).
         return value.astimezone(UTC) if value is not None else None
+
+
+class OperatorOut(BaseModel):
+    """One operator AutoTrain can file a claim with — the public list behind
+    GET /operators. Exactly these three fields: no id, no claim_url, nothing
+    a signed-out visitor has no business seeing."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    atoc_code: str
+    name: str
+    min_delay_minutes: int

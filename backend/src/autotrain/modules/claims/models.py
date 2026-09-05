@@ -70,3 +70,22 @@ class OperatorFiling:
     adapter: str
     claim_url: str | None
     is_active: bool
+
+    @property
+    def is_supported(self) -> bool:
+        """Whether AutoTrain can file with this operator: a live adapter, and
+        the operator still taking claims. The Python twin of the SQL in the
+        repository's _SUPPORTED_OPERATORS — change both together."""
+        return self.adapter != "none" and self.is_active
+
+
+@dataclass(frozen=True)
+class SupportedOperator:
+    """An operator AutoTrain can file with (OperatorFiling.is_supported), as
+    the public GET /operators list shows it: the code, the name, and the delay
+    at which its Delay Repay scheme starts paying. Not "automatic": v1 filing
+    opens the operator's own form (adapters.py)."""
+
+    atoc_code: str
+    name: str
+    min_delay_minutes: int

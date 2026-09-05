@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from autotrain.api.middleware import TransactionMiddleware
-from autotrain.api.routers import auth, claims, journeys
+from autotrain.api.routers import auth, claims, journeys, operators
 from autotrain.core import db
 from autotrain.core.config import get_settings
 
@@ -47,6 +47,7 @@ def create_app() -> FastAPI:
     app.include_router(journeys.router)
     app.include_router(claims.router)
     app.include_router(auth.router)
+    app.include_router(operators.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

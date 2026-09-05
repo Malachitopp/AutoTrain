@@ -15,17 +15,14 @@ least one test. It commits for real and cleans up after itself.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 import psycopg
-import pytest
 from fastapi.testclient import TestClient
 
 from autotrain.api.app import create_app
-from autotrain.api.deps import get_conn
 from conftest import auth_header, mk_user
 
 _DEP = datetime(2026, 8, 10, 8, 14, tzinfo=UTC)
@@ -65,30 +62,6 @@ def _single_error(resp: Any) -> dict[str, Any]:
     detail = resp.json()["detail"]
     assert len(detail) == 1, detail
     return detail[0]
-
-
-@pytest.fixture
-def client(conn: psycopg.Connection) -> Iterator[TestClient]:
-    app = create_app()
-
-    def _rollback_conn() -> Iterator[psycopg.Connection]:
-        # A savepoint per request: a request that dies mid-transaction (409
-        # duplicate, 404 on the users FK) must not poison the connection for
-        # the next request in the same test. The fixture rolls back the outer
-        # transaction afterwards, so nothing ever commits.
-        with conn.transaction():
-            yield conn
-
-    # Pin the outer transaction open BEFORE any request runs: psycopg only
-    # issues BEGIN on first use, and conn.transaction() on an idle connection
-    # opens a real top-level transaction whose exit would COMMIT — the
-    # "nothing ever commits" comment above is only true once this has run.
-    conn.execute("SELECT 1")
-
-    app.dependency_overrides[get_conn] = _rollback_conn
-    # Deliberately no `with`: entering the client would run the lifespan and
-    # open the real pool, which these tests must never touch.
-    yield TestClient(app)
 
 
 class TestHealth:

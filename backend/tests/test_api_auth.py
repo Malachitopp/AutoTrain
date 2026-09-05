@@ -11,7 +11,6 @@ suite's settings leave email_sender at 'none', so the 503 path is the real one.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -21,11 +20,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from autotrain.api import app as app_module
-from autotrain.api.app import create_app
-from autotrain.api.deps import get_conn
 from autotrain.api.routers import auth as auth_router
 from autotrain.core.config import get_settings
-from conftest import TEST_APP_BASE_URL, TEST_JWT_SECRET, auth_header, mk_user
+from conftest import TEST_APP_BASE_URL, TEST_JWT_SECRET, api_client, auth_header, mk_user
 
 _EMAIL = "rider@example.com"
 
@@ -36,19 +33,6 @@ class _RecordingEmailSender:
 
     def send_email(self, *, to: str, subject: str, body: str) -> None:
         self.sent.append((to, subject, body))
-
-
-def _client_for(conn: psycopg.Connection) -> TestClient:
-    """The journeys-suite client: real app, rollback conn, pool never opened."""
-    app = create_app()
-
-    def _rollback_conn() -> Iterator[psycopg.Connection]:
-        with conn.transaction():
-            yield conn
-
-    conn.execute("SELECT 1")  # pin the outer transaction open first
-    app.dependency_overrides[get_conn] = _rollback_conn
-    return TestClient(app)
 
 
 @pytest.fixture
@@ -64,7 +48,7 @@ def client(
     # attribute swaps the transport for exactly this test — the same seam the
     # entrypoint uses, exercised the same way.
     monkeypatch.setattr(auth_router, "_email_sender", lambda: sender)
-    return _client_for(conn)
+    return api_client(conn)
 
 
 def _token_from(sender: _RecordingEmailSender) -> str:
@@ -131,7 +115,7 @@ class TestRequestLink:
     def test_unconfigured_email_transport_is_503(self, conn: psycopg.Connection) -> None:
         # No sender patch: settings leave email_sender at 'none', and the
         # refusal is scoped to this endpoint, not the whole app.
-        client = _client_for(conn)
+        client = api_client(conn)
         resp = client.post("/auth/login/request", json={"email": _EMAIL})
         assert resp.status_code == 503
         assert resp.json()["detail"] == "no email sender configured"
@@ -280,7 +264,7 @@ class TestCors:
             "get_settings",
             lambda: get_settings().model_copy(update={"cors_origins": origins}),
         )
-        return _client_for(conn)
+        return api_client(conn)
 
     def test_listed_origin_may_send_a_bearer_token(
         self, conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch

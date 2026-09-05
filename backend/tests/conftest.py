@@ -16,6 +16,7 @@ from typing import Any
 
 import psycopg
 import pytest
+from fastapi.testclient import TestClient
 from psycopg import conninfo, sql
 
 DEFAULT_TEST_URL = "postgresql://autotrain:autotrain@localhost:5433/autotrain_test"
@@ -39,6 +40,8 @@ os.environ["AUTOTRAIN_EMAIL_SENDER"] = "none"
 TEST_APP_BASE_URL = "http://frontend.test"
 os.environ["AUTOTRAIN_APP_BASE_URL"] = TEST_APP_BASE_URL
 
+from autotrain.api.app import create_app  # noqa: E402
+from autotrain.api.deps import get_conn  # noqa: E402
 from autotrain.core import db  # noqa: E402
 from autotrain.core.config import get_settings  # noqa: E402
 from autotrain.core.migrate import migrate_up  # noqa: E402
@@ -149,3 +152,44 @@ def auth_header(user_id: Any) -> dict[str, str]:
     (signature and expiry checked per request, no dependency overrides)."""
     token = identity.issue_session_token(user_id, secret=TEST_JWT_SECRET)
     return {"Authorization": f"Bearer {token}"}
+
+
+# --- The API test client -----------------------------------------------------
+# One definition; promoted here when the fourth suite (test_api_operators)
+# needed it — the same rule as the row helpers above.
+
+
+def api_client(conn: psycopg.Connection) -> TestClient:
+    """The real app with exactly one substitution: `get_conn` hands out the
+    suite's rollback `conn`, so every request runs routing, validation,
+    services, repositories and real Postgres, and nothing ever commits.
+
+    Suites that need a second substitution (test_api_auth patches the email
+    sender) call this and add theirs on top.
+    """
+    app = create_app()
+
+    def _rollback_conn() -> Iterator[psycopg.Connection]:
+        # A savepoint per request: a request that dies mid-transaction (409
+        # duplicate, 404 on the users FK) must not poison the connection for
+        # the next request in the same test. The `conn` fixture rolls back the
+        # outer transaction afterwards, so nothing ever commits.
+        with conn.transaction():
+            yield conn
+
+    # Pin the outer transaction open BEFORE any request runs: psycopg only
+    # issues BEGIN on first use, and conn.transaction() on an idle connection
+    # opens a real top-level transaction whose exit would COMMIT — the
+    # "nothing ever commits" comment above is only true once this has run.
+    conn.execute("SELECT 1")
+
+    app.dependency_overrides[get_conn] = _rollback_conn
+    # Deliberately no `with`: entering the client would run the lifespan and
+    # open the real pool, which these tests must never touch.
+    return TestClient(app)
+
+
+@pytest.fixture
+def client(conn: psycopg.Connection) -> TestClient:
+    """`api_client` over the rollback conn — what most API suites want."""
+    return api_client(conn)

@@ -80,6 +80,13 @@ def _mk_operator(
     )
 
 
+def _mk_filable_operator(conn: psycopg.Connection, atoc: str = "QQ") -> UUID:
+    """An operator the creation sweep opens claims for: a live adapter with
+    a link. The plain `_mk_operator` (adapter 'none') is one the sweep must
+    skip, so every sweep test says which of the two it means."""
+    return _mk_operator(conn, atoc, adapter="deep_link", claim_url=CLAIM_URL)
+
+
 def _mk_journey(
     conn: psycopg.Connection,
     user_id: UUID,
@@ -377,7 +384,7 @@ def test_transition_reports_a_lost_race_as_false(conn: psycopg.Connection) -> No
 
 def test_sweep_opens_claims_and_stamps_the_detections(conn: psycopg.Connection) -> None:
     user_id = _mk_user(conn)
-    operator_id = _mk_operator(conn)
+    operator_id = _mk_filable_operator(conn)
     first, first_detection = _entitled_journey(
         conn, operator_id=operator_id, user_id=user_id, origin="MAN"
     )
@@ -430,9 +437,68 @@ def test_sweep_retires_a_detection_with_no_operator(conn: psycopg.Connection) ->
     assert run_claim_sweep(conn).examined == 0
 
 
+def test_sweep_skips_an_operator_it_cannot_file_with(conn: psycopg.Connection) -> None:
+    """adapter 'none': AutoTrain has nowhere to send the claim, so none is
+    opened — a claim that can never be filed would sit in the user's "pending"
+    money for ever. Stamped like the no-operator case, so it leaves the queue
+    and never counts as 'detected' anywhere."""
+    user_id = _mk_user(conn)
+    journey_id, detection_id = _entitled_journey(
+        conn, operator_id=_mk_operator(conn), user_id=user_id
+    )
+
+    stats = run_claim_sweep(conn)
+
+    assert (stats.examined, stats.opened, stats.unsupported, stats.no_operator) == (1, 0, 1, 0)
+    assert _claim(conn, journey_id) is None
+    assert _processed_at(conn, detection_id) is not None
+    assert run_claim_sweep(conn).examined == 0
+
+
+def test_sweep_skips_an_inactive_operator(conn: psycopg.Connection) -> None:
+    """A link on an operator that has stopped taking claims (franchise change)
+    is a dead link: the same outcome as having no adapter at all."""
+    user_id = _mk_user(conn)
+    operator_id = _mk_operator(conn, adapter="deep_link", claim_url=CLAIM_URL, is_active=False)
+    journey_id, detection_id = _entitled_journey(conn, operator_id=operator_id, user_id=user_id)
+
+    stats = run_claim_sweep(conn)
+
+    assert (stats.opened, stats.unsupported) == (0, 1)
+    assert _claim(conn, journey_id) is None
+    assert _processed_at(conn, detection_id) is not None
+
+
+def test_sweep_backfills_only_when_the_stamp_is_reset(conn: psycopg.Connection) -> None:
+    """How an operator is added later. Turning its adapter on is not enough:
+    the stamp is the record that claims decided, so the sweep does not look
+    again. The enabling migration must also reset claims_processed_at on that
+    operator's detections; then the next sweep opens them."""
+    user_id = _mk_user(conn)
+    operator_id = _mk_operator(conn)
+    journey_id, detection_id = _entitled_journey(conn, operator_id=operator_id, user_id=user_id)
+    assert run_claim_sweep(conn).unsupported == 1
+
+    conn.execute(
+        "UPDATE operators SET adapter = 'deep_link', claim_url = %s WHERE id = %s",
+        (CLAIM_URL, operator_id),
+    )
+    assert run_claim_sweep(conn).examined == 0
+    assert _claim(conn, journey_id) is None
+
+    conn.execute(
+        "UPDATE delay_detections SET claims_processed_at = NULL WHERE id = %s", (detection_id,)
+    )
+    stats = run_claim_sweep(conn)
+
+    assert (stats.examined, stats.opened) == (1, 1)
+    row = _claim(conn, journey_id)
+    assert row is not None and row[1] == "draft" and row[2] == ENTITLEMENT
+
+
 def test_sweep_is_idempotent(conn: psycopg.Connection) -> None:
     user_id = _mk_user(conn)
-    journey_id, _ = _entitled_journey(conn, operator_id=_mk_operator(conn), user_id=user_id)
+    journey_id, _ = _entitled_journey(conn, operator_id=_mk_filable_operator(conn), user_id=user_id)
 
     first = run_claim_sweep(conn)
     second = run_claim_sweep(conn)
@@ -444,7 +510,7 @@ def test_sweep_is_idempotent(conn: psycopg.Connection) -> None:
 
 def test_sweep_pages_through_more_than_one_batch(conn: psycopg.Connection) -> None:
     user_id = _mk_user(conn)
-    operator_id = _mk_operator(conn)
+    operator_id = _mk_filable_operator(conn)
     for index in range(5):
         _entitled_journey(
             conn,
@@ -463,7 +529,7 @@ def test_sweep_pages_through_more_than_one_batch(conn: psycopg.Connection) -> No
 def test_sweep_counts_a_claim_another_writer_already_opened(conn: psycopg.Connection) -> None:
     user_id = _mk_user(conn)
     journey_id, detection_id = _entitled_journey(
-        conn, operator_id=_mk_operator(conn), user_id=user_id
+        conn, operator_id=_mk_filable_operator(conn), user_id=user_id
     )
     # A competing sweep got the claim in but had not stamped the detection yet.
     open_claim(conn, _detection_row(conn, detection_id), _context(conn, journey_id))
@@ -795,7 +861,7 @@ def test_get_claim_scopes_by_owner(conn: psycopg.Connection) -> None:
 
 def test_list_claims_is_newest_first(conn: psycopg.Connection) -> None:
     user_id = _mk_user(conn)
-    operator_id = _mk_operator(conn)
+    operator_id = _mk_filable_operator(conn)
     for index in range(3):
         _entitled_journey(
             conn,

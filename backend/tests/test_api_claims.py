@@ -10,16 +10,12 @@ shortcuts past the state machine.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID, uuid4
 
 import psycopg
-import pytest
 from fastapi.testclient import TestClient
 
-from autotrain.api.app import create_app
-from autotrain.api.deps import get_conn
 from autotrain.modules.claims.service import open_claim, run_claim_sweep, transition
 from conftest import auth_header, mk_user, scalar
 
@@ -30,27 +26,6 @@ ENTITLEMENT = 2275
 CLAIM_URL = "https://delayrepay.test-railways.example/claim"
 
 
-# Same fixture as test_api_journeys (promote to conftest on the fourth copy —
-# the house rule recorded there).
-@pytest.fixture
-def client(conn: psycopg.Connection) -> Iterator[TestClient]:
-    app = create_app()
-
-    def _rollback_conn() -> Iterator[psycopg.Connection]:
-        # A savepoint per request: a request that dies mid-transaction must
-        # not poison the connection for the next request in the same test.
-        with conn.transaction():
-            yield conn
-
-    # Pin the outer transaction open BEFORE any request runs (psycopg issues
-    # BEGIN on first use; without this, savepoint exits would COMMIT).
-    conn.execute("SELECT 1")
-
-    app.dependency_overrides[get_conn] = _rollback_conn
-    # No `with`: entering the client would run the lifespan and open the pool.
-    yield TestClient(app)
-
-
 # --- Row builders (through the service where a service writer exists) --------
 
 
@@ -58,9 +33,12 @@ def _mk_operator(
     conn: psycopg.Connection,
     atoc: str = "QQ",
     *,
-    adapter: str = "none",
-    claim_url: str | None = None,
+    adapter: str = "deep_link",
+    claim_url: str | None = CLAIM_URL,
 ) -> UUID:
+    # Supported by default: _mk_claim runs the real sweep, and the sweep opens
+    # claims only for operators it can file with. Pass adapter='none' to build
+    # one it skips.
     return scalar(
         conn.execute(
             "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days, "
@@ -326,7 +304,15 @@ class TestFileClaim:
         self, client: TestClient, conn: psycopg.Connection
     ) -> None:
         user_id = mk_user(conn)
-        claim_id, _ = _mk_claim(conn, user_id, _mk_operator(conn))  # adapter stays 'none'
+        operator_id = _mk_operator(conn)
+        claim_id, _ = _mk_claim(conn, user_id, operator_id)
+        # The claim was opened while the operator was supported; the link
+        # has since been withdrawn. Now that the sweep skips unsupported
+        # operators, this is the one way a claim ends up on one.
+        conn.execute(
+            "UPDATE operators SET adapter = 'none', claim_url = NULL WHERE id = %s",
+            (operator_id,),
+        )
 
         resp = client.post(f"/claims/{claim_id}/file", headers=_hdr(user_id))
 

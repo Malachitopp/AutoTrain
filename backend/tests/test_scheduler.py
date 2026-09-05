@@ -62,8 +62,12 @@ def _committed_world() -> Iterator[tuple[psycopg.Connection, UUID, UUID]]:
         user_id = _mk_user(setup, "scheduler-test@example.com")
         operator_id = _scalar(
             setup.execute(
-                "INSERT INTO operators (atoc_code, name, min_delay_minutes, claim_window_days) "
-                "VALUES ('QZ', 'Scheduler Rail', 15, 28) RETURNING id"
+                # A live adapter and link: the sweep opens claims only for
+                # operators it can file with.
+                "INSERT INTO operators (atoc_code, name, min_delay_minutes, "
+                "claim_window_days, adapter, claim_url) "
+                "VALUES ('QZ', 'Scheduler Rail', 15, 28, 'deep_link', "
+                "'https://delayrepay.scheduler-rail.example/') RETURNING id"
             )
         )
         yield setup, user_id, operator_id
