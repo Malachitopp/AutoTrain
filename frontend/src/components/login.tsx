@@ -7,55 +7,75 @@
  *    link (POST /auth/login/request). The API answers the same way whether
  *    or not the address has an account, and so does this screen.
  * 2. A visit from the emailed link carries #token=... in the address bar.
- *    The token is exchanged for a session (POST /auth/login/verify), stored,
- *    and the user lands on the home page. A dead link falls back to the form
- *    with an explanation.
+ *    The screen shows a Continue button; pressing it exchanges the token for
+ *    a session (POST /auth/login/verify), stores it, and lands on the home
+ *    page. A dead link falls back to the form with an explanation.
+ *
+ * The exchange waits for a click on purpose. Email security scanners open
+ * links, and an attacker can send someone a link for the attacker's own
+ * account; if the page exchanged the token the moment it loaded, the first
+ * would spend the link before the person saw it and the second would sign
+ * the person into the wrong account without their knowledge. A click is the
+ * person saying "yes, sign me in here".
  */
 
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 
+import { Brand } from "@/components/brand";
 import { ApiError, auth, describeError } from "@/lib/api";
 import * as session from "@/lib/session";
-import { useHydrated } from "@/lib/use-hydrated";
+import { useHash } from "@/lib/use-hash";
 
-type Phase = { kind: "form"; error?: string } | { kind: "sending" } | { kind: "sent"; email: string };
+type Phase =
+  | { kind: "form"; error?: string }
+  | { kind: "sending" }
+  | { kind: "sent"; email: string }
+  | { kind: "verifying" };
 
 export function Login() {
   const router = useRouter();
-  const hydrated = useHydrated();
+  const hash = useHash();
   const [phase, setPhase] = useState<Phase>({ kind: "form" });
   const [email, setEmail] = useState("");
-  // The token this screen has already started exchanging. A ref, not state:
-  // it exists so the effect below runs the exchange once, even though React
-  // re-runs effects in development (StrictMode).
-  const exchanging = useRef<string | null>(null);
 
-  // The address bar exists only in the browser, so it is read after
-  // hydration. While the link's token is still in it and nothing has gone
-  // wrong, the exchange is under way.
-  const linkToken = hydrated ? session.tokenFromHash(window.location.hash) : null;
-  const verifying = linkToken !== null && phase.kind === "form" && phase.error === undefined;
+  // null until the browser render: the server has no address bar.
+  if (hash === null) {
+    return (
+      <Frame>
+        <p className="text-muted">Loading…</p>
+      </Frame>
+    );
+  }
+  const linkToken = session.tokenFromHash(hash);
 
-  useEffect(() => {
-    if (linkToken === null || exchanging.current === linkToken) return;
-    exchanging.current = linkToken;
-    auth
-      .verifyLogin(linkToken)
-      .then(({ access_token }) => {
+  async function finishSignIn(token: string) {
+    setPhase({ kind: "verifying" });
+    try {
+      const { access_token } = await auth.verifyLogin(token);
+      session.store(access_token);
+      scrubLink();
+      router.replace("/");
+    } catch (error: unknown) {
+      if (error instanceof ApiError && error.status === 401) {
+        // The API has judged the link dead: nothing to retry.
         scrubLink();
-        session.store(access_token);
-        router.replace("/");
-      })
-      .catch((error: unknown) => {
+        setPhase({
+          kind: "form",
+          error: "That link has expired or was already used. Request a new one.",
+        });
+      } else if (error instanceof session.StorageUnavailable) {
+        // The token was spent but the session cannot be kept.
         scrubLink();
-        const message =
-          error instanceof ApiError && error.status === 401
-            ? "That link has expired or was already used. Request a new one."
-            : describeError(error);
-        setPhase({ kind: "form", error: message });
-      });
-  }, [linkToken, router]);
+        setPhase({ kind: "form", error: error.message });
+      } else {
+        // The API never judged the token (unreachable, or failing), so the
+        // link is still good. It stays in the address bar and Continue
+        // becomes a retry.
+        setPhase({ kind: "form", error: describeError(error) });
+      }
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -68,28 +88,61 @@ export function Login() {
     }
   }
 
-  if (!hydrated || verifying) {
-    return <p className="p-8 text-zinc-500">Signing you in…</p>;
+  if (phase.kind === "verifying") {
+    return (
+      <Frame>
+        <p className="text-muted">Signing you in…</p>
+      </Frame>
+    );
+  }
+
+  if (linkToken !== null) {
+    return (
+      <Frame>
+        <h1 className="text-2xl font-extrabold tracking-[-0.02em]">Finish signing in</h1>
+        <p className="mt-3 leading-relaxed text-muted">
+          You followed a sign-in link. Press continue to open your account on this browser.
+        </p>
+        {session.token() !== null && (
+          <p className="mt-2 text-sm text-muted">
+            This browser is already signed in. Continuing switches it to the account the link
+            belongs to.
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={() => finishSignIn(linkToken)}
+          className="mt-6 w-full rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-600"
+        >
+          Continue
+        </button>
+        {phase.kind === "form" && phase.error !== undefined && (
+          <p role="alert" className="mt-4 text-sm text-red-700">
+            {phase.error}
+          </p>
+        )}
+      </Frame>
+    );
   }
 
   if (phase.kind === "sent") {
     return (
-      <section className="mx-auto max-w-sm p-8">
-        <h1 className="text-2xl font-semibold">Check your inbox</h1>
-        <p className="mt-4 text-zinc-600">
-          If <span className="font-medium">{phase.email}</span> can receive mail, a sign-in link
-          is on its way. It works once and expires in 15 minutes.
+      <Frame>
+        <h1 className="text-2xl font-extrabold tracking-[-0.02em]">Check your inbox</h1>
+        <p className="mt-3 leading-relaxed text-muted">
+          If <span className="font-semibold text-ink">{phase.email}</span> can receive mail, a
+          sign-in link is on its way. It works once and expires in 15 minutes.
         </p>
-      </section>
+      </Frame>
     );
   }
 
   return (
-    <section className="mx-auto max-w-sm p-8">
-      <h1 className="text-2xl font-semibold">Sign in to AutoTrain</h1>
-      <p className="mt-2 text-zinc-600">No password. We email you a link.</p>
-      <form onSubmit={submit} className="mt-6 flex flex-col gap-3">
-        <label htmlFor="email" className="text-sm font-medium">
+    <Frame>
+      <h1 className="text-2xl font-extrabold tracking-[-0.02em]">Sign in</h1>
+      <p className="mt-2 text-muted">No password. We email you a link.</p>
+      <form onSubmit={submit} className="mt-6 flex flex-col gap-2">
+        <label htmlFor="email" className="text-[11px] font-semibold text-muted">
           Email
         </label>
         <input
@@ -99,12 +152,12 @@ export function Login() {
           autoComplete="email"
           value={email}
           onChange={(event) => setEmail(event.target.value)}
-          className="rounded border border-zinc-300 px-3 py-2"
+          className="rounded-control border border-line bg-white px-4 py-3 text-[15px] font-semibold"
         />
         <button
           type="submit"
           disabled={phase.kind === "sending"}
-          className="rounded bg-zinc-900 px-4 py-2 font-medium text-white disabled:opacity-50"
+          className="mt-3 rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-600 disabled:opacity-50"
         >
           {phase.kind === "sending" ? "Sending…" : "Email me a link"}
         </button>
@@ -114,7 +167,21 @@ export function Login() {
           {phase.error}
         </p>
       )}
-    </section>
+    </Frame>
+  );
+}
+
+/** The card every state of this screen sits in, under the brand. */
+function Frame({ children }: { children: ReactNode }) {
+  return (
+    <main className="flex flex-1 flex-col items-center px-6 pt-24 pb-16">
+      <div className="mb-8">
+        <Brand />
+      </div>
+      <section className="w-full max-w-md rounded-card border border-line bg-white/90 p-8 shadow-soft backdrop-blur">
+        {children}
+      </section>
+    </main>
   );
 }
 

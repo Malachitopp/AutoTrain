@@ -28,12 +28,33 @@ export function token(): string | null {
   }
 }
 
+/** Thrown by store() when the browser refuses to keep anything: site data
+ * blocked, private mode in some browsers, storage full. The message is
+ * written for the person, not the developer. */
+export class StorageUnavailable extends Error {
+  constructor() {
+    super(
+      "Your browser is blocking storage for this site, so you cannot stay signed in. " +
+        "Allow site data for AutoTrain and request a new link.",
+    );
+    this.name = "StorageUnavailable";
+  }
+}
+
 export function store(jwt: string): void {
-  window.localStorage.setItem(KEY, jwt);
+  try {
+    window.localStorage.setItem(KEY, jwt);
+  } catch {
+    throw new StorageUnavailable();
+  }
 }
 
 export function clear(): void {
-  window.localStorage.removeItem(KEY);
+  try {
+    window.localStorage.removeItem(KEY);
+  } catch {
+    // Nothing was ever stored in a browser that blocks storage.
+  }
 }
 
 /** The login token carried by an emailed link, or null if the address bar

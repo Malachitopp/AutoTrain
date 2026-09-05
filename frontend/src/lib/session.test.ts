@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as session from "@/lib/session";
 
@@ -20,6 +20,18 @@ describe("session storage", () => {
     session.store("jwt-goes-here");
     session.clear();
     expect(session.token()).toBeNull();
+  });
+
+  it("store says so, in plain words, when the browser blocks storage", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("blocked", "SecurityError");
+    });
+    expect(() => session.store("jwt")).toThrow(session.StorageUnavailable);
+    expect(() => session.store("jwt")).toThrow(/blocking storage/);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 });
 
