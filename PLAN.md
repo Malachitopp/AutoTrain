@@ -77,9 +77,30 @@ The big three: **operator form changes** breaking adapters (mitigate: monitoring
 3. **Weeks 7–10 — App + notifications.** React Native: barcode scan, journey list, and the push notification loop on qualifying delays — the magic moment web can't deliver.
 4. **Weeks 11–14 — Auto-filing.** Server-side claim submission for the top 3–5 operators; claim status tracking.
 5. **Then:** email ticket ingestion (LLM extraction — see [ARCHITECTURE §6a](ARCHITECTURE.md)), more operator adapters, season tickets, paid tier.
+6. **Maybe, v2:** a separate London-commuter feature for TfL contactless refunds, for users who want it — see §10. Not a change to the National Rail path.
 
 ## 9. Open questions
 
 - Success fee vs subscription (success fee converts better but complicates money flow since the operator pays the user directly — you'd invoice the user after payout).
 - Which operators to automate first — pick by a mix of passenger volume and worst punctuality (HSP data can rank this empirically).
 - Whether to seek a relationship with Rail Delivery Group / operators early, or stay a pure consumer tool until traction.
+- London (TfL) feature, if built: is the credential-free version (§10, level 0) good enough, or does the one-tap promise need the phone to sign into TfL (level 1)?
+
+## 10. Maybe, v2: London commuters (TfL contactless refunds)
+
+Written 2026-09-05 so it is not forgotten. Nothing here is committed to.
+
+**The reference product.** [Reeclaim](https://www.reeclaim.co.uk/) sells exactly this, and only this: TfL-only, contactless bank cards, the user connects their TfL account, Reeclaim finds every eligible delay, pre-fills the refund, the user approves each one with a tap, Reeclaim submits, TfL credits the card in 5–10 working days. Subscription £4.99–£15.99 a month and no cut of the refund. Claimed scale (Sept 2026): 149K cards connected, 20M journeys, 375K claims, £1M+ refunded. It proves two things we care about: commuters pay a subscription for "nothing to do until a notification", and a subscription avoids the money-flow problems of a success fee (§6).
+
+**Why it fits AutoTrain.** TfL is the single account holding every journey that National Rail does not have (§3, MARKET F1). The rules are simple: 15+ min on Underground/DLR, 30+ min on Overground/Elizabeth line, full fare back, claim within 28 days. TfL's public Unified API (free) gives line status and disruption data for detection. Contactless journeys on National Rail operators inside the London contactless area also appear in the TfL account, so this would cover part of our own market too.
+
+**Shape.** A separate module, `tfl`, with its own tables and service, behind the same import contracts as the others (ARCHITECTURE §3). Four parts, each a shape the backend already has once: (1) a connection to the user's TfL account; (2) a journey importer — nightly sweep, stamp column, source behind a protocol, like the ingestor; (3) a delay detector — a pure function over TfL data, like the entitlement calculator but with TfL's rules; (4) a submitter — a `form_submit` adapter behind the consent gate (`users.claim_consent_at`). Reused as is: identity, notifications, the scheduler and worker loops, the money summary, and the one-tap approve screen.
+
+**The credential problem, as a ladder.** Every level above 0 means acting inside the user's TfL account, and there is no official API for that.
+
+0. **No credentials.** TfL accounts can email journey statements; if that can be set to automatic (weekly), the user forwards them to their AutoTrain address and they ride the same pipeline as ticket emails. Detection from the public API. Filing is a deep link to TfL's refund page, where the user signs in and submits themselves. Fully automatic detection, one extra tap to file, and we never see a password. *To verify: that automatic statement emails exist and their cadence fits the 28-day window.*
+1. **Device-side.** The mobile app signs into TfL on the phone; the password stays in the phone's keychain; our server only receives journey data, and for filing the phone submits. This is Reeclaim's model ("encrypted on your device, never on our servers"). Browsers' cross-origin rules make it impossible from a web page, so it needs the native app.
+2. **Server-side session.** Hold an encrypted TfL session token per user. Fully automatic and the worst risk. Only if 0 and 1 both fail the product.
+3. **Official.** An API or data-sharing agreement with TfL. The only version with no grey area; needs TfL to agree.
+
+**Before anything above level 0:** the legal read §6 and §7 already call for — TfL's terms, and automated access to an account with the user's permission. **Sequencing:** after the National Rail slice has real users. Everything here is a second copy of an existing piece, and second copies go faster once the first has been used.
