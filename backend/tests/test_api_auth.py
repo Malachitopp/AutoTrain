@@ -22,7 +22,15 @@ from fastapi.testclient import TestClient
 from autotrain.api import app as app_module
 from autotrain.api.routers import auth as auth_router
 from autotrain.core.config import get_settings
-from conftest import TEST_APP_BASE_URL, TEST_JWT_SECRET, api_client, auth_header, mk_user
+from autotrain.modules.identity import service as identity
+from conftest import (
+    TEST_APP_BASE_URL,
+    TEST_JWT_SECRET,
+    api_client,
+    auth_header,
+    mk_user,
+    scalar,
+)
 
 _EMAIL = "rider@example.com"
 
@@ -301,3 +309,61 @@ class TestCors:
         resp = client.options("/auth/me", headers={"Origin": TEST_APP_BASE_URL, **_PREFLIGHT})
         assert resp.status_code == 400
         assert "access-control-allow-origin" not in resp.headers
+
+
+class TestCookieSessions:
+    """The web app's way in: the session as an httpOnly cookie the browser
+    sends by itself. The test client keeps a cookie jar, so a request with
+    no Authorization header stands for the browser."""
+
+    def test_verify_sets_the_cookie_the_browser_then_uses_until_logout(
+        self, client: TestClient, sender: _RecordingEmailSender
+    ) -> None:
+        client.post("/auth/login/request", json={"email": _EMAIL})
+        verified = client.post("/auth/login/verify", json={"token": _token_from(sender)})
+        assert verified.status_code == 200
+        set_cookie = verified.headers["set-cookie"]
+        assert set_cookie.startswith("autotrain_session=")
+        assert "HttpOnly" in set_cookie and "SameSite=lax" in set_cookie and "Path=/" in set_cookie
+        assert client.cookies["autotrain_session"] == verified.json()["access_token"]
+
+        me = client.get("/auth/me")  # no header: the cookie alone
+        assert me.status_code == 200
+        assert me.json()["email"] == _EMAIL
+
+        assert client.post("/auth/logout").status_code == 204
+        assert "autotrain_session" not in client.cookies
+        assert client.get("/auth/me").status_code == 401
+
+    def test_sign_out_everywhere_kills_earlier_sessions_on_every_device(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        user_id = mk_user(conn, _EMAIL)
+        phone = identity.issue_session_token(
+            user_id, secret=TEST_JWT_SECRET, now=datetime.now(UTC) - timedelta(seconds=5)
+        )
+        assert (
+            client.get("/auth/me", headers={"Authorization": f"Bearer {phone}"}).status_code == 200
+        )
+
+        resp = client.post("/auth/sessions/revoke", headers={"Authorization": f"Bearer {phone}"})
+        assert resp.status_code == 204
+
+        assert (
+            client.get("/auth/me", headers={"Authorization": f"Bearer {phone}"}).status_code == 401
+        )
+        fresh = identity.issue_session_token(
+            user_id, secret=TEST_JWT_SECRET, now=datetime.now(UTC) + timedelta(seconds=2)
+        )
+        assert (
+            client.get("/auth/me", headers={"Authorization": f"Bearer {fresh}"}).status_code == 200
+        )
+
+    def test_delete_me_erases_the_account_and_ends_the_session(
+        self, client: TestClient, conn: psycopg.Connection
+    ) -> None:
+        user_id = mk_user(conn, _EMAIL)
+        headers = auth_header(user_id)
+        assert client.delete("/auth/me", headers=headers).status_code == 204
+        assert client.get("/auth/me", headers=headers).status_code == 401
+        assert scalar(conn.execute("SELECT email FROM users WHERE id = %s", (user_id,))) is None

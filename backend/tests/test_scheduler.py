@@ -23,6 +23,7 @@ import pytest
 
 from autotrain.entrypoints import scheduler
 from autotrain.entrypoints.scheduler import _expire_once, _run_jobs_once, _uk_today
+from autotrain.modules.journeys.service import ExtractedLeg, ExtractedTicket
 from conftest import TEST_DATABASE_URL
 from conftest import mk_user as _mk_user
 from conftest import scalar as _scalar
@@ -266,3 +267,74 @@ def test_main_once_runs_and_exits(monkeypatch: pytest.MonkeyPatch) -> None:
     no-ops then)."""
     monkeypatch.setattr(sys, "argv", ["autotrain-scheduler", "--once"])
     scheduler.main()  # raising (or hanging without --once) is the failure mode
+
+
+# --- The intake job -----------------------------------------------------------
+
+
+class _OneTicketReader:
+    """A TicketExtractor that reads every email as the same single ticket."""
+
+    def __init__(self, travel_date: date) -> None:
+        self.travel_date = travel_date
+
+    def extract(self, *, subject: str, body: str, received_at: datetime) -> ExtractedTicket:
+        return ExtractedTicket(
+            is_ticket=True,
+            retailer="Trainline",
+            kind="single",
+            price_pence=4550,
+            legs=[
+                ExtractedLeg(
+                    origin_crs="MAN",
+                    destination_crs="EUS",
+                    travel_date=self.travel_date.isoformat(),
+                    departure_time="08:14",
+                    arrival_time="10:22",
+                    operator_name=None,
+                    operator_atoc_code=None,
+                )
+            ],
+            confidence="high",
+            notes=None,
+        )
+
+
+def _mk_received_email(setup: psycopg.Connection, user_id, message_id: str) -> UUID:
+    return _scalar(
+        setup.execute(
+            "INSERT INTO inbound_emails (user_id, message_id, sender, recipient, subject, body) "
+            "VALUES (%s, %s, 'tickets@retailer.test', 'tickets-x@in.autotrain.test', "
+            "'Your booking', 'body') RETURNING id",
+            (user_id, message_id),
+        )
+    )
+
+
+@pytest.mark.usefixtures("pool")
+def test_run_jobs_once_reads_forwarded_emails_only_when_a_reader_is_configured() -> None:
+    """The intake job rides the same pass as the claims jobs and is skipped,
+    not failed, when no reader is configured."""
+    with _committed_world() as (setup, user_id, _operator_id):
+        today = _uk_today(datetime.now(tz=UTC))
+        first = _mk_received_email(setup, user_id, "<scheduler-1@retailer.test>")
+
+        _run_jobs_once(batch_size=50)  # no reader: the queue is untouched
+        assert _scalar(
+            setup.execute("SELECT status FROM inbound_emails WHERE id = %s", (first,))
+        ) == ("received")
+
+        _run_jobs_once(batch_size=50, extractor=_OneTicketReader(today - timedelta(days=2)))
+        assert _scalar(
+            setup.execute("SELECT status FROM inbound_emails WHERE id = %s", (first,))
+        ) == ("parsed")
+        assert (
+            _scalar(
+                setup.execute(
+                    "SELECT count(*) FROM journeys j JOIN tickets t ON t.id = j.ticket_id "
+                    "WHERE j.user_id = %s AND t.source = 'email'",
+                    (user_id,),
+                )
+            )
+            == 1
+        )

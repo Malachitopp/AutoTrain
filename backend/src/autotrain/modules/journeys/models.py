@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import Any
 from uuid import UUID
 
 
@@ -105,5 +106,29 @@ class JourneyRow:
     darwin_rid: str | None
     darwin_uid: str | None
     status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class InboundEmailRow:
+    """One row of `inbound_emails` (migration 0013): a forwarded ticket email
+    and what became of it. `extraction` is the reader's answer as it was
+    stored (a dict, from jsonb); `body` is the raw email and never leaves
+    the module except to the reader."""
+
+    id: UUID
+    user_id: UUID | None
+    message_id: str
+    sender: str
+    recipient: str
+    subject: str
+    body: str
+    received_at: datetime
+    status: str
+    status_reason: str | None
+    extraction: dict[str, Any] | None
+    attempts: int
+    processed_at: datetime | None
     created_at: datetime
     updated_at: datetime

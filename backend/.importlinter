@@ -30,6 +30,7 @@ source_modules =
     autotrain.modules.notifications
     autotrain.sources
 forbidden_modules =
+    autotrain.modules.journeys.intake
     autotrain.modules.journeys.models
     autotrain.modules.journeys.repository
 allow_indirect_imports = True

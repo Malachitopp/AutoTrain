@@ -44,6 +44,7 @@ class TestMigrationsApply:
         ).fetchall()
         tables = {r[0] for r in rows}
         expected = {
+            "inbound_emails",
             "operators",
             "delay_repay_bands",
             "users",

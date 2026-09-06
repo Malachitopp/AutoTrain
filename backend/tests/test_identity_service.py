@@ -150,7 +150,11 @@ class TestSessionTokens:
     def test_round_trip(self) -> None:
         user_id = uuid4()
         token = identity.issue_session_token(user_id, secret=TEST_JWT_SECRET)
-        assert identity.session_user(token, secret=TEST_JWT_SECRET) == user_id
+        claims = identity.session_user(token, secret=TEST_JWT_SECRET)
+        assert claims is not None
+        assert claims.user_id == user_id
+        # iat is whole seconds and within a breath of now.
+        assert abs((datetime.now(UTC) - claims.issued_at).total_seconds()) < 5
 
     def test_tampered_token_is_refused(self) -> None:
         token = identity.issue_session_token(uuid4(), secret=TEST_JWT_SECRET)
@@ -177,3 +181,55 @@ class TestSessionTokens:
             algorithm="HS256",
         )
         assert identity.session_user(anonymous, secret=TEST_JWT_SECRET) is None
+
+
+# --- The session cutoff (0014) ----------------------------------------------
+
+
+class TestSessionCutoff:
+    def test_sign_out_everywhere_refuses_earlier_sessions_and_accepts_later_ones(
+        self, conn: psycopg.Connection
+    ) -> None:
+        user_id = mk_user(conn, _EMAIL)
+        before = identity.session_user(
+            identity.issue_session_token(
+                user_id, secret=TEST_JWT_SECRET, now=datetime.now(UTC) - timedelta(seconds=5)
+            ),
+            secret=TEST_JWT_SECRET,
+        )
+        assert before is not None
+        assert identity.session_is_live(conn, user_id=user_id, issued_at=before.issued_at)
+
+        assert identity.revoke_sessions(conn, user_id) is True
+
+        assert not identity.session_is_live(conn, user_id=user_id, issued_at=before.issued_at)
+        after = identity.session_user(
+            identity.issue_session_token(
+                user_id, secret=TEST_JWT_SECRET, now=datetime.now(UTC) + timedelta(seconds=2)
+            ),
+            secret=TEST_JWT_SECRET,
+        )
+        assert after is not None
+        assert identity.session_is_live(conn, user_id=user_id, issued_at=after.issued_at)
+        # Unknown and erased accounts have no sessions to keep.
+        assert identity.revoke_sessions(conn, uuid4()) is False
+        assert not identity.session_is_live(conn, user_id=uuid4(), issued_at=datetime.now(UTC))
+
+    def test_a_token_that_is_not_an_access_token_is_refused(self) -> None:
+        # Correctly signed and dated, but typ names something else (or is
+        # missing, as on any token minted before 0014): not a session.
+        for payload in (
+            {
+                "sub": str(uuid4()),
+                "iat": datetime.now(UTC),
+                "exp": datetime.now(UTC) + timedelta(days=1),
+            },
+            {
+                "sub": str(uuid4()),
+                "iat": datetime.now(UTC),
+                "exp": datetime.now(UTC) + timedelta(days=1),
+                "typ": "refresh",
+            },
+        ):
+            token = jwt.encode(payload, TEST_JWT_SECRET, algorithm="HS256")
+            assert identity.session_user(token, secret=TEST_JWT_SECRET) is None

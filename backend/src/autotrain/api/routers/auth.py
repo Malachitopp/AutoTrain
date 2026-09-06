@@ -1,13 +1,21 @@
-"""Auth routes: magic-link login, session issue, and the signed-in user's
-profile. The three builders below fetch configured dependencies or refuse
-with a 503 scoped to the endpoint — the worker refuses to boot without its
-transport, but the API has other jobs to keep doing."""
+"""Auth routes: magic-link login, session issue, sign-out (this browser, or
+every session), the signed-in user's profile, and erasure. The three
+builders below fetch configured dependencies or refuse with a 503 scoped to
+the endpoint — the worker refuses to boot without its transport, but the
+API has other jobs to keep doing.
+
+A session travels two ways. The web app gets it as an httpOnly cookie set
+here, which page scripts cannot read (so an XSS hole cannot lift it) and the
+browser sends by itself; a client that cannot hold cookies (the mobile app,
+later) keeps the same token from the response body and presents it as a
+bearer header. deps.current_user_id accepts either.
+"""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 
-from autotrain.api.deps import ConnDep, UserIdDep
+from autotrain.api.deps import SESSION_COOKIE, ConnDep, UserIdDep
 from autotrain.api.schemas import LoginRequest, LoginVerify, SessionOut, UserOut
 from autotrain.core.config import get_settings
 from autotrain.modules.identity import service
@@ -42,6 +50,33 @@ def _app_base_url() -> str:
     return settings.app_base_url
 
 
+def _set_session_cookie(response: Response, token: str) -> None:
+    """The web session. HttpOnly: no script reads it. SameSite=Lax: a page
+    on another site cannot make the browser send it with a cross-site POST
+    (the CSRF that would otherwise come free with cookies), while the app's
+    own origin — the same site as the API in every deployment — can. Secure
+    is a setting because a local http development server cannot set it."""
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=int(service.SESSION_TTL.total_seconds()),
+        httponly=True,
+        secure=get_settings().session_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=SESSION_COOKIE,
+        httponly=True,
+        secure=get_settings().session_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+
+
 @router.post("/login/request", status_code=204)
 def request_login(payload: LoginRequest, conn: ConnDep) -> None:
     """Always 204, account or not — the enumeration reasoning lives in
@@ -50,13 +85,34 @@ def request_login(payload: LoginRequest, conn: ConnDep) -> None:
 
 
 @router.post("/login/verify")
-def verify_login(payload: LoginVerify, conn: ConnDep) -> SessionOut:
-    """Exchange a clicked link for a session. Every failure is the same 401."""
+def verify_login(payload: LoginVerify, conn: ConnDep, response: Response) -> SessionOut:
+    """Exchange a clicked link for a session. Every failure is the same 401.
+    The session goes out twice: as the httpOnly cookie the web app relies
+    on, and in the body for a client that holds its own token."""
     user_id = service.verify_login(conn, payload.token)
     if user_id is None:
         raise HTTPException(status_code=401, detail="invalid token")
     token = service.issue_session_token(user_id, secret=_jwt_secret())
+    _set_session_cookie(response, token)
     return SessionOut(access_token=token)
+
+
+@router.post("/logout", status_code=204)
+def logout(response: Response) -> None:
+    """Sign this browser out: drop the cookie. No session required — a
+    browser that is already signed out gets the same 204. The token itself
+    stays valid until it expires (sessions are stateless); to kill every
+    token, the user signs out everywhere."""
+    _clear_session_cookie(response)
+
+
+@router.post("/sessions/revoke", status_code=204)
+def revoke_sessions(conn: ConnDep, user_id: UserIdDep, response: Response) -> None:
+    """Sign out everywhere: every session issued before now, this one
+    included, is refused from here on (users.sessions_invalid_before, 0014).
+    The answer to a lost phone or a session that may have been stolen."""
+    service.revoke_sessions(conn, user_id)
+    _clear_session_cookie(response)
 
 
 @router.get("/me")
@@ -68,3 +124,14 @@ def me(conn: ConnDep, user_id: UserIdDep) -> UserOut:
     if profile is None:
         raise HTTPException(status_code=404, detail="unknown user")
     return UserOut.model_validate(profile)
+
+
+@router.delete("/me", status_code=204)
+def erase_me(conn: ConnDep, user_id: UserIdDep, response: Response) -> None:
+    """Erase the account (GDPR): everything that identifies the person goes,
+    the claims filed on their behalf stay for audit under an anonymous id
+    (identity.erase_user has the full list). Every session dies with it."""
+    if not service.erase_user(conn, user_id):
+        # Unreachable past the gate, which already refused an erased account.
+        raise HTTPException(status_code=404, detail="unknown user")
+    _clear_session_cookie(response)

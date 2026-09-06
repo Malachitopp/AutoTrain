@@ -21,6 +21,7 @@ import time
 
 from autotrain.core import db
 from autotrain.core.config import Settings, get_settings
+from autotrain.core.observability import fields, setup_logging
 from autotrain.modules.notifications import service as notifications
 from autotrain.sources.push import LogPushSender
 
@@ -55,7 +56,7 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level.upper())
+    setup_logging("worker", level=settings.log_level, fmt=settings.log_format)
 
     sender = _build_sender(settings)
 
@@ -64,7 +65,7 @@ def main() -> None:
         while True:
             try:
                 stats = _sweep_once(sender)
-                logger.info("notification sweep complete: %s", stats)
+                logger.info("notification sweep complete", extra=fields(stats))
             except Exception:
                 # Broad on purpose — driver exception types are contractually
                 # invisible here (.importlinter: psycopg stays behind core).

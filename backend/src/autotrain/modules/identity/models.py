@@ -34,3 +34,29 @@ class UserProfile:
     email: str
     claim_consent_at: datetime | None
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class ForwardingCode:
+    """One user's forwarding code, or None when none has been minted yet —
+    a row shape so "no code" and "no such user" stay distinguishable."""
+
+    forwarding_code: str | None
+
+
+@dataclass(frozen=True)
+class SessionGate:
+    """The bearer gate's per-request read (0014): a row means the account is
+    live; the cutoff, when set, is the instant before which no session is
+    accepted."""
+
+    sessions_invalid_before: datetime | None
+
+
+@dataclass(frozen=True)
+class SessionClaims:
+    """What a verified session token says: who, and when it was issued —
+    the two facts the gate judges it on."""
+
+    user_id: UUID
+    issued_at: datetime

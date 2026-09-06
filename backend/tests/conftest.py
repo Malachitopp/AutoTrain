@@ -39,6 +39,12 @@ os.environ["AUTOTRAIN_EMAIL_SENDER"] = "none"
 # on is deterministic; the missing-config 503 path patches it away per test.
 TEST_APP_BASE_URL = "http://frontend.test"
 os.environ["AUTOTRAIN_APP_BASE_URL"] = TEST_APP_BASE_URL
+# Ticket-email intake: the webhook's shared secret and the forwarding domain,
+# pinned so the intake suites are deterministic.
+TEST_INTAKE_SECRET = "test-intake-secret-not-for-production"
+os.environ["AUTOTRAIN_INTAKE_SECRET"] = TEST_INTAKE_SECRET
+TEST_INBOUND_DOMAIN = "in.autotrain.test"
+os.environ["AUTOTRAIN_INBOUND_EMAIL_DOMAIN"] = TEST_INBOUND_DOMAIN
 
 from autotrain.api.app import create_app  # noqa: E402
 from autotrain.api.deps import get_conn  # noqa: E402
