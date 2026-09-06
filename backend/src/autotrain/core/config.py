@@ -31,6 +31,8 @@ class Settings(BaseSettings):
 
     environment: Literal["local", "staging", "production"] = "local"
     log_level: str = "INFO"
+    # 'text' for a terminal; 'json' for a log store (core/observability.py).
+    log_format: Literal["text", "json"] = "text"
 
     database_url: str
     db_pool_min_size: int = Field(default=1, ge=0)
@@ -94,6 +96,27 @@ class Settings(BaseSettings):
     # unaffected, since CORS is enforced only by browsers. The env value is
     # JSON, because the field is a list: AUTOTRAIN_CORS_ORIGINS=["http://..."]
     cors_origins: list[str] = Field(default_factory=list)
+    # The web session cookie's Secure flag (routers/auth.py). False so a local
+    # http development server can set the cookie at all; every https
+    # deployment sets it True.
+    session_cookie_secure: bool = False
+
+    # Ticket-email intake (journeys module, ARCHITECTURE §6a).
+    # The domain users forward ticket emails to: their address is
+    # tickets-<code>@<this>. None on purpose (the address route answers 503)
+    # rather than a placeholder that would be shown to users and bounce.
+    inbound_email_domain: str | None = None
+    # The shared secret the mail provider's webhook presents on every
+    # POST /intake/email. Whoever holds it can queue emails for any user.
+    intake_secret: SecretStr | None = None
+    # Which reader turns a stored email into a ticket. 'none' (default) means
+    # the scheduler skips the intake job; 'claude' needs the API key below.
+    ticket_extractor: Literal["none", "claude"] = "none"
+    anthropic_api_key: SecretStr | None = None
+    ticket_extractor_model: str = "claude-opus-5"
+    # Emails per scheduler pass. Small on purpose: one email is one model
+    # call of a few seconds, and a pass should finish well inside the interval.
+    intake_batch_size: int = Field(default=20, ge=1)
 
     # Only read by the integration test suite, which drops and recreates it.
     test_database_url: str | None = None
@@ -116,6 +139,18 @@ class Settings(BaseSettings):
                     "AUTOTRAIN_ARRIVALS_SOURCE=hsp requires AUTOTRAIN_HSP_EMAIL and "
                     "AUTOTRAIN_HSP_PASSWORD (free Rail Data Portal account: "
                     "https://raildata.org.uk)"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _claude_reader_requires_key(self) -> Settings:
+        """Same shape as the HSP rule: ticket_extractor=claude with an absent
+        or blank key is an invalid deployment, refused at boot."""
+        if self.ticket_extractor == "claude":
+            key = self.anthropic_api_key.get_secret_value() if self.anthropic_api_key else ""
+            if not key:
+                raise ValueError(
+                    "AUTOTRAIN_TICKET_EXTRACTOR=claude requires AUTOTRAIN_ANTHROPIC_API_KEY"
                 )
         return self
 

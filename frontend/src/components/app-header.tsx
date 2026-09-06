@@ -11,17 +11,25 @@ import { useRouter } from "next/navigation";
 
 import { Brand } from "@/components/brand";
 import { useCurrentUser } from "@/components/require-session";
+import { auth } from "@/lib/api";
 import * as session from "@/lib/session";
 
 export function AppHeader() {
   const user = useCurrentUser();
   const router = useRouter();
 
-  function signOut() {
-    // Forget the token here; the API keeps no session state to tell. Then
-    // the front door, not the login form: signing out is not a request to
-    // sign in again.
-    session.clear();
+  async function signOut() {
+    // The cookie is httpOnly, so only the API can drop it. If that call
+    // fails (API down) the hint is cleared anyway and the front door shows
+    // "Sign in"; the next gated visit asks the API and the cookie, if it
+    // survived, simply signs the person back in. Then the front door, not
+    // the login form: signing out is not a request to sign in again.
+    try {
+      await auth.logout();
+    } catch {
+      // See above.
+    }
+    session.forget();
     router.replace("/");
   }
 

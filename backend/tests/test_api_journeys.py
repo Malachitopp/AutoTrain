@@ -222,7 +222,7 @@ class TestCreateJourney:
     def test_missing_bearer_token_is_401(self, client: TestClient) -> None:
         resp = client.post("/journeys", json=_payload())
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "missing Bearer token"
+        assert resp.json()["detail"] == "missing session"
 
     def test_non_bearer_authorization_is_401(self, client: TestClient) -> None:
         resp = client.post("/journeys", json=_payload(), headers={"Authorization": "Basic dXNlcg"})

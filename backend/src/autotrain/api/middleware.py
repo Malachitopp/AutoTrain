@@ -1,4 +1,5 @@
-"""Transaction-per-request, settled BEFORE the response leaves the server.
+"""Two pure-ASGI middlewares: the request id (bottom of this file) and the
+transaction-per-request, settled BEFORE the response leaves the server.
 
 Since FastAPI 0.106 the teardown of a yield dependency runs after the response
 body is already on the wire. A dependency-owned `with db.transaction()`
@@ -23,13 +24,25 @@ The rules it implements:
 
 from __future__ import annotations
 
+import logging
+import re
+import time
 from contextlib import AbstractContextManager
+from uuid import uuid4
 
 from fastapi.concurrency import run_in_threadpool
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from autotrain.core import db
 from autotrain.core.db import Connection
+from autotrain.core.observability import request_id_var
+
+logger = logging.getLogger(__name__)
+
+# A supplied X-Request-ID is kept only when it looks like an id: no newlines
+# or control characters into the log, no 4KB headers echoed back.
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 class _Rollback(Exception):
@@ -106,3 +119,51 @@ class TransactionMiddleware:
             # response started; that path must never commit.
             if txn.open:
                 await run_in_threadpool(txn.settle, commit=False)
+
+
+class RequestIdMiddleware:
+    """Gives every request an id, returns it as X-Request-ID, and writes one
+    line per request (method, path, status, duration) under that id — the
+    line a user's "I got an error" is matched against. Registered outside
+    TransactionMiddleware, so a request that fails before its transaction
+    opens is still logged with its id. A client may supply its own id (a
+    proxy, a retrying app); it is kept when it looks like one.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        supplied = Headers(scope=scope).get("x-request-id")
+        request_id = supplied if supplied and _REQUEST_ID.fullmatch(supplied) else uuid4().hex
+        token = request_id_var.set(request_id)
+        started = time.perf_counter()
+        status: int | None = None
+
+        async def send_with_id(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                MutableHeaders(scope=message).append("x-request-id", request_id)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_id)
+        finally:
+            if scope.get("path") != "/healthz":  # the probe every few seconds is noise
+                logger.info(
+                    "request",
+                    extra={
+                        "method": scope.get("method"),
+                        "path": scope.get("path"),
+                        # None here means an exception escaped before any
+                        # response started; the outer error handler sends 500.
+                        "status": status if status is not None else 500,
+                        "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                    },
+                )
+            request_id_var.reset(token)

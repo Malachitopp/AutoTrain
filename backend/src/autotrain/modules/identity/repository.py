@@ -17,7 +17,12 @@ from uuid import UUID
 import psycopg
 
 from autotrain.core import db
-from autotrain.modules.identity.models import PushTarget, UserProfile
+from autotrain.modules.identity.models import (
+    ForwardingCode,
+    PushTarget,
+    SessionGate,
+    UserProfile,
+)
 
 # Batched like journeys' _CLAIM_CONTEXTS: the worker resolves a whole page of
 # detections' users in one round trip. Ordered so a user's devices come back
@@ -48,6 +53,37 @@ _USER_PROFILE = (
 # The bearer gate's per-request question. EXISTS rather than the profile
 # row: the gate needs one bit, and it runs on every authenticated request.
 _USER_IS_LIVE = "SELECT EXISTS (SELECT 1 FROM users WHERE id = %s AND deleted_at IS NULL)"
+
+# Forwarding codes (0013). The claim is guarded on IS NULL so two requests
+# minting at once both keep the first code; the loser reads it back.
+_FORWARDING_CODE = "SELECT forwarding_code FROM users WHERE id = %s AND deleted_at IS NULL"
+_CLAIM_FORWARDING_CODE = (
+    "UPDATE users SET forwarding_code = %s "
+    "WHERE id = %s AND forwarding_code IS NULL AND deleted_at IS NULL"
+)
+_USER_BY_FORWARDING_CODE = "SELECT id FROM users WHERE forwarding_code = %s AND deleted_at IS NULL"
+
+# The session gate (0014): one read answers "still an account" (a row) and
+# "signed out everywhere since this token" (the cutoff). Cutoffs are set
+# from the wall clock, not the transaction clock, and truncated to the
+# second because a token's iat is whole seconds.
+_SESSION_GATE = "SELECT sessions_invalid_before FROM users WHERE id = %s AND deleted_at IS NULL"
+_REVOKE_SESSIONS = (
+    "UPDATE users SET sessions_invalid_before = date_trunc('second', clock_timestamp()) "
+    "WHERE id = %s AND deleted_at IS NULL"
+)
+
+# Erasure (0004's anonymise-not-delete). The email is read first so the
+# pending login tokens for it can go; then the row is stripped and stamped.
+_USER_EMAIL = "SELECT email FROM users WHERE id = %s AND deleted_at IS NULL"
+_DELETE_LOGIN_TOKENS = "DELETE FROM login_tokens WHERE email = %s"
+_DELETE_DEVICES = "DELETE FROM devices WHERE user_id = %s"
+_ERASE_USER = (
+    "UPDATE users SET email = NULL, display_name = NULL, password_hash = NULL, "
+    "forwarding_code = NULL, deleted_at = now(), "
+    "sessions_invalid_before = date_trunc('second', clock_timestamp()) "
+    "WHERE id = %s AND deleted_at IS NULL"
+)
 
 
 def push_targets(
@@ -96,3 +132,44 @@ def user_is_live(conn: psycopg.Connection, user_id: UUID) -> bool:
     was never created or has been erased. Always a bool: EXISTS yields a
     row either way, so this never has a None arm to handle."""
     return db.fetch_value(conn, _USER_IS_LIVE, (user_id,))
+
+
+def forwarding_code(conn: psycopg.Connection, user_id: UUID) -> ForwardingCode | None:
+    """None for an unknown or erased user; a row (possibly holding None) otherwise."""
+    return db.fetch_one(conn, _FORWARDING_CODE, (user_id,), row_cls=ForwardingCode)
+
+
+def claim_forwarding_code(conn: psycopg.Connection, user_id: UUID, code: str) -> bool:
+    """True if this call set the code; False if the user already had one."""
+    return db.execute(conn, _CLAIM_FORWARDING_CODE, (code, user_id)) == 1
+
+
+def user_id_by_forwarding_code(conn: psycopg.Connection, code: str) -> UUID | None:
+    return db.fetch_value(conn, _USER_BY_FORWARDING_CODE, (code,))
+
+
+def session_gate(conn: psycopg.Connection, user_id: UUID) -> SessionGate | None:
+    """None for an unknown or erased account; otherwise the cutoff row."""
+    return db.fetch_one(conn, _SESSION_GATE, (user_id,), row_cls=SessionGate)
+
+
+def revoke_sessions(conn: psycopg.Connection, user_id: UUID) -> bool:
+    """True if a live account's cutoff was moved to now."""
+    return db.execute(conn, _REVOKE_SESSIONS, (user_id,)) == 1
+
+
+def user_email(conn: psycopg.Connection, user_id: UUID) -> str | None:
+    return db.fetch_value(conn, _USER_EMAIL, (user_id,))
+
+
+def delete_login_tokens(conn: psycopg.Connection, email: str) -> int:
+    return db.execute(conn, _DELETE_LOGIN_TOKENS, (email,))
+
+
+def delete_devices(conn: psycopg.Connection, user_id: UUID) -> int:
+    return db.execute(conn, _DELETE_DEVICES, (user_id,))
+
+
+def erase_user_row(conn: psycopg.Connection, user_id: UUID) -> bool:
+    """True if this call erased a live account; False if there was none."""
+    return db.execute(conn, _ERASE_USER, (user_id,)) == 1

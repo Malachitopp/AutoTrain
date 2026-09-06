@@ -1,13 +1,16 @@
 """Process type 4 of 4: the scheduler — recurring jobs on an interval
 (ARCHITECTURE §2; the enumeration is api, ingestor, worker, scheduler).
 
-Two jobs today, both from the claims module, both cheap no-ops when their
-work queues are empty:
+Three jobs today, all cheap no-ops when their work queues are empty:
 
   * claim sweep  — opens a draft claim for every entitled delay detection
     that does not have one (the delay_detections_unclaimed_idx queue, 0010);
   * claim expiry — expires claims whose filing window closed, so a claim we
-    never managed to file ends with an audited answer, not silence.
+    never managed to file ends with an audited answer, not silence;
+  * ticket intake — reads forwarded ticket emails into journeys
+    (inbound_emails_queue_idx, 0013). Runs only when a reader is configured
+    (AUTOTRAIN_TICKET_EXTRACTOR); the reader is built here, once, and handed
+    to the journeys module — the sources/ seam, as in the ingestor.
 
 Jobs are isolated from each other: one failing is logged and retried next
 interval while the rest still run — the same containment stance as the
@@ -16,8 +19,8 @@ one-claim-per-journey constraint and the guarded expiry transition), so a
 crash between interval N and N+1 needs no recovery logic; the next interval
 simply does whatever remains.
 
-Unlike the ingestor this process needs no external source and no credentials,
-so there is nothing to validate at boot beyond Settings itself.
+The claims jobs need no external source and no credentials; the intake job
+is the exception, and Settings refuses to boot with a reader and no key.
 """
 
 from __future__ import annotations
@@ -30,7 +33,10 @@ from zoneinfo import ZoneInfo
 
 from autotrain.core import db
 from autotrain.core.config import get_settings
+from autotrain.core.observability import fields, setup_logging
 from autotrain.modules.claims import service as claims
+from autotrain.modules.journeys import service as journeys
+from autotrain.sources.ticket_emails import ClaudeTicketExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -64,21 +70,52 @@ def _expire_once(batch_size: int) -> int:
         return claims.expire_overdue(conn, today, batch_size=batch_size, commit_each=True)
 
 
-def _run_jobs_once(batch_size: int) -> None:
+def _build_extractor() -> journeys.TicketExtractor | None:
+    """The configured ticket reader, or None when intake is switched off.
+    One branch per reader; adding one touches this function and sources/."""
+    settings = get_settings()
+    if settings.ticket_extractor == "claude":
+        if settings.anthropic_api_key is None:  # unreachable: Settings validates the pair
+            raise SystemExit("AUTOTRAIN_TICKET_EXTRACTOR=claude needs AUTOTRAIN_ANTHROPIC_API_KEY")
+        return ClaudeTicketExtractor(
+            api_key=settings.anthropic_api_key.get_secret_value(),
+            model=settings.ticket_extractor_model,
+        )
+    return None
+
+
+def _intake_once(extractor: journeys.TicketExtractor) -> journeys.IntakeStats:
+    settings = get_settings()
+    with db.transaction() as conn:
+        # commit_each: every email's outcome is durable the moment it is
+        # decided — a model call is seconds, and a crash mid-pass must not
+        # undo the emails already read.
+        return journeys.run_intake_sweep(
+            conn, extractor, batch_size=settings.intake_batch_size, commit_each=True
+        )
+
+
+def _run_jobs_once(batch_size: int, extractor: journeys.TicketExtractor | None = None) -> None:
     """One pass over every job, each isolated: a job that raises is logged
     and retried next interval; the jobs after it still run. Broad excepts on
     purpose — driver exception types are contractually invisible here
     (.importlinter: psycopg stays behind core)."""
     try:
         stats = _claim_sweep_once(batch_size)
-        logger.info("claim sweep complete: %s", stats)
+        logger.info("claim sweep complete", extra=fields(stats))
     except Exception:
         logger.exception("claim sweep failed; retrying next interval")
     try:
         expired = _expire_once(batch_size)
-        logger.info("claim expiry complete: expired=%d", expired)
+        logger.info("claim expiry complete", extra={"expired": expired})
     except Exception:
         logger.exception("claim expiry failed; retrying next interval")
+    if extractor is not None:
+        try:
+            intake = _intake_once(extractor)
+            logger.info("ticket intake complete", extra=fields(intake))
+        except Exception:
+            logger.exception("ticket intake failed; retrying next interval")
 
 
 def main() -> None:
@@ -87,12 +124,16 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level.upper())
+    setup_logging("scheduler", level=settings.log_level, fmt=settings.log_format)
+
+    extractor = _build_extractor()
+    if extractor is None:
+        logger.info("ticket intake off: AUTOTRAIN_TICKET_EXTRACTOR=none")
 
     db.init_pool()
     try:
         while True:
-            _run_jobs_once(settings.scheduler_batch_size)
+            _run_jobs_once(settings.scheduler_batch_size, extractor)
             if args.once:
                 break
             time.sleep(settings.scheduler_interval_seconds)

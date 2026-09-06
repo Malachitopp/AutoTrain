@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { JourneyForm } from "@/components/journey-form";
 import { RequireSession } from "@/components/require-session";
-import * as session from "@/lib/session";
 
 const replace = vi.fn();
 vi.mock("next/navigation", () => ({ useRouter: () => ({ replace }) }));
@@ -57,7 +56,6 @@ function fill(values: Record<string, string>) {
 
 beforeEach(() => {
   window.localStorage.clear();
-  session.store("a-live-jwt");
   replace.mockReset();
 });
 

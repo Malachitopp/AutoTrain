@@ -13,14 +13,17 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date, datetime
+from typing import Any
 from uuid import UUID
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 from autotrain.core import db
 from autotrain.modules.journeys.models import (
     AssessableJourney,
     ClaimContext,
+    InboundEmailRow,
     JourneyRow,
     NotificationContext,
 )
@@ -31,7 +34,8 @@ from autotrain.modules.journeys.models import (
 # both S608 and the LiteralString guarantee these constants exist to keep.
 
 _INSERT_TICKET = (
-    "INSERT INTO tickets (user_id, kind, price_pence, source) VALUES (%s, %s, %s, %s) RETURNING id"
+    "INSERT INTO tickets (user_id, kind, price_pence, source, retailer, source_payload) "
+    "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id"
 )
 
 _INSERT_JOURNEY = (
@@ -67,6 +71,70 @@ _LIST_FOR_USER = (
 _LEG_EXISTS = (
     "SELECT EXISTS (SELECT 1 FROM journeys WHERE user_id = %s AND travel_date = %s "
     "AND origin_crs = %s AND destination_crs = %s AND scheduled_departure = %s)"
+)
+
+
+# --- Inbound ticket emails (0013) ------------------------------------------
+
+# The full inbound_emails column list, repeated verbatim for the same reasons
+# as the journeys list above.
+
+# ON CONFLICT (message_id) DO NOTHING: a webhook retry of an email already
+# stored returns no row, and the caller reads "no row" as "seen before".
+_INSERT_INBOUND_EMAIL = (
+    "INSERT INTO inbound_emails (user_id, message_id, sender, recipient, subject, body, "
+    "status, status_reason, processed_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+    "ON CONFLICT (message_id) DO NOTHING "
+    "RETURNING id, user_id, message_id, sender, recipient, subject, body, received_at, "
+    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at"
+)
+
+# The intake sweep's page: oldest unread first (inbound_emails_queue_idx).
+# The caller passes the ids it has given up on for this sweep, so a raising
+# email does not head every page until the sweep ends. Every 'received' row
+# is listed, whatever its attempts: the sweep itself retires the exhausted
+# ones (a crash on the last attempt must not strand a row). id breaks
+# received_at ties so a page order is stable.
+_LIST_RECEIVED_EMAILS = (
+    "SELECT id, user_id, message_id, sender, recipient, subject, body, received_at, "
+    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at "
+    "FROM inbound_emails WHERE status = 'received' AND NOT (id = ANY(%s::uuid[])) "
+    "ORDER BY received_at, id LIMIT %s"
+)
+
+_LIST_INBOUND_FOR_USER = (
+    "SELECT id, user_id, message_id, sender, recipient, subject, body, received_at, "
+    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at "
+    "FROM inbound_emails WHERE user_id = %s ORDER BY received_at DESC, id LIMIT %s"
+)
+
+# Guarded on status like the marks below: counting an attempt on a row
+# another writer has already decided would be a second paid read of it.
+_BUMP_ATTEMPTS = (
+    "UPDATE inbound_emails SET attempts = attempts + 1 WHERE id = %s AND status = 'received'"
+)
+
+# Guarded on status: a decided row is never re-decided, so two sweeps reaching
+# one email (or a sweep and a reviewer) cannot overwrite each other.
+_MARK_PROCESSED = (
+    "UPDATE inbound_emails SET status = %s, status_reason = %s, extraction = %s, "
+    "processed_at = now() WHERE id = %s AND status = 'received'"
+)
+
+_MARK_FAILED_IF_EXHAUSTED = (
+    "UPDATE inbound_emails SET status = 'failed', status_reason = %s, processed_at = now() "
+    "WHERE id = %s AND status = 'received' AND attempts >= %s"
+)
+
+# --- Erasure (GDPR) ---------------------------------------------------------
+# identity.erase_user asks each module to forget the person. Journeys keeps
+# the journeys (claims reference them, RESTRICT) but drops the raw emails and
+# the seller/email references on tickets — the only text here that came from
+# the person rather than the timetable.
+_DELETE_INBOUND_EMAILS = "DELETE FROM inbound_emails WHERE user_id = %s"
+_STRIP_TICKET_SOURCES = (
+    "UPDATE tickets SET retailer = NULL, source_payload = NULL WHERE user_id = %s"
 )
 
 
@@ -170,9 +238,18 @@ def assign_operator(conn: psycopg.Connection, journey_id: UUID, operator_id: UUI
 
 
 def insert_ticket(
-    conn: psycopg.Connection, user_id: UUID, kind: str, price_pence: int, source: str
+    conn: psycopg.Connection,
+    user_id: UUID,
+    kind: str,
+    price_pence: int,
+    source: str,
+    *,
+    retailer: str | None = None,
+    source_payload: str | None = None,
 ) -> UUID:
-    return db.fetch_value(conn, _INSERT_TICKET, (user_id, kind, price_pence, source))
+    return db.fetch_value(
+        conn, _INSERT_TICKET, (user_id, kind, price_pence, source, retailer, source_payload)
+    )
 
 
 def insert_journey(
@@ -244,3 +321,88 @@ def notification_contexts(
         conn, _NOTIFICATION_CONTEXTS, (list(journey_ids),), row_cls=NotificationContext
     )
     return {row.journey_id: row for row in rows}
+
+
+# --- Inbound ticket emails --------------------------------------------------
+
+
+def insert_inbound_email(
+    conn: psycopg.Connection,
+    *,
+    user_id: UUID | None,
+    message_id: str,
+    sender: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    status: str,
+    status_reason: str | None,
+    processed_at: datetime | None,
+) -> InboundEmailRow | None:
+    """The stored row, or None when this message_id was stored before."""
+    return db.fetch_one(
+        conn,
+        _INSERT_INBOUND_EMAIL,
+        (
+            user_id,
+            message_id,
+            sender,
+            recipient,
+            subject,
+            body,
+            status,
+            status_reason,
+            processed_at,
+        ),
+        row_cls=InboundEmailRow,
+    )
+
+
+def list_received_emails(
+    conn: psycopg.Connection, limit: int, *, excluding: Sequence[UUID] = ()
+) -> list[InboundEmailRow]:
+    return db.fetch_all(
+        conn, _LIST_RECEIVED_EMAILS, (list(excluding), limit), row_cls=InboundEmailRow
+    )
+
+
+def list_inbound_for_user(
+    conn: psycopg.Connection, user_id: UUID, limit: int
+) -> list[InboundEmailRow]:
+    return db.fetch_all(conn, _LIST_INBOUND_FOR_USER, (user_id, limit), row_cls=InboundEmailRow)
+
+
+def bump_attempts(conn: psycopg.Connection, email_id: UUID) -> bool:
+    """True if the attempt was counted; False if the row is no longer queued."""
+    return db.execute(conn, _BUMP_ATTEMPTS, (email_id,)) == 1
+
+
+def mark_processed(
+    conn: psycopg.Connection,
+    email_id: UUID,
+    *,
+    status: str,
+    reason: str | None,
+    extraction: dict[str, Any] | None,
+) -> bool:
+    """True if this call decided the row; False if it was no longer queued."""
+    payload = None if extraction is None else Jsonb(extraction)
+    return db.execute(conn, _MARK_PROCESSED, (status, reason, payload, email_id)) == 1
+
+
+def mark_failed_if_exhausted(
+    conn: psycopg.Connection, email_id: UUID, *, max_attempts: int, reason: str
+) -> bool:
+    """True if the row has now used up its attempts and was marked failed."""
+    return db.execute(conn, _MARK_FAILED_IF_EXHAUSTED, (reason, email_id, max_attempts)) == 1
+
+
+# --- Erasure ----------------------------------------------------------------
+
+
+def delete_inbound_emails(conn: psycopg.Connection, user_id: UUID) -> int:
+    return db.execute(conn, _DELETE_INBOUND_EMAILS, (user_id,))
+
+
+def strip_ticket_sources(conn: psycopg.Connection, user_id: UUID) -> int:
+    return db.execute(conn, _STRIP_TICKET_SOURCES, (user_id,))

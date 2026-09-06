@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 from autotrain.core import db
 from autotrain.core.config import Settings, get_settings
+from autotrain.core.observability import fields, setup_logging
 from autotrain.modules.delays import service
 from autotrain.sources.hsp import HspSource
 
@@ -78,7 +79,7 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level.upper())
+    setup_logging("ingestor", level=settings.log_level, fmt=settings.log_format)
 
     source = _build_source(settings)
 
@@ -87,7 +88,7 @@ def main() -> None:
         while True:
             try:
                 stats = _sweep_once(source)
-                logger.info("sweep complete: %s", stats)
+                logger.info("sweep complete", extra=fields(stats))
             except Exception:
                 # A transient failure (database blip mid-sweep) must not kill
                 # the process: per-journey commits made completed work

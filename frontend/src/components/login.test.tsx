@@ -87,7 +87,7 @@ describe("a plain visit", () => {
 });
 
 describe("a visit from the emailed link", () => {
-  it("waits for a click, then exchanges the token, stores the session, scrubs the link, and goes home", async () => {
+  it("waits for a click, then exchanges the token, notes the session, scrubs the link, and goes home", async () => {
     window.location.hash = "#token=magic-123";
     const calls = fakeFetch(200, { access_token: "the-jwt" });
     render(<Login />);
@@ -101,14 +101,14 @@ describe("a visit from the emailed link", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe("http://api.test/auth/login/verify");
     expect(calls[0].init.body).toBe(JSON.stringify({ token: "magic-123" }));
-    expect(session.token()).toBe("the-jwt");
+    expect(session.hasSession()).toBe(true);
     // The token must not survive in the address bar: a reload or a
     // bookmark would otherwise replay it.
     expect(window.location.hash).toBe("");
   });
 
   it("warns when this browser is already signed in", async () => {
-    session.store("someone-elses-jwt");
+    session.remember();
     window.location.hash = "#token=magic-123";
     render(<Login />);
     await screen.findByRole("button", { name: "Continue" });
@@ -124,7 +124,7 @@ describe("a visit from the emailed link", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("expired or was already used");
     expect(screen.getByLabelText("Email")).toBeDefined();
-    expect(session.token()).toBeNull();
+    expect(session.hasSession()).toBe(false);
     expect(window.location.hash).toBe("");
     expect(replace).not.toHaveBeenCalled();
   });
@@ -141,20 +141,6 @@ describe("a visit from the emailed link", () => {
     // The token is unspent, so the link stays and Continue is still there.
     expect(window.location.hash).toBe("#token=still-good");
     expect(screen.getByRole("button", { name: "Continue" })).toBeDefined();
-    expect(replace).not.toHaveBeenCalled();
-  });
-
-  it("explains when the browser refuses to keep the session", async () => {
-    window.location.hash = "#token=magic-123";
-    fakeFetch(200, { access_token: "the-jwt" });
-    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-      throw new DOMException("blocked", "SecurityError");
-    });
-    render(<Login />);
-    fireEvent.click(await screen.findByRole("button", { name: "Continue" }));
-
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("blocking storage");
     expect(replace).not.toHaveBeenCalled();
   });
 

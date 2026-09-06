@@ -1,4 +1,4 @@
-"""Wire shapes for the journeys, claims, auth and operators endpoints.
+"""Wire shapes for the journeys, claims, auth, operators and intake endpoints.
 
 Validation happens here, before any SQL runs: a request that would violate a
 0005 constraint fails as a 422 naming the offending field, not as a database
@@ -220,3 +220,48 @@ class OperatorOut(BaseModel):
     atoc_code: str
     name: str
     min_delay_minutes: int
+
+
+class InboundEmailIn(BaseModel):
+    """One forwarded email as the mail provider's webhook hands it over —
+    a provider-neutral shape; a Postmark or SES adapter maps into it. body
+    is whatever the provider gives (plain text preferred, HTML if that is
+    all there is); the reader copes with either."""
+
+    message_id: str = Field(min_length=1, max_length=998)
+    sender: str = Field(min_length=1, max_length=320)
+    recipient: str = Field(min_length=1, max_length=320)
+    subject: str = Field(default="", max_length=2000)
+    body: str = Field(default="", max_length=500_000)
+
+
+class IntakeReceipt(BaseModel):
+    """What the webhook did with the email. Always a 202: none of the three
+    is something a provider retry would change."""
+
+    status: Literal["received", "rejected", "duplicate"]
+
+
+class ForwardingAddressOut(BaseModel):
+    """Where this user forwards ticket emails."""
+
+    address: str
+
+
+class InboundEmailOut(BaseModel):
+    """One forwarded email as the user sees it: when it came, from whom,
+    and what became of it. The body and the reader's raw answer stay off
+    the wire — they are for review, not display."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    received_at: AwareDatetime
+    sender: str
+    subject: str
+    status: str
+    status_reason: str | None
+
+    @field_serializer("received_at")
+    def _in_utc(self, value: datetime) -> datetime:
+        return value.astimezone(UTC)

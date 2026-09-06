@@ -7,22 +7,23 @@ configuration, so the same image runs locally and in ECS unchanged.
 
 from __future__ import annotations
 
-import logging
-
 import uvicorn
 
 from autotrain.core.config import get_settings
+from autotrain.core.observability import setup_logging
 
 
 def main() -> None:
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level.upper())
+    setup_logging("api", level=settings.log_level, fmt=settings.log_format)
     uvicorn.run(
         "autotrain.api.app:create_app",
         factory=True,
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
+        # RequestIdMiddleware writes the one line per request, with the id.
+        access_log=False,
     )
 
 

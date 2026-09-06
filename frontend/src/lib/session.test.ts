@@ -2,36 +2,32 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as session from "@/lib/session";
 
-describe("session storage", () => {
+describe("the signed-in hint", () => {
   beforeEach(() => {
     window.localStorage.clear();
   });
 
-  it("starts signed out", () => {
-    expect(session.token()).toBeNull();
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
-  it("round-trips a token", () => {
-    session.store("jwt-goes-here");
-    expect(session.token()).toBe("jwt-goes-here");
+  it("starts absent, is set by remember and cleared by forget", () => {
+    expect(session.hasSession()).toBe(false);
+    session.remember();
+    expect(session.hasSession()).toBe(true);
+    session.forget();
+    expect(session.hasSession()).toBe(false);
   });
 
-  it("clear signs out", () => {
-    session.store("jwt-goes-here");
-    session.clear();
-    expect(session.token()).toBeNull();
-  });
-
-  it("store says so, in plain words, when the browser blocks storage", () => {
+  it("never throws when the browser blocks storage: the API is asked instead", () => {
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new DOMException("blocked", "SecurityError");
     });
-    expect(() => session.store("jwt")).toThrow(session.StorageUnavailable);
-    expect(() => session.store("jwt")).toThrow(/blocking storage/);
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("blocked", "SecurityError");
+    });
+    expect(() => session.remember()).not.toThrow();
+    expect(session.hasSession()).toBe(false);
   });
 });
 
@@ -41,15 +37,9 @@ describe("tokenFromHash", () => {
     expect(session.tokenFromHash("#token=Ab3-_xyz")).toBe("Ab3-_xyz");
   });
 
-  it("is null for a plain visit to /login", () => {
+  it("is null for a plain visit, another fragment, or an empty token", () => {
     expect(session.tokenFromHash("")).toBeNull();
-  });
-
-  it("is null for a fragment that names something else", () => {
     expect(session.tokenFromHash("#section=faq")).toBeNull();
-  });
-
-  it("is null for an empty token", () => {
     expect(session.tokenFromHash("#token=")).toBeNull();
   });
 });

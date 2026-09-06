@@ -5,12 +5,20 @@ Everything the rest of the system may do with journeys goes through this file
 in the module. psycopg's exception types never escape it either — database
 failures surface as the domain exceptions below, so callers stay free of
 driver knowledge.
+
+Two ways in, one writer. add_manual_journey takes the form's fields; the
+intake functions take a forwarded ticket email, hand it to a TicketExtractor
+(the reader, built outside the module — see intake.py) and turn a trusted
+reading into the same ticket + journeys through the same private writer, so
+nothing downstream can tell how a journey arrived.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from uuid import UUID
 
 import psycopg
@@ -21,7 +29,13 @@ from psycopg import errors as pg_errors
 # hand callers the repository past every import-linter contract (the graph
 # records only an import of the service). The underscore makes that an
 # ImportError, so the public surface is exactly the functions below.
+from autotrain.modules.journeys import intake as _intake
 from autotrain.modules.journeys import repository as _repository
+
+# Re-exported deliberately: the reader's protocol and its answer shape, so the
+# scheduler and the reader implementation import them from here and stay off
+# journeys.intake (the journeys-privacy contract).
+from autotrain.modules.journeys.intake import ExtractedLeg, ExtractedTicket, TicketExtractor
 
 # AssessableJourney, ClaimContext and NotificationContext are re-exported
 # deliberately: they are the shapes this service hands the delay engine, the
@@ -30,9 +44,47 @@ from autotrain.modules.journeys import repository as _repository
 from autotrain.modules.journeys.models import (
     AssessableJourney,
     ClaimContext,
+    InboundEmailRow,
     JourneyRow,
     NotificationContext,
 )
+
+__all__ = [
+    "MAX_INTAKE_ATTEMPTS",
+    "AssessableJourney",
+    "ClaimContext",
+    "DuplicateJourney",
+    "ExtractedLeg",
+    "ExtractedTicket",
+    "InboundEmailRow",
+    "IntakeStats",
+    "InvalidJourney",
+    "JourneyRow",
+    "JourneysError",
+    "NotificationContext",
+    "TicketExtractor",
+    "UnknownUser",
+    "add_manual_journey",
+    "assign_operator",
+    "claim_contexts",
+    "forget_user",
+    "get_journey",
+    "list_awaiting_assessment",
+    "list_inbound_emails",
+    "list_journeys",
+    "mark_assessed",
+    "mark_unmatched",
+    "notification_contexts",
+    "receive_ticket_email",
+    "run_intake_sweep",
+]
+
+logger = logging.getLogger(__name__)
+
+# A reader that keeps failing on one email (a malformed body, a model outage
+# that outlasts the retries) must not be asked for ever: after this many
+# attempts the email is marked failed and leaves the queue.
+MAX_INTAKE_ATTEMPTS = 3
 
 # The two constraints that mean "this journey is already tracked":
 # journeys_user_leg_departure_key (0009) is the cross-request guard — every
@@ -93,28 +145,69 @@ def add_manual_journey(
             f"{origin_crs}->{destination_crs} on {travel_date} at {scheduled_departure} "
             "is already tracked"
         )
+    leg = _intake.LegSpec(
+        origin_crs=origin_crs,
+        destination_crs=destination_crs,
+        travel_date=travel_date,
+        scheduled_departure=scheduled_departure,
+        scheduled_arrival=scheduled_arrival,
+    )
+    return _insert_ticket_and_journeys(
+        conn, user_id, kind=kind, price_pence=price_pence, source="manual", legs=[leg]
+    )[0]
+
+
+def _insert_ticket_and_journeys(
+    conn: psycopg.Connection,
+    user_id: UUID,
+    *,
+    kind: str,
+    price_pence: int,
+    source: str,
+    legs: Sequence[_intake.LegSpec],
+    retailer: str | None = None,
+    source_payload: str | None = None,
+) -> list[JourneyRow]:
+    """One ticket and its journeys, as one unit of work — the writer behind
+    both ways in. The caller owns the transaction, so the inserts commit or
+    roll back together: no journey without its ticket, no ticket without its
+    journeys. Driver errors become the module's domain errors here.
+    """
     try:
-        ticket_id = _repository.insert_ticket(conn, user_id, kind, price_pence, "manual")
-        return _repository.insert_journey(
+        ticket_id = _repository.insert_ticket(
             conn,
-            user_id=user_id,
-            ticket_id=ticket_id,
-            origin_crs=origin_crs,
-            destination_crs=destination_crs,
-            travel_date=travel_date,
-            scheduled_departure=scheduled_departure,
-            scheduled_arrival=scheduled_arrival,
+            user_id,
+            kind,
+            price_pence,
+            source,
+            retailer=retailer,
+            source_payload=source_payload,
         )
+        rows: list[JourneyRow] = []
+        for leg in legs:
+            # No operator from either way in: the delay sweep assigns it from
+            # the arrivals data, which knows who ran the train (0005's
+            # seller-is-not-operator rule; intake.py's module docstring).
+            rows.append(
+                _repository.insert_journey(
+                    conn,
+                    user_id=user_id,
+                    ticket_id=ticket_id,
+                    origin_crs=leg.origin_crs,
+                    destination_crs=leg.destination_crs,
+                    travel_date=leg.travel_date,
+                    scheduled_departure=leg.scheduled_departure,
+                    scheduled_arrival=leg.scheduled_arrival,
+                )
+            )
+        return rows
     except pg_errors.ForeignKeyViolation as exc:
-        # Only the users FK can fail here — no operator id is supplied on a
-        # manual add — so this is always "that user does not exist".
+        # Only the users FK can fail here — no operator id is supplied by
+        # either way in — so this is always "that user does not exist".
         raise UnknownUser(str(user_id)) from exc
     except pg_errors.UniqueViolation as exc:
         if exc.diag.constraint_name in _DUPLICATE_CONSTRAINTS:
-            raise DuplicateJourney(
-                f"{origin_crs}->{destination_crs} on {travel_date} at {scheduled_departure} "
-                "is already tracked"
-            ) from exc
+            raise DuplicateJourney(f"{_describe(legs)} is already tracked") from exc
         raise
     except (pg_errors.CheckViolation, pg_errors.DataError) as exc:
         # CHECKs (times ordered, CRS shape, price >= 0) and range errors
@@ -122,6 +215,16 @@ def add_manual_journey(
         # mirror every one of these constraints — but a direct caller must
         # still get a domain error, not a driver class.
         raise InvalidJourney(str(exc).strip()) from exc
+
+
+def _describe(legs: Sequence[_intake.LegSpec]) -> str:
+    if len(legs) == 1:
+        leg = legs[0]
+        return (
+            f"{leg.origin_crs}->{leg.destination_crs} on {leg.travel_date} "
+            f"at {leg.scheduled_departure}"
+        )
+    return f"one of the {len(legs)} journeys on this ticket"
 
 
 def get_journey(conn: psycopg.Connection, journey_id: UUID, user_id: UUID) -> JourneyRow | None:
@@ -193,3 +296,288 @@ def notification_contexts(
     by journey id — the notification worker's version of claim_contexts.
     Batched; ids with no journey are simply absent from the result."""
     return _repository.notification_contexts(conn, journey_ids)
+
+
+# --- Ticket-email intake ------------------------------------------------------
+
+
+@dataclass
+class IntakeStats:
+    """One intake sweep's outcome, for the scheduler's log line."""
+
+    examined: int = 0
+    parsed: int = 0  # journeys created
+    needs_review: int = 0  # read, not trusted; a person decides
+    rejected: int = 0  # not a ticket, or a kind we do not monitor
+    duplicate: int = 0  # every journey on it was already tracked
+    failed: int = 0  # the reader kept erroring; gave up after MAX_INTAKE_ATTEMPTS
+    lost_race: int = 0  # another writer decided the email while this sweep held it
+    errors: int = 0  # the reader raised this time; the email waits for the next sweep
+
+
+class _AlreadyDecided(Exception):
+    """Raised inside the write savepoint when the email's status was changed
+    by someone else between the read and the write, so the savepoint rolls
+    the ticket and journeys back with it."""
+
+
+def receive_ticket_email(
+    conn: psycopg.Connection,
+    *,
+    user_id: UUID | None,
+    message_id: str,
+    sender: str,
+    recipient: str,
+    subject: str,
+    body: str,
+) -> InboundEmailRow | None:
+    """Store one forwarded email for the intake sweep to read.
+
+    Returns None when this message_id was stored before (a webhook retry).
+    `user_id` None means the recipient address belongs to nobody — most
+    often an erased account whose forwarding rule is still running. The row
+    records only that mail arrived for the code, and when: sender, subject
+    and body are all dropped, because there is no owner left to erase them.
+    """
+    if user_id is None:
+        return _repository.insert_inbound_email(
+            conn,
+            user_id=None,
+            message_id=message_id,
+            sender="",
+            recipient=recipient,
+            subject="",
+            body="",
+            status="rejected",
+            status_reason="unknown recipient",
+            processed_at=datetime.now(UTC),
+        )
+    return _repository.insert_inbound_email(
+        conn,
+        user_id=user_id,
+        message_id=message_id,
+        sender=sender,
+        recipient=recipient,
+        subject=subject,
+        body=body,
+        status="received",
+        status_reason=None,
+        processed_at=None,
+    )
+
+
+def list_inbound_emails(
+    conn: psycopg.Connection, user_id: UUID, *, limit: int = 50
+) -> list[InboundEmailRow]:
+    """What became of the emails this user forwarded, newest first."""
+    return _repository.list_inbound_for_user(conn, user_id, limit)
+
+
+def run_intake_sweep(
+    conn: psycopg.Connection,
+    extractor: TicketExtractor,
+    *,
+    batch_size: int = 20,
+    commit_each: bool = False,
+) -> IntakeStats:
+    """Read every queued email and act on what the reader says.
+
+    The house sweep shape (the claim sweep documents it): pages over the
+    'received' queue, one savepoint per email, a raising email is logged and
+    left alone. Three things differ because the reader is a slow, fallible
+    network call:
+
+    * Each email's attempt is counted BEFORE it is read, in its own savepoint
+      guarded on status, so a reader that always raises runs out of attempts
+      (MAX_INTAKE_ATTEMPTS) and the email is marked failed rather than re-read
+      for ever — and a row another writer has decided is never read at all.
+    * A raising email is excluded from the rest of THIS sweep (`skipped`), so
+      one outage cannot burn all its attempts seconds apart; it waits for the
+      next interval.
+    * A row that already used its attempts but is still 'received' (the
+      process died on its last read) is retired here without a read.
+
+    Pages are small: one email is one model call.
+    """
+    stats = IntakeStats()
+    skipped: set[UUID] = set()
+    while True:
+        page = _repository.list_received_emails(conn, batch_size, excluding=list(skipped))
+        if not page:
+            break
+
+        progressed = 0
+        for email in page:
+            stats.examined += 1
+            if email.attempts >= MAX_INTAKE_ATTEMPTS:
+                with conn.transaction():
+                    _repository.mark_failed_if_exhausted(
+                        conn,
+                        email.id,
+                        max_attempts=MAX_INTAKE_ATTEMPTS,
+                        reason=f"the reader failed {MAX_INTAKE_ATTEMPTS} times",
+                    )
+                stats.failed += 1
+                progressed += 1
+                if commit_each:
+                    conn.commit()
+                continue
+
+            with conn.transaction():
+                counted = _repository.bump_attempts(conn, email.id)
+            if not counted:
+                # Decided by someone else since the page was listed.
+                stats.lost_race += 1
+                progressed += 1
+                continue
+
+            try:
+                with conn.transaction():
+                    status = _process_email(conn, email, extractor)
+                setattr(stats, status, getattr(stats, status) + 1)
+                progressed += 1
+            except Exception as exc:
+                logger.exception(
+                    "intake: email %s failed on attempt %d; continuing",
+                    email.id,
+                    email.attempts + 1,
+                )
+                stats.errors += 1
+                with conn.transaction():
+                    exhausted = _repository.mark_failed_if_exhausted(
+                        conn,
+                        email.id,
+                        max_attempts=MAX_INTAKE_ATTEMPTS,
+                        reason=(
+                            f"the reader failed {MAX_INTAKE_ATTEMPTS} times "
+                            f"(last: {type(exc).__name__})"
+                        ),
+                    )
+                if exhausted:
+                    stats.failed += 1
+                    progressed += 1  # it left the queue, which is progress
+                else:
+                    skipped.add(email.id)  # not again this sweep
+            if commit_each:
+                conn.commit()
+
+        if progressed == 0:
+            # Defence in depth: `skipped` already keeps a raising page from
+            # coming back, so this should not fire. If it does, stop rather
+            # than loop.
+            logger.error("intake: no email in a page of %d could be decided — stopping", len(page))
+            break
+    return stats
+
+
+def _process_email(
+    conn: psycopg.Connection, email: InboundEmailRow, extractor: TicketExtractor
+) -> str:
+    """Read one email and act on the reading. Returns the status it ends in —
+    one of IntakeStats's counters.
+
+    Every status write is guarded on the row still being 'received'
+    (repository._MARK_PROCESSED), and the write that creates journeys shares
+    a savepoint with its status write: if the status was changed by someone
+    else meanwhile, the journeys roll back with the savepoint and the answer
+    is 'lost_race', never a ticket beside a verdict that disowns it.
+    """
+    if email.user_id is None:
+        # Unreachable: rows without a user are stored already decided, so the
+        # queue never holds one. Said out loud rather than trusted.
+        raise RuntimeError(f"queued inbound email {email.id} has no user")
+
+    ticket = extractor.extract(
+        subject=email.subject, body=email.body, received_at=email.received_at
+    )
+    extraction = ticket.model_dump()
+    verdict = _intake.judge(ticket, today=datetime.now(UTC).date())
+    if verdict.plan is None:
+        decided = _repository.mark_processed(
+            conn, email.id, status=verdict.status, reason=verdict.reason, extraction=extraction
+        )
+        return verdict.status if decided else "lost_race"
+
+    plan = verdict.plan
+    # Per leg, not per ticket: the outbound may have been added by hand
+    # before the confirmation was forwarded, and the return still needs
+    # tracking. Only legs nobody tracks yet are created; the rest are named.
+    new_legs = [
+        leg
+        for leg in plan.legs
+        if not _repository.leg_exists(
+            conn,
+            email.user_id,
+            leg.travel_date,
+            leg.origin_crs,
+            leg.destination_crs,
+            leg.scheduled_departure,
+        )
+    ]
+    already = len(plan.legs) - len(new_legs)
+    if not new_legs:
+        decided = _repository.mark_processed(
+            conn,
+            email.id,
+            status="duplicate",
+            reason=f"all {already} journey(s) on it were already tracked",
+            extraction=extraction,
+        )
+        return "duplicate" if decided else "lost_race"
+
+    try:
+        with conn.transaction():
+            journeys = _insert_ticket_and_journeys(
+                conn,
+                email.user_id,
+                kind=plan.kind,
+                price_pence=plan.price_pence,
+                source="email",
+                legs=new_legs,
+                retailer=plan.retailer,
+                source_payload=str(email.id),
+            )
+            reason = f"{len(journeys)} journey(s) added"
+            if already:
+                reason += f"; {already} already tracked"
+            if not _repository.mark_processed(
+                conn, email.id, status="parsed", reason=reason, extraction=extraction
+            ):
+                raise _AlreadyDecided
+    except _AlreadyDecided:
+        return "lost_race"
+    except DuplicateJourney:
+        # The leg_exists check and this insert raced another writer for the
+        # same journey. Rare; the outcome is still the truth.
+        decided = _repository.mark_processed(
+            conn,
+            email.id,
+            status="duplicate",
+            reason="these journeys are already tracked",
+            extraction=extraction,
+        )
+        return "duplicate" if decided else "lost_race"
+    except InvalidJourney as exc:
+        decided = _repository.mark_processed(
+            conn,
+            email.id,
+            status="needs_review",
+            reason=f"refused by the database: {exc}",
+            extraction=extraction,
+        )
+        return "needs_review" if decided else "lost_race"
+    return "parsed"
+
+
+# --- Erasure ----------------------------------------------------------------
+
+
+def forget_user(conn: psycopg.Connection, user_id: UUID) -> None:
+    """The journeys module's part of GDPR erasure (identity.erase_user
+    composes the whole). Forwarded emails are deleted outright — bodies are
+    the most personal thing the system holds. Tickets lose the seller and
+    the reference to the email they came from; the journeys themselves stay,
+    because claims reference them and a station pair with a date names no
+    one once the user row is anonymised."""
+    _repository.delete_inbound_emails(conn, user_id)
+    _repository.strip_ticket_sources(conn, user_id)
