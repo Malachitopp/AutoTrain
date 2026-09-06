@@ -19,6 +19,7 @@ Two rules the rest of the codebase depends on:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -95,6 +96,50 @@ def transaction() -> Iterator[psycopg.Connection]:
     """
     with get_pool().connection() as conn:
         yield conn
+
+
+# --- Job locks --------------------------------------------------------------
+# The sweeps assume one process runs each of them at a time. A rolling deploy
+# overlaps two for a minute, and scaling out runs two on purpose; without a
+# lock the second does the first's work again — no wrong data (every write is
+# guarded or ON CONFLICT), but a paid source call or a model call made twice.
+# A session-level advisory lock, named per job, makes the assumption true:
+# the second process sees the lock held and skips its pass.
+
+_TRY_LOCK = "SELECT pg_try_advisory_lock(%s)"
+_UNLOCK = "SELECT pg_advisory_unlock(%s)"
+
+
+def lock_key(name: str) -> int:
+    """A stable 64-bit key for a job name — Postgres advisory locks are
+    numbered, not named. Signed, because bigint is."""
+    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big", signed=True)
+
+
+@contextmanager
+def job_lock(conn: psycopg.Connection, name: str) -> Iterator[bool]:
+    """Try to hold the job's lock for the block; yields whether this session
+    got it (False: another session holds it — skip the pass, do not wait).
+
+    Session-level on purpose: the sweeps commit as they go, and a
+    transaction-level lock would be released by the first commit. Released
+    on exit whatever happened inside; the server releases it anyway if the
+    connection drops mid-sweep.
+    """
+    key = lock_key(name)
+    held = bool(fetch_value(conn, _TRY_LOCK, (key,)))
+    try:
+        yield held
+    except BaseException:
+        # A failure inside the block may have left the transaction aborted,
+        # and an aborted transaction refuses every statement — the unlock
+        # below included. Its work is lost either way (the caller rolls
+        # back), so end it here, then release.
+        conn.rollback()
+        raise
+    finally:
+        if held:
+            execute(conn, _UNLOCK, (key,))
 
 
 def fetch_all(

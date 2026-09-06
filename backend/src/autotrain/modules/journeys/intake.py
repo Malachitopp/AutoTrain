@@ -22,6 +22,17 @@ Two things the reader says are recorded but never acted on:
   full price — so a "single" with two legs would be paid twice over. The
   legs-per-kind check below sends that to a person instead.
 
+Three more things live here because they are the same boundary:
+* the door (screen): the checks an email must pass when it ARRIVES, before
+  it is stored for reading at all — whether the provider could verify the
+  sender, how many the user has sent today, and which of the two forwarding
+  shapes it is;
+* the setup message (forwarding_confirmation): Gmail emails a code to the
+  address before it will start forwarding, and that message must reach the
+  user rather than the ticket reader;
+* what the reader is given (text_for_reading): the stored body is raw; the
+  reader gets its words, without markup and cut to a size.
+
 Journeys-internal: the journeys-privacy contract forbids importing this file
 from outside the module. Callers reach it through service.run_intake_sweep.
 """
@@ -31,6 +42,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from email.utils import parseaddr
+from html.parser import HTMLParser
 from typing import Literal, Protocol
 from zoneinfo import ZoneInfo
 
@@ -273,3 +286,217 @@ def _london_instant(day: date, wall_clock: time) -> datetime:
     clocks go back, 01:00 to 01:59 happens twice; fold=0 takes the first (BST)
     occurrence — one hour a year, and the delay sweep tolerates minutes."""
     return datetime.combine(day, wall_clock, tzinfo=_LONDON).astimezone(UTC)
+
+
+# --- Trust at the door ----------------------------------------------------------
+# What arrives here has been through someone else's mail system, so the
+# first question is what the message can actually prove.
+#
+# There are two ways a ticket email reaches us, and they prove opposite
+# things:
+#
+# * MANUAL. The person opens the email and presses Forward. Their provider
+#   composes a NEW message from them, signed as them, with the original
+#   quoted inside. Strong proof of WHO. Weak proof of WHAT: the retailer's
+#   original headers are now just text in the body, and the sender could
+#   have edited them.
+# * AUTOMATIC. The person sets up a forwarding rule once, and their provider
+#   redirects each matching message untouched. The From header still names
+#   the retailer, and the retailer's own signature still validates. Strong
+#   proof of WHAT. No proof at all of WHO: the only headers naming the
+#   forwarding account (X-Forwarded-For, and the envelope sender) are added
+#   after signing, and any sender can type them.
+#
+# An earlier version of this file refused anything whose From address was
+# not the account holder's. That rule is correct for the manual shape and
+# rejects EVERY message of the automatic shape — which is the shape the
+# product is for, because it is the one a person sets up once and forgets.
+#
+# So the door no longer judges identity from the message. The forwarding
+# address is the credential: 128 bits, replaceable, and rate limited per
+# user. Identity is re-established where it can be: the user confirms a
+# parsed journey in the app before anything is filed.
+
+MANUAL = "manual"
+AUTOMATIC = "automatic"
+
+# Gmail sends the setup code from one of these; older archives show the
+# second. A From header is forgeable, so this only decides ROUTING — the
+# code is shown to the user, never acted on by itself.
+_GOOGLE_SENDERS = frozenset({"forwarding-noreply@google.com", "mail-noreply@google.com"})
+_CONFIRMATION_SUBJECT = re.compile(r"forwarding confirmation", re.IGNORECASE)
+_CONFIRMATION_CODE = re.compile(r"\(\s*#\s*(\d{4,12})\s*\)")
+_ADDRESS = r"[^\s<>@]+@[^\s<>@]+"
+_CONFIRMATION_REQUESTER = re.compile(
+    rf"({_ADDRESS})\s+has requested to automatically forward mail", re.IGNORECASE
+)
+_CONFIRMATION_FROM_SUBJECT = re.compile(rf"receive mail from\s+({_ADDRESS})", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class DoorVerdict:
+    """What the door made of one arriving email. `refused` is None when it
+    may be read; `forwarding` records which shape it was either way."""
+
+    forwarding: Literal["manual", "automatic"]
+    refused: str | None = None
+
+
+@dataclass(frozen=True)
+class ForwardingConfirmation:
+    """Gmail's setup message: the code the user must enter back into Gmail,
+    and the account that asked to forward."""
+
+    code: str
+    requested_by: str | None
+
+
+def sender_address(sender: str) -> str:
+    """The bare address in a From value ("Jo Bloggs <jo@example.com>" ->
+    "jo@example.com"), lowercased; '' when there is none."""
+    return parseaddr(sender)[1].strip().lower()
+
+
+def screen(
+    *,
+    sender: str,
+    account_email: str,
+    spf_pass: bool | None,
+    dkim_pass: bool | None,
+    recent_count: int,
+    daily_cap: int,
+) -> DoorVerdict:
+    """Whether this email may be read, and which forwarding shape it is.
+
+    Two refusals, and neither is about identity (see the note above):
+
+    * An explicit SPF or DKIM failure from the mail provider. None means
+      "not checked" and passes, because the provider adapter that fills
+      these in may not be the one running.
+    * The per-user daily cap, which bounds what a leaked address, or a
+      runaway forwarding rule, can make the reader spend.
+    """
+    shape = MANUAL if sender_address(sender) == account_email.strip().lower() else AUTOMATIC
+    if spf_pass is False or dkim_pass is False:
+        return DoorVerdict(shape, "the sender could not be verified (SPF or DKIM failed)")
+    if recent_count >= daily_cap:
+        return DoorVerdict(shape, f"daily limit of {daily_cap} emails reached")
+    return DoorVerdict(shape)
+
+
+def forwarding_confirmation(
+    *, sender: str, subject: str, body: str
+) -> ForwardingConfirmation | None:
+    """Gmail's "confirm forwarding" message, or None for anything else.
+
+    Gmail will not begin forwarding until a code it emails to the
+    destination is entered back into Gmail's settings. That message arrives
+    at the user's forwarding address like any other, and it is not a ticket:
+    handed to the reader it would be filed as "not a ticket", and the user
+    would never see the code, so forwarding could never be switched on.
+    Recognising it here is what makes automatic forwarding possible at all.
+    """
+    if sender_address(sender) not in _GOOGLE_SENDERS:
+        return None
+    if not _CONFIRMATION_SUBJECT.search(subject):
+        return None
+    code = _CONFIRMATION_CODE.search(subject) or _CONFIRMATION_CODE.search(body)
+    if code is None:
+        return None
+    asked = _CONFIRMATION_REQUESTER.search(body) or _CONFIRMATION_FROM_SUBJECT.search(subject)
+    return ForwardingConfirmation(
+        code=code.group(1), requested_by=asked.group(1).lower() if asked else None
+    )
+
+
+# --- What the reader is given ---------------------------------------------------
+# The raw body is stored as it came; the reader gets a trimmed version. HTML
+# mail is mostly markup — a booking confirmation can be 200 KB of layout
+# around 2 KB of words — and the reader is paid by the character.
+
+# Longer than any ticket confirmation's words; well inside the reader's
+# window with its instructions. Markup is removed BEFORE the cut, so the
+# ticket details under a long header are not what gets cut.
+_MAX_READ_CHARS = 50_000
+_HTML_HINT = re.compile(r"<(html|body|head|div|table|tr|td|p|br|span|a|img)\b", re.IGNORECASE)
+_SPACES = re.compile(r"[ \t\r\f\v\xa0]+")
+_TRUNCATED = "\n[cut here: the email was longer than the reader is given]"
+
+
+class _TextOnly(HTMLParser):
+    """Collects the words of an HTML document: no tags, no scripts, no
+    styles; a line break wherever the markup breaks the flow."""
+
+    _SKIP = frozenset({"script", "style", "head", "title", "template"})
+    _BREAK = frozenset(
+        {
+            "p",
+            "div",
+            "br",
+            "tr",
+            "li",
+            "ul",
+            "ol",
+            "table",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "section",
+            "article",
+            "header",
+            "footer",
+            "blockquote",
+            "pre",
+            "hr",
+            "dt",
+            "dd",
+        }
+    )
+    _CELL = frozenset({"td", "th"})
+
+    def __init__(self) -> None:
+        super().__init__()  # convert_charrefs=True: &pound; arrives as £
+        self.parts: list[str] = []
+        self._skipping = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP:
+            self._skipping += 1
+        elif tag in self._BREAK:
+            self.parts.append("\n")
+        elif tag in self._CELL:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP:
+            self._skipping = max(0, self._skipping - 1)
+        elif tag in self._BREAK:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skipping:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        lines = (_SPACES.sub(" ", line).strip() for line in "".join(self.parts).split("\n"))
+        return "\n".join(line for line in lines if line)
+
+
+def text_for_reading(body: str, *, limit: int = _MAX_READ_CHARS) -> str:
+    """The body as the reader should see it: HTML reduced to its words, and
+    no more than `limit` characters, with a marker where it was cut. Plain
+    text under the limit passes through untouched."""
+    text = _html_to_text(body) if _HTML_HINT.search(body[:5000]) else body
+    if len(text) > limit:
+        text = text[:limit] + _TRUNCATED
+    return text
+
+
+def _html_to_text(html: str) -> str:
+    parser = _TextOnly()
+    parser.feed(html)
+    parser.close()
+    return parser.text()

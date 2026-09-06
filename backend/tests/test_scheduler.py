@@ -21,6 +21,7 @@ from uuid import UUID
 import psycopg
 import pytest
 
+from autotrain.core import db
 from autotrain.entrypoints import scheduler
 from autotrain.entrypoints.scheduler import _expire_once, _run_jobs_once, _uk_today
 from autotrain.modules.journeys.service import ExtractedLeg, ExtractedTicket
@@ -314,7 +315,8 @@ def _mk_received_email(setup: psycopg.Connection, user_id, message_id: str) -> U
 @pytest.mark.usefixtures("pool")
 def test_run_jobs_once_reads_forwarded_emails_only_when_a_reader_is_configured() -> None:
     """The intake job rides the same pass as the claims jobs and is skipped,
-    not failed, when no reader is configured."""
+    not failed, when no reader is configured. The retention job rides it
+    too, reader or not."""
     with _committed_world() as (setup, user_id, _operator_id):
         today = _uk_today(datetime.now(tz=UTC))
         first = _mk_received_email(setup, user_id, "<scheduler-1@retailer.test>")
@@ -338,3 +340,54 @@ def test_run_jobs_once_reads_forwarded_emails_only_when_a_reader_is_configured()
             )
             == 1
         )
+
+        setup.execute(
+            "UPDATE inbound_emails SET processed_at = now() - interval '61 days' WHERE id = %s",
+            (first,),
+        )
+        _run_jobs_once(batch_size=50)
+        assert (
+            _scalar(setup.execute("SELECT body FROM inbound_emails WHERE id = %s", (first,))) == ""
+        )
+
+
+@pytest.mark.usefixtures("pool")
+def test_run_jobs_once_skips_a_job_another_scheduler_is_running(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two schedulers at once — a rolling deploy's overlap, a scale-out —
+    must not both open the same claims or pay for the same model calls.
+    Each job holds a named lock; a pass that finds it held skips that job,
+    says so, and the other jobs still run. The lock gone, the next pass
+    does the work."""
+    with _committed_world() as (setup, user_id, operator_id):
+        today = _uk_today(datetime.now(tz=UTC))
+        journey, _ = _mk_assessed_journey_with_detection(
+            setup, user_id, operator_id, travel_date=today - timedelta(days=2), origin="MAN"
+        )
+        stale = _mk_draft_claim(
+            setup,
+            user_id,
+            operator_id,
+            travel_date=today - timedelta(days=90),
+            file_by=today - timedelta(days=62),
+            origin="LDS",
+        )
+        # `setup` plays the other scheduler, mid-way through its claim sweep.
+        key = db.lock_key("claim-sweep")
+        assert _scalar(setup.execute("SELECT pg_try_advisory_lock(%s)", (key,))) is True
+        try:
+            with caplog.at_level(logging.INFO, logger="autotrain.entrypoints.scheduler"):
+                _run_jobs_once(batch_size=50)
+        finally:
+            setup.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        assert "claim sweep skipped" in caplog.text
+        assert "claim expiry complete" in caplog.text
+        # The held job did nothing; the others ran.
+        assert journey not in _claim_state(setup, user_id)[0]
+        assert (
+            _scalar(setup.execute("SELECT status FROM claims WHERE id = %s", (stale,))) == "expired"
+        )
+
+        _run_jobs_once(batch_size=50)
+        assert _claim_state(setup, user_id)[0][journey] == "draft"

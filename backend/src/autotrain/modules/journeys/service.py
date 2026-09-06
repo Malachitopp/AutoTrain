@@ -15,10 +15,11 @@ nothing downstream can tell how a journey arrived.
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
 import psycopg
@@ -77,6 +78,7 @@ __all__ = [
     "notification_contexts",
     "receive_ticket_email",
     "run_intake_sweep",
+    "run_retention_sweep",
 ]
 
 logger = logging.getLogger(__name__)
@@ -321,24 +323,45 @@ class _AlreadyDecided(Exception):
     the ticket and journeys back with it."""
 
 
+# The door's daily cap counts a rolling day, not a calendar one: a cap that
+# reset at midnight would let one burst straddle it and count twice over.
+_CAP_WINDOW = timedelta(hours=24)
+
+
 def receive_ticket_email(
     conn: psycopg.Connection,
     *,
     user_id: UUID | None,
+    account_email: str | None,
     message_id: str,
     sender: str,
     recipient: str,
     subject: str,
     body: str,
+    spf_pass: bool | None = None,
+    dkim_pass: bool | None = None,
+    daily_cap: int = 50,
 ) -> InboundEmailRow | None:
-    """Store one forwarded email for the intake sweep to read.
+    """Store one forwarded email: for the intake sweep to read, or as
+    refused at the door, with the reason.
 
     Returns None when this message_id was stored before (a webhook retry).
     `user_id` None means the recipient address belongs to nobody — most
     often an erased account whose forwarding rule is still running. The row
     records only that mail arrived for the code, and when: sender, subject
     and body are all dropped, because there is no owner left to erase them.
+
+    An email the door refuses (intake.screen: a failed provider check, or
+    the daily cap) is stored under its user without its body — the sender
+    and subject stay, so they can see what was dropped and why — and never
+    reaches the reader.
+
+    Gmail's forwarding-setup message is recognised and filed as
+    'confirmation' with its code in the reason, never handed to the reader:
+    it is how the user switches automatic forwarding on, so it has to reach
+    them rather than be answered "not a ticket".
     """
+    now = datetime.now(UTC)
     if user_id is None:
         return _repository.insert_inbound_email(
             conn,
@@ -348,22 +371,50 @@ def receive_ticket_email(
             recipient=recipient,
             subject="",
             body="",
+            spf_pass=spf_pass,
+            dkim_pass=dkim_pass,
+            forwarding=None,
             status="rejected",
             status_reason="unknown recipient",
-            processed_at=datetime.now(UTC),
+            processed_at=now,
         )
-    return _repository.insert_inbound_email(
+    if account_email is None:
+        raise ValueError("account_email is required when user_id is given")
+    verdict = _intake.screen(
+        sender=sender,
+        account_email=account_email,
+        spf_pass=spf_pass,
+        dkim_pass=dkim_pass,
+        recent_count=_repository.count_received_since(conn, user_id, now - _CAP_WINDOW),
+        daily_cap=daily_cap,
+    )
+    store = functools.partial(
+        _repository.insert_inbound_email,
         conn,
         user_id=user_id,
         message_id=message_id,
         sender=sender,
         recipient=recipient,
         subject=subject,
-        body=body,
-        status="received",
-        status_reason=None,
-        processed_at=None,
+        spf_pass=spf_pass,
+        dkim_pass=dkim_pass,
+        forwarding=verdict.forwarding,
     )
+    if verdict.refused is not None:
+        return store(body="", status="rejected", status_reason=verdict.refused, processed_at=now)
+    setup = _intake.forwarding_confirmation(sender=sender, subject=subject, body=body)
+    if setup is not None:
+        asked = setup.requested_by or "an account"
+        return store(
+            body=body,
+            status="confirmation",
+            status_reason=(
+                f"{asked} asked to forward mail here. "
+                f"Enter code {setup.code} in Gmail to switch it on."
+            ),
+            processed_at=now,
+        )
+    return store(body=body, status="received", status_reason=None, processed_at=None)
 
 
 def list_inbound_emails(
@@ -488,7 +539,9 @@ def _process_email(
         raise RuntimeError(f"queued inbound email {email.id} has no user")
 
     ticket = extractor.extract(
-        subject=email.subject, body=email.body, received_at=email.received_at
+        subject=email.subject,
+        body=_intake.text_for_reading(email.body),
+        received_at=email.received_at,
     )
     extraction = ticket.model_dump()
     verdict = _intake.judge(ticket, today=datetime.now(UTC).date())
@@ -567,6 +620,31 @@ def _process_email(
         )
         return "needs_review" if decided else "lost_race"
     return "parsed"
+
+
+# --- Retention --------------------------------------------------------------
+
+
+def run_retention_sweep(
+    conn: psycopg.Connection, *, keep_days: int, batch_size: int = 500, commit_each: bool = False
+) -> int:
+    """Blank the raw bodies of emails decided more than `keep_days` ago;
+    returns how many. A body is kept only as long as a bad read might need
+    re-running — the claim window plus a buffer — because it is the most
+    personal thing the system holds. The sender, subject, status and the
+    reader's structured answer stay, so the user can still see what became
+    of what they forwarded. Batched, so a first run over a long backlog
+    never holds one long transaction."""
+    before = datetime.now(UTC) - timedelta(days=keep_days)
+    purged = 0
+    while True:
+        with conn.transaction():
+            batch = _repository.purge_old_bodies(conn, before, batch_size)
+        purged += batch
+        if commit_each:
+            conn.commit()
+        if batch < batch_size:
+            return purged
 
 
 # --- Erasure ----------------------------------------------------------------

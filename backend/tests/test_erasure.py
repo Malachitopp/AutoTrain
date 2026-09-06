@@ -83,6 +83,7 @@ def _one_of_everything(conn: psycopg.Connection) -> tuple[UUID, str]:
     journeys.receive_ticket_email(
         conn,
         user_id=user_id,
+        account_email=EMAIL,
         message_id="<leaving@retailer.test>",
         sender=EMAIL,
         recipient=address,

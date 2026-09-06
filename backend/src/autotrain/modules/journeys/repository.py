@@ -83,11 +83,12 @@ _LEG_EXISTS = (
 # stored returns no row, and the caller reads "no row" as "seen before".
 _INSERT_INBOUND_EMAIL = (
     "INSERT INTO inbound_emails (user_id, message_id, sender, recipient, subject, body, "
-    "status, status_reason, processed_at) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+    "spf_pass, dkim_pass, forwarding, status, status_reason, processed_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
     "ON CONFLICT (message_id) DO NOTHING "
     "RETURNING id, user_id, message_id, sender, recipient, subject, body, received_at, "
-    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at"
+    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at, "
+    "spf_pass, dkim_pass, body_purged_at, forwarding"
 )
 
 # The intake sweep's page: oldest unread first (inbound_emails_queue_idx).
@@ -98,14 +99,16 @@ _INSERT_INBOUND_EMAIL = (
 # received_at ties so a page order is stable.
 _LIST_RECEIVED_EMAILS = (
     "SELECT id, user_id, message_id, sender, recipient, subject, body, received_at, "
-    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at "
+    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at, "
+    "spf_pass, dkim_pass, body_purged_at, forwarding "
     "FROM inbound_emails WHERE status = 'received' AND NOT (id = ANY(%s::uuid[])) "
     "ORDER BY received_at, id LIMIT %s"
 )
 
 _LIST_INBOUND_FOR_USER = (
     "SELECT id, user_id, message_id, sender, recipient, subject, body, received_at, "
-    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at "
+    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at, "
+    "spf_pass, dkim_pass, body_purged_at, forwarding "
     "FROM inbound_emails WHERE user_id = %s ORDER BY received_at DESC, id LIMIT %s"
 )
 
@@ -125,6 +128,21 @@ _MARK_PROCESSED = (
 _MARK_FAILED_IF_EXHAUSTED = (
     "UPDATE inbound_emails SET status = 'failed', status_reason = %s, processed_at = now() "
     "WHERE id = %s AND status = 'received' AND attempts >= %s"
+)
+
+# The door's per-user count (intake.screen's daily cap): rows stored for the
+# user since an instant, whatever became of them, on inbound_emails_user_idx.
+_COUNT_RECEIVED_SINCE = (
+    "SELECT count(*) FROM inbound_emails WHERE user_id = %s AND received_at >= %s"
+)
+
+# Retention (0015): blank the bodies of emails decided before an instant, a
+# batch at a time on inbound_emails_retention_idx. Nothing else on the row
+# changes; the structured reading stays.
+_PURGE_OLD_BODIES = (
+    "UPDATE inbound_emails SET body = '', body_purged_at = now() "
+    "WHERE id IN (SELECT id FROM inbound_emails "
+    "WHERE processed_at < %s AND body_purged_at IS NULL ORDER BY processed_at LIMIT %s)"
 )
 
 # --- Erasure (GDPR) ---------------------------------------------------------
@@ -335,6 +353,9 @@ def insert_inbound_email(
     recipient: str,
     subject: str,
     body: str,
+    spf_pass: bool | None,
+    dkim_pass: bool | None,
+    forwarding: str | None,
     status: str,
     status_reason: str | None,
     processed_at: datetime | None,
@@ -350,6 +371,9 @@ def insert_inbound_email(
             recipient,
             subject,
             body,
+            spf_pass,
+            dkim_pass,
+            forwarding,
             status,
             status_reason,
             processed_at,
@@ -395,6 +419,15 @@ def mark_failed_if_exhausted(
 ) -> bool:
     """True if the row has now used up its attempts and was marked failed."""
     return db.execute(conn, _MARK_FAILED_IF_EXHAUSTED, (reason, email_id, max_attempts)) == 1
+
+
+def count_received_since(conn: psycopg.Connection, user_id: UUID, since: datetime) -> int:
+    return db.fetch_value(conn, _COUNT_RECEIVED_SINCE, (user_id, since))
+
+
+def purge_old_bodies(conn: psycopg.Connection, before: datetime, limit: int) -> int:
+    """How many bodies this call blanked."""
+    return db.execute(conn, _PURGE_OLD_BODIES, (before, limit))
 
 
 # --- Erasure ----------------------------------------------------------------
