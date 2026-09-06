@@ -17,7 +17,7 @@ import { useHydrated } from "@/lib/use-hydrated";
 
 export function SignInLink({ className }: { className?: string }) {
   const hydrated = useHydrated();
-  const signedIn = hydrated && session.token() !== null;
+  const signedIn = hydrated && session.hasSession();
   return signedIn ? (
     <Link href="/journeys" className={className}>
       Your journeys

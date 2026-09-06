@@ -1,59 +1,49 @@
 /**
- * The session's lifecycle in the browser: it begins with a login link and
- * then lives in storage.
+ * Whether this browser has a session, as far as a page can know.
  *
- * The API issues a bearer JWT (POST /auth/login/verify) and expects it back on
- * every request as `Authorization: Bearer <jwt>`. This module is the only
- * place that knows the token is kept in localStorage: the api module asks for
- * it, the login page stores it, the sign-out button clears it, and nothing
- * else touches storage. Swapping the storage later means editing one file.
+ * The session itself is an httpOnly cookie the API sets on login
+ * (POST /auth/login/verify) and the browser sends by itself on every request
+ * (api.ts asks for it with credentials: "include"). Page scripts cannot read
+ * that cookie — that is the point: a script injected through an XSS hole
+ * cannot lift the session either, which it could when the token sat in
+ * localStorage.
  *
- * localStorage is readable by any script running on the page, so an XSS hole
- * would leak sessions. The production hardening is to keep the token in an
- * httpOnly cookie set by a Next.js route handler; the three functions below
- * stay the same, only their bodies change.
+ * So this module keeps only a HINT: "signed in on this browser", used to
+ * choose between "Sign in" and "Your journeys" on the front door before the
+ * API has been asked. The hint is never trusted for anything that matters.
+ * The gate (use-user.ts) asks GET /auth/me, and the API alone decides; a
+ * wrong hint costs one extra request, never a wrong page.
  */
 
-const KEY = "autotrain.session";
+const KEY = "autotrain.signed_in";
 
-/** The stored session token, or null when signed out (or when rendering on
- * the server, where there is no browser storage). Never throws: a browser
- * that blocks storage reads as signed out. */
-export function token(): string | null {
-  if (typeof window === "undefined") return null;
+/** The hint. False on the server (no storage there) and in a browser that
+ * blocks storage: both simply mean "ask the API". Never throws. */
+export function hasSession(): boolean {
+  if (typeof window === "undefined") return false;
   try {
-    return window.localStorage.getItem(KEY);
+    return window.localStorage.getItem(KEY) === "1";
   } catch {
-    return null;
+    return false;
   }
 }
 
-/** Thrown by store() when the browser refuses to keep anything: site data
- * blocked, private mode in some browsers, storage full. The message is
- * written for the person, not the developer. */
-export class StorageUnavailable extends Error {
-  constructor() {
-    super(
-      "Your browser is blocking storage for this site, so you cannot stay signed in. " +
-        "Allow site data for AutoTrain and request a new link.",
-    );
-    this.name = "StorageUnavailable";
-  }
-}
-
-export function store(jwt: string): void {
+/** Set after a confirmed sign-in. A browser that refuses storage loses only
+ * the hint: the cookie is the session, and the next gated visit asks. */
+export function remember(): void {
   try {
-    window.localStorage.setItem(KEY, jwt);
+    window.localStorage.setItem(KEY, "1");
   } catch {
-    throw new StorageUnavailable();
+    // Nothing to keep; see above.
   }
 }
 
-export function clear(): void {
+/** Cleared on sign-out and whenever the API answers 401. */
+export function forget(): void {
   try {
     window.localStorage.removeItem(KEY);
   } catch {
-    // Nothing was ever stored in a browser that blocks storage.
+    // Nothing was stored in a browser that blocks storage.
   }
 }
 

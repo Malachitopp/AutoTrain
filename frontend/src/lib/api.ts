@@ -13,8 +13,6 @@
  * money is integer pence; ids are UUID strings.
  */
 
-import * as session from "@/lib/session";
-
 // --- Wire shapes ---------------------------------------------------------
 
 /** GET /auth/me. claim_consent_at is null until the user grants auto-filing
@@ -140,13 +138,15 @@ async function request<T>(method: "GET" | "POST", path: string, body?: unknown):
     throw new Error("NEXT_PUBLIC_API_URL is not set — copy frontend/.env.example to .env.local");
   }
   const headers: Record<string, string> = {};
-  const jwt = session.token();
-  if (jwt !== null) headers["Authorization"] = `Bearer ${jwt}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
 
+  // The session is an httpOnly cookie the API set on login; the browser
+  // attaches it when asked to include credentials. Nothing here ever sees
+  // the token, which is the point (see session.ts).
   const response = await fetch(`${BASE_URL}${path}`, {
     method,
     headers,
+    credentials: "include",
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) throw new ApiError(response.status, await detailOf(response));
@@ -192,11 +192,17 @@ export const auth = {
    * either way). The link arrives by email; nothing comes back here. */
   requestLogin: (email: string) => request<void>("POST", "/auth/login/request", { email }),
   /** Exchange the token from the emailed link for a session. 401 for a
-   * token that is unknown, expired, or already used. */
+   * token that is unknown, expired, or already used. The API sets the
+   * session cookie on this response; the token in the body is for clients
+   * that cannot hold cookies, and the web app ignores it. */
   verifyLogin: (token: string) => request<Session>("POST", "/auth/login/verify", { token }),
-  /** Who the stored session belongs to. 401 once it expires or the account
-   * is erased. */
+  /** Who the session cookie belongs to. 401 when there is none, once it
+   * expires, after a sign-out everywhere, or once the account is erased. */
   me: () => request<User>("GET", "/auth/me"),
+  /** Drop this browser's session cookie. Always 204. */
+  logout: () => request<void>("POST", "/auth/logout"),
+  /** Sign out everywhere: every session on every device, this one included. */
+  revokeSessions: () => request<void>("POST", "/auth/sessions/revoke"),
 };
 
 export const journeys = {

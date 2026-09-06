@@ -8,8 +8,9 @@
  *    or not the address has an account, and so does this screen.
  * 2. A visit from the emailed link carries #token=... in the address bar.
  *    The screen shows a Continue button; pressing it exchanges the token for
- *    a session (POST /auth/login/verify), stores it, and lands on the
- *    journeys page. A dead link falls back to the form with an explanation.
+ *    a session (POST /auth/login/verify) — the API sets it as an httpOnly
+ *    cookie — and lands on the journeys page. A dead link falls back to the
+ *    form with an explanation.
  *
  * The exchange waits for a click on purpose. Email security scanners open
  * links, and an attacker can send someone a link for the attacker's own
@@ -52,8 +53,8 @@ export function Login() {
   async function finishSignIn(token: string) {
     setPhase({ kind: "verifying" });
     try {
-      const { access_token } = await auth.verifyLogin(token);
-      session.store(access_token);
+      await auth.verifyLogin(token);
+      session.remember();
       scrubLink();
       router.replace("/journeys");
     } catch (error: unknown) {
@@ -64,10 +65,6 @@ export function Login() {
           kind: "form",
           error: "That link has expired or was already used. Request a new one.",
         });
-      } else if (error instanceof session.StorageUnavailable) {
-        // The token was spent but the session cannot be kept.
-        scrubLink();
-        setPhase({ kind: "form", error: error.message });
       } else {
         // The API never judged the token (unreachable, or failing), so the
         // link is still good. It stays in the address bar and Continue
@@ -103,7 +100,7 @@ export function Login() {
         <p className="mt-3 leading-relaxed text-muted">
           You followed a sign-in link. Press continue to open your account on this browser.
         </p>
-        {session.token() !== null && (
+        {session.hasSession() && (
           <p className="mt-2 text-sm text-muted">
             This browser is already signed in. Continuing switches it to the account the link
             belongs to.

@@ -9,7 +9,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, auth, claims, journeys } from "@/lib/api";
-import * as session from "@/lib/session";
 
 type Recorded = { url: string; init: RequestInit };
 
@@ -46,16 +45,10 @@ describe("request shape", () => {
     expect(calls[0].init.body).toBe(JSON.stringify({ email: "rider@example.com" }));
   });
 
-  it("sends the stored session as a bearer token", async () => {
-    session.store("the-jwt");
+  it("asks the browser to send the session cookie and never sets a token header", async () => {
     const calls = fakeFetch(200, { items: [], count: 0, limit: 50 });
     await journeys.list();
-    expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer the-jwt" });
-  });
-
-  it("sends no Authorization header when signed out", async () => {
-    const calls = fakeFetch(204);
-    await auth.requestLogin("rider@example.com");
+    expect(calls[0].init.credentials).toBe("include");
     expect(calls[0].init.headers).not.toHaveProperty("Authorization");
   });
 

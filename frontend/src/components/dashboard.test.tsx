@@ -92,7 +92,6 @@ function renderPage() {
 
 beforeEach(() => {
   window.localStorage.clear();
-  session.store("a-live-jwt");
   replace.mockReset();
 });
 
@@ -197,11 +196,14 @@ describe("Dashboard", () => {
     expect(screen.getByRole("button", { name: "Try again" })).toBeDefined();
   });
 
-  it("sign out forgets the token and goes to the front door", async () => {
-    page({ recovered_pence: 0, pending_pence: 0 }, [], []);
+  it("sign out asks the API to drop the cookie, forgets the hint, and goes to the front door", async () => {
+    const api = page({ recovered_pence: 0, pending_pence: 0 }, [], []);
     renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: "Sign out" }));
-    expect(session.token()).toBeNull();
-    expect(replace).toHaveBeenCalledWith("/");
+    await screen.findByText("No journeys yet");
+    expect(session.hasSession()).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("/"));
+    expect(api.calls).toContain("POST /auth/logout");
+    expect(session.hasSession()).toBe(false);
   });
 });

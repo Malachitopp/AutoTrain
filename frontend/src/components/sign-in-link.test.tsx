@@ -30,7 +30,7 @@ describe("SignInLink", () => {
   });
 
   it("takes a returning user straight to the app", () => {
-    session.store("a-live-jwt");
+    session.remember();
     render(<SignInLink />);
     const link = screen.getByRole("link", { name: "Your journeys" });
     expect(link.getAttribute("href")).toBe("/journeys");
