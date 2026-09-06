@@ -18,6 +18,7 @@ import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 
 import { AppHeader } from "@/components/app-header";
+import { SupportedOperators } from "@/components/supported-operators";
 import { describeError, journeys, type JourneyKind } from "@/lib/api";
 import { londonToIso, nextDay } from "@/lib/time";
 
@@ -70,6 +71,9 @@ export function JourneyForm() {
           The details from your ticket. Station codes are the three letters printed on it, like
           EUS or MAN.
         </p>
+        <div className="mt-3">
+          <SupportedOperators compact />
+        </div>
 
         <form onSubmit={submit} className="mt-6 flex flex-col gap-4">
           <div className="grid grid-cols-2 gap-3">

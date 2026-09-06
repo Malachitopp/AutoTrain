@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import { Brand } from "@/components/brand";
 import { SignInLink } from "@/components/sign-in-link";
+import { SupportedOperators } from "@/components/supported-operators";
 
 // The front door. Public, static, and short: what AutoTrain does in one
 // line, how it works in three, and one button. Everything behind the button
@@ -12,9 +13,11 @@ import { SignInLink } from "@/components/sign-in-link";
 // on the browser (which button to show) is the SignInLink client component.
 //
 // Every sentence here describes what the backend does today (deep-link
-// filing, per-operator thresholds, no money handling). When server-side
-// filing lands (claims adapters v2), the third step and the first chip are
-// the lines to update.
+// filing, no money handling). When server-side filing lands (claims adapters
+// v2), the third step and the first chip are the lines to update.
+//
+// The one live part is the operator list: it comes from GET /operators, so
+// the page can never promise an operator the backend cannot file with.
 
 const CTA =
   "rounded-control bg-cta px-6 py-3 font-semibold text-white shadow-soft transition-colors hover:bg-pink-700";
@@ -52,17 +55,21 @@ export default function LandingPage() {
 
         <section id="how" className="mt-20 grid gap-4 sm:grid-cols-3">
           <Step n="1" title="Add a journey">
-            Where from, where to, the date, the operator and the ticket price. Once.
+            Where from, where to, the date, the times and the ticket price. Once.
           </Step>
           <Step n="2" title="We watch the train">
-            Actual arrival times from National Rail, checked after every journey you add. Most
-            operators pay from 15 minutes late; a few, such as LNER and ScotRail, from 30.
+            Actual arrival times from National Rail, checked after every journey you add. Late
+            enough for your operator&apos;s scheme, and a claim opens.
           </Step>
           <Step n="3" title="Your claim is ready">
             We open it with the amount and the deadline. Tap File and we take you to your
             operator&apos;s Delay Repay page to send it. Sending it for you is coming, with your
             permission.
           </Step>
+        </section>
+
+        <section className="mt-10">
+          <SupportedOperators />
         </section>
 
         <section className="mt-10 grid gap-4 sm:grid-cols-3">
@@ -79,7 +86,7 @@ export default function LandingPage() {
         </section>
 
         <p className="mt-16 text-center text-sm text-muted">
-          Most UK train operators run a Delay Repay scheme. Most passengers never claim.
+          Most passengers who are owed Delay Repay never claim it.
         </p>
       </main>
     </>

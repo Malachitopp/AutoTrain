@@ -12,6 +12,10 @@
  * only a draft or needs_user claim whose deadline has not passed can be
  * filed by the user. `ready` means the system is about to file it, and a
  * claim past file_by is refused, so neither gets the button.
+ *
+ * An operator AutoTrain cannot file with is named as the reason there is no
+ * claim: the backend opens none for such journeys (the claims sweep skips
+ * them), and "No claim" would read as "you were owed nothing".
  */
 
 import type { Claim, Journey } from "@/lib/api";
@@ -33,13 +37,18 @@ export type JourneyView = {
 export function describeJourney(journey: Journey, claim: Claim | undefined, now: Date): JourneyView {
   if (claim !== undefined) return describeClaim(claim, now);
 
+  if (journey.operator_supported === false) {
+    // Known as soon as the train is matched, before it has even run: no
+    // claim will ever be opened for this journey, whatever the delay.
+    return view(`${journey.operator_name ?? "This operator"} isn't supported yet`, "muted");
+  }
+
   switch (journey.status) {
     case "assessed":
       // Assessed with no claim. Usually on time or under the operator's
       // threshold — but also, for up to one scheduler interval, a delay
-      // whose claim has not been opened yet, and permanently a delay on an
-      // operator the backend has no scheme for. "No claim" is true in every
-      // case; anything stronger is a guess.
+      // whose claim has not been opened yet. "No claim" is true in both
+      // cases; anything stronger is a guess.
       return view("No claim", "muted");
     case "unmatched":
       return view("Couldn't find this train", "bad");

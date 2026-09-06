@@ -22,6 +22,8 @@ const RIDER = {
   created_at: "2026-09-04T12:00:00Z",
 };
 
+const OPERATORS = [{ atoc_code: "NT", name: "Northern", min_delay_minutes: 15 }];
+
 type Recorded = { path: string; method: string; body: unknown };
 
 function fakeApi(createStatus: number, createBody: unknown): Recorded[] {
@@ -35,6 +37,9 @@ function fakeApi(createStatus: number, createBody: unknown): Recorded[] {
     });
     if (path === "/auth/me") {
       return new Response(JSON.stringify(RIDER), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (path === "/operators") {
+      return new Response(JSON.stringify(OPERATORS), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     return new Response(JSON.stringify(createBody), {
       status: createStatus,

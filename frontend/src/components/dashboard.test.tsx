@@ -37,6 +37,8 @@ const JOURNEY = {
   scheduled_arrival: "2026-09-04T09:22:00Z",
   status: "assessed",
   created_at: "2026-09-01T00:00:00Z",
+  operator_name: null,
+  operator_supported: null,
 };
 
 const CLAIM = {
