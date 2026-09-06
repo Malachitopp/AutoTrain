@@ -20,6 +20,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 import psycopg
@@ -46,6 +47,7 @@ from autotrain.modules.journeys.models import (
     AssessableJourney,
     ClaimContext,
     InboundEmailRow,
+    InboundEmailSummary,
     JourneyRow,
     NotificationContext,
 )
@@ -58,6 +60,7 @@ __all__ = [
     "ExtractedLeg",
     "ExtractedTicket",
     "InboundEmailRow",
+    "InboundEmailSummary",
     "IntakeStats",
     "InvalidJourney",
     "JourneyRow",
@@ -385,7 +388,7 @@ def receive_ticket_email(
         account_email=account_email,
         spf_pass=spf_pass,
         dkim_pass=dkim_pass,
-        recent_count=_repository.count_received_since(conn, user_id, now - _CAP_WINDOW),
+        recent_count=_repository.count_received_since(conn, user_id, now - _CAP_WINDOW, daily_cap),
         daily_cap=daily_cap,
     )
     store = functools.partial(
@@ -419,7 +422,7 @@ def receive_ticket_email(
 
 def list_inbound_emails(
     conn: psycopg.Connection, user_id: UUID, *, limit: int = 50
-) -> list[InboundEmailRow]:
+) -> list[InboundEmailSummary]:
     """What became of the emails this user forwarded, newest first."""
     return _repository.list_inbound_for_user(conn, user_id, limit)
 
@@ -429,6 +432,7 @@ def run_intake_sweep(
     extractor: TicketExtractor,
     *,
     batch_size: int = 20,
+    max_emails: int | None = None,
     commit_each: bool = False,
 ) -> IntakeStats:
     """Read every queued email and act on what the reader says.
@@ -448,17 +452,24 @@ def run_intake_sweep(
     * A row that already used its attempts but is still 'received' (the
       process died on its last read) is retired here without a read.
 
-    Pages are small: one email is one model call.
+    Pages are small: one email is one model call. `max_emails` bounds the
+    whole PASS, not the page: without it a first run over a long backlog
+    would keep paging until the queue drained, which at seconds of model
+    call per email can outlast the scheduler's interval by hours. The queue
+    is durable and every status move is guarded, so stopping early costs
+    nothing — the next interval picks up where this one stopped.
     """
     stats = IntakeStats()
     skipped: set[UUID] = set()
-    while True:
+    while max_emails is None or stats.examined < max_emails:
         page = _repository.list_received_emails(conn, batch_size, excluding=list(skipped))
         if not page:
             break
 
         progressed = 0
         for email in page:
+            if max_emails is not None and stats.examined >= max_emails:
+                break
             stats.examined += 1
             if email.attempts >= MAX_INTAKE_ATTEMPTS:
                 with conn.transaction():
@@ -481,10 +492,18 @@ def run_intake_sweep(
                 stats.lost_race += 1
                 progressed += 1
                 continue
+            if commit_each:
+                # Before the reader, not after: extract() is a network call
+                # of seconds, and everything up to here is finished work.
+                # Committing now means no transaction is held open across
+                # it — no snapshot pinned, no row locked, nothing for an
+                # idle-in-transaction timeout to kill.
+                conn.commit()
 
             try:
+                reading = _read_email(email, extractor)
                 with conn.transaction():
-                    status = _process_email(conn, email, extractor)
+                    status = _apply_reading(conn, email, reading)
                 setattr(stats, status, getattr(stats, status) + 1)
                 progressed += 1
             except Exception as exc:
@@ -521,11 +540,40 @@ def run_intake_sweep(
     return stats
 
 
-def _process_email(
-    conn: psycopg.Connection, email: InboundEmailRow, extractor: TicketExtractor
-) -> str:
-    """Read one email and act on the reading. Returns the status it ends in —
-    one of IntakeStats's counters.
+@dataclass
+class _Reading:
+    """What the reader said about one email, and what the checks made of it.
+    Held apart from the writing so the model call happens with no database
+    transaction open."""
+
+    user_id: UUID
+    extraction: dict[str, Any]
+    verdict: _intake.Verdict
+
+
+def _read_email(email: InboundEmailRow, extractor: TicketExtractor) -> _Reading:
+    """The slow half: hand the email to the reader and judge the answer.
+    Touches no database, so the caller can hold no transaction while it
+    runs."""
+    if email.user_id is None:
+        # Unreachable: rows without a user are stored already decided, so the
+        # queue never holds one. Said out loud rather than trusted.
+        raise RuntimeError(f"queued inbound email {email.id} has no user")
+    ticket = extractor.extract(
+        subject=email.subject,
+        body=_intake.text_for_reading(email.body),
+        received_at=email.received_at,
+    )
+    return _Reading(
+        user_id=email.user_id,
+        extraction=ticket.model_dump(),
+        verdict=_intake.judge(ticket, today=datetime.now(UTC).date()),
+    )
+
+
+def _apply_reading(conn: psycopg.Connection, email: InboundEmailRow, reading: _Reading) -> str:
+    """The writing half: act on a reading. Returns the status the email ends
+    in — one of IntakeStats's counters.
 
     Every status write is guarded on the row still being 'received'
     (repository._MARK_PROCESSED), and the write that creates journeys shares
@@ -533,18 +581,8 @@ def _process_email(
     else meanwhile, the journeys roll back with the savepoint and the answer
     is 'lost_race', never a ticket beside a verdict that disowns it.
     """
-    if email.user_id is None:
-        # Unreachable: rows without a user are stored already decided, so the
-        # queue never holds one. Said out loud rather than trusted.
-        raise RuntimeError(f"queued inbound email {email.id} has no user")
-
-    ticket = extractor.extract(
-        subject=email.subject,
-        body=_intake.text_for_reading(email.body),
-        received_at=email.received_at,
-    )
-    extraction = ticket.model_dump()
-    verdict = _intake.judge(ticket, today=datetime.now(UTC).date())
+    extraction = reading.extraction
+    verdict = reading.verdict
     if verdict.plan is None:
         decided = _repository.mark_processed(
             conn, email.id, status=verdict.status, reason=verdict.reason, extraction=extraction
@@ -560,7 +598,7 @@ def _process_email(
         for leg in plan.legs
         if not _repository.leg_exists(
             conn,
-            email.user_id,
+            reading.user_id,
             leg.travel_date,
             leg.origin_crs,
             leg.destination_crs,
@@ -582,7 +620,7 @@ def _process_email(
         with conn.transaction():
             journeys = _insert_ticket_and_journeys(
                 conn,
-                email.user_id,
+                reading.user_id,
                 kind=plan.kind,
                 price_pence=plan.price_pence,
                 source="email",
@@ -628,23 +666,39 @@ def _process_email(
 def run_retention_sweep(
     conn: psycopg.Connection, *, keep_days: int, batch_size: int = 500, commit_each: bool = False
 ) -> int:
-    """Blank the raw bodies of emails decided more than `keep_days` ago;
+    """Blank the raw bodies of forwarded emails older than `keep_days`;
     returns how many. A body is kept only as long as a bad read might need
     re-running — the claim window plus a buffer — because it is the most
     personal thing the system holds. The sender, subject, status and the
     reader's structured answer stay, so the user can still see what became
     of what they forwarded. Batched, so a first run over a long backlog
-    never holds one long transaction."""
+    never holds one long transaction.
+
+    Two passes, because there are two ways a body gets old. The first is an
+    email that was read and decided. The second is one that was never read
+    at all: with no extractor configured, or one that stayed broken, rows
+    keep status 'received' for ever, and a sweep that only looked at decided
+    rows would hold their bodies indefinitely — the exact promise this job
+    exists to keep. Past the window there is nothing left worth reading
+    anyway, the claim window having closed weeks earlier, so those rows are
+    retired and blanked together.
+    """
     before = datetime.now(UTC) - timedelta(days=keep_days)
-    purged = 0
-    while True:
-        with conn.transaction():
-            batch = _repository.purge_old_bodies(conn, before, batch_size)
-        purged += batch
-        if commit_each:
-            conn.commit()
-        if batch < batch_size:
-            return purged
+    stale = f"never read within {keep_days} days; the claim window had already closed"
+    done = 0
+    for purge in (
+        lambda: _repository.retire_stale_received(conn, before, batch_size, reason=stale),
+        lambda: _repository.purge_old_bodies(conn, before, batch_size),
+    ):
+        while True:
+            with conn.transaction():
+                batch = purge()
+            done += batch
+            if commit_each:
+                conn.commit()
+            if batch < batch_size:
+                break
+    return done
 
 
 # --- Erasure ----------------------------------------------------------------

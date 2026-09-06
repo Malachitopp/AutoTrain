@@ -210,7 +210,10 @@ def judge(ticket: ExtractedTicket, *, today: date) -> Verdict:
             return Verdict("needs_review", f"leg {index}: {exc}")
         for earlier, other in enumerate(legs, start=1):
             if _same_train(spec, other):
-                return Verdict("needs_review", f"leg {index} repeats leg {earlier}")
+                return Verdict(
+                    "needs_review",
+                    f"leg {index} repeats leg {earlier}: same route on the same day",
+                )
         legs.append(spec)
 
     plan = TicketPlan(
@@ -220,11 +223,22 @@ def judge(ticket: ExtractedTicket, *, today: date) -> Verdict:
 
 
 def _same_train(a: LegSpec, b: LegSpec) -> bool:
-    return (a.travel_date, a.origin_crs, a.destination_crs, a.scheduled_departure) == (
+    """Whether two legs on one ticket collide.
+
+    Deliberately NOT comparing departure times, even though two departures
+    on one route in one day are different trains. The database's own rule
+    for one ticket is journeys_ticket_leg_key, UNIQUE (ticket_id,
+    travel_date, origin_crs, destination_crs) — no time in it. A judge that
+    allowed what the constraint forbids would pass the plan, hit the unique
+    index on the insert, and file the email as a duplicate of journeys that
+    do not exist, losing both legs. So this matches the constraint, and a
+    reader answer that really does describe two same-day trains on one
+    route goes to a person instead.
+    """
+    return (a.travel_date, a.origin_crs, a.destination_crs) == (
         b.travel_date,
         b.origin_crs,
         b.destination_crs,
-        b.scheduled_departure,
     )
 
 
@@ -326,7 +340,18 @@ AUTOMATIC = "automatic"
 _GOOGLE_SENDERS = frozenset({"forwarding-noreply@google.com", "mail-noreply@google.com"})
 _CONFIRMATION_SUBJECT = re.compile(r"forwarding confirmation", re.IGNORECASE)
 _CONFIRMATION_CODE = re.compile(r"\(\s*#\s*(\d{4,12})\s*\)")
-_ADDRESS = r"[^\s<>@]+@[^\s<>@]+"
+# Both halves are BOUNDED, and that is not cosmetic. Written as
+# [^\s<>@]+@[^\s<>@]+ this pattern is quadratic: on a body with no '@' the
+# engine matches a long run from every starting position in turn, so a
+# 500,000-character body — the schema's limit — takes minutes of CPU on one
+# thread, holding a pooled connection. The lengths below are RFC 5321's
+# limits for a local part and a domain, so nothing real is lost, and they
+# make the scan linear. They also cap what can end up in status_reason,
+# which is stored and shown in the browser.
+_ADDRESS = r"[^\s<>@]{1,64}@[^\s<>@]{1,255}"
+# A confirmation message is short. Searching the head of the body is a
+# second bound, independent of the patterns.
+_CONFIRMATION_SEARCH_CHARS = 20_000
 _CONFIRMATION_REQUESTER = re.compile(
     rf"({_ADDRESS})\s+has requested to automatically forward mail", re.IGNORECASE
 )
@@ -400,10 +425,11 @@ def forwarding_confirmation(
         return None
     if not _CONFIRMATION_SUBJECT.search(subject):
         return None
-    code = _CONFIRMATION_CODE.search(subject) or _CONFIRMATION_CODE.search(body)
+    head = body[:_CONFIRMATION_SEARCH_CHARS]
+    code = _CONFIRMATION_CODE.search(subject) or _CONFIRMATION_CODE.search(head)
     if code is None:
         return None
-    asked = _CONFIRMATION_REQUESTER.search(body) or _CONFIRMATION_FROM_SUBJECT.search(subject)
+    asked = _CONFIRMATION_REQUESTER.search(head) or _CONFIRMATION_FROM_SUBJECT.search(subject)
     return ForwardingConfirmation(
         code=code.group(1), requested_by=asked.group(1).lower() if asked else None
     )
@@ -425,7 +451,12 @@ _TRUNCATED = "\n[cut here: the email was longer than the reader is given]"
 
 class _TextOnly(HTMLParser):
     """Collects the words of an HTML document: no tags, no scripts, no
-    styles; a line break wherever the markup breaks the flow."""
+    styles; a line break wherever the markup breaks the flow, and a space
+    wherever anything else was, so two values that touched in the markup do
+    not become one word. Real mail is full of
+    <span>Leeds</span><span>09:15</span>, and "Leeds09:15" is worse than a
+    stray space — times and prices are what the money is computed from.
+    """
 
     _SKIP = frozenset({"script", "style", "head", "title", "template"})
     _BREAK = frozenset(
@@ -460,24 +491,33 @@ class _TextOnly(HTMLParser):
     def __init__(self) -> None:
         super().__init__()  # convert_charrefs=True: &pound; arrives as £
         self.parts: list[str] = []
-        self._skipping = 0
+        # Counted per tag name, not one total: an unclosed <style> must not
+        # make a later </head> cancel it, and vice versa.
+        self._skipping: dict[str, int] = {}
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in self._SKIP:
-            self._skipping += 1
+        if tag == "body":
+            # Nothing legitimately skips across the start of the body. Mail
+            # with an unclosed tag in its head is common enough that without
+            # this the whole message would be swallowed.
+            self._skipping.clear()
+        elif tag in self._SKIP:
+            self._skipping[tag] = self._skipping.get(tag, 0) + 1
         elif tag in self._BREAK:
             self.parts.append("\n")
-        elif tag in self._CELL:
+        else:
             self.parts.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self._SKIP:
-            self._skipping = max(0, self._skipping - 1)
+            self._skipping[tag] = max(0, self._skipping.get(tag, 0) - 1)
         elif tag in self._BREAK:
             self.parts.append("\n")
+        else:
+            self.parts.append(" ")
 
     def handle_data(self, data: str) -> None:
-        if not self._skipping:
+        if not any(self._skipping.values()):
             self.parts.append(data)
 
     def text(self) -> str:
@@ -488,8 +528,19 @@ class _TextOnly(HTMLParser):
 def text_for_reading(body: str, *, limit: int = _MAX_READ_CHARS) -> str:
     """The body as the reader should see it: HTML reduced to its words, and
     no more than `limit` characters, with a marker where it was cut. Plain
-    text under the limit passes through untouched."""
-    text = _html_to_text(body) if _HTML_HINT.search(body[:5000]) else body
+    text under the limit passes through untouched.
+
+    If reducing the markup leaves nothing while the body plainly had
+    something in it, the raw body is sent instead. Mail is malformed more
+    often than anyone expects, and a reader given "" answers "not a ticket"
+    — a wrong answer, reported to the user as though it were about their
+    ticket. Markup the reader has to look past is the better failure.
+    """
+    text = body
+    if _HTML_HINT.search(body[:5000]):
+        reduced = _html_to_text(body)
+        if reduced.strip() or not body.strip():
+            text = reduced
     if len(text) > limit:
         text = text[:limit] + _TRUNCATED
     return text

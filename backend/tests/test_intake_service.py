@@ -207,7 +207,18 @@ def test_a_return_ticket_becomes_two_journeys_on_one_ticket(conn: psycopg.Connec
             "needs_review",
             "2 legs on a single ticket",
         ),
-        (ticket(kind="return", legs=[leg(), leg()]), "needs_review", "leg 2 repeats leg 1"),
+        # Two legs on one ticket sharing a route and a date, whatever the
+        # times: journeys_ticket_leg_key (0005) has no time in it, so a plan
+        # the judge waved through would collide on insert and be filed as a
+        # duplicate of journeys that do not exist.
+        (
+            ticket(
+                kind="return",
+                legs=[leg(), leg(departure_time="18:00", arrival_time="20:10")],
+            ),
+            "needs_review",
+            "same route on the same day",
+        ),
         (ticket(legs=[leg(arrival_time=None)]), "needs_review", "arrival time not found"),
         (ticket(legs=[leg(origin_crs="Manchester")]), "needs_review", "not a station code"),
         (ticket(legs=[leg(destination_crs="MAN")]), "needs_review", "same station"),
@@ -438,14 +449,19 @@ def test_both_forwarding_shapes_are_accepted_and_the_door_judges_only_what_it_ca
     # No verdict at all is not a failed verdict.
     assert receive(conn, user_id, "<u@r>", spf_pass=None, dkim_pass=None).status == "received"
 
-    # Five rows stored so far, refused ones included, so a cap of five
-    # refuses the next.
-    over = receive(conn, user_id, "<over@r>", daily_cap=5)
+    # Four got in and one was refused. The cap counts what it let through,
+    # never its own refusals: a refusal costs no reader call, and counting
+    # them would keep the window shut long after a flood had stopped.
+    over = receive(conn, user_id, "<over@r>", daily_cap=4)
     assert (over.status, over.status_reason, over.body) == (
         "rejected",
-        "daily limit of 5 emails reached",
+        "daily limit of 4 emails reached",
         "",
     )
+    # Two refused rows now, and neither counts, so a cap of five has room
+    # for exactly one more.
+    assert receive(conn, user_id, "<fifth@r>", daily_cap=5).status == "received"
+    assert receive(conn, user_id, "<sixth@r>", daily_cap=5).status == "rejected"
     # The cap is a rolling day: once yesterday's rows age out there is room.
     conn.execute(
         "UPDATE inbound_emails SET received_at = received_at - interval '25 hours' "
@@ -454,11 +470,15 @@ def test_both_forwarding_shapes_are_accepted_and_the_door_judges_only_what_it_ca
     )
     assert receive(conn, user_id, "<after@r>", daily_cap=5).status == "received"
 
-    # Everything the door let through reaches the reader, both shapes.
+    # Everything the door let through reaches the reader, both shapes — but
+    # a pass is bounded, so the rest of the queue waits for the next one
+    # rather than running a backlog past the scheduler's interval.
     reader = ScriptedExtractor(ticket())
-    stats = service.run_intake_sweep(conn, reader)
-    assert (stats.examined, stats.parsed, stats.duplicate) == (5, 1, 4)
-    assert len(reader.calls) == 5
+    first = service.run_intake_sweep(conn, reader, max_emails=2)
+    assert first.examined == 2
+    rest = service.run_intake_sweep(conn, reader)
+    assert (first.examined + rest.examined, first.parsed + rest.parsed) == (6, 1)
+    assert len(reader.calls) == 6
 
 
 def test_gmails_setup_message_reaches_the_user_and_never_the_reader(
@@ -528,6 +548,8 @@ def test_the_reader_is_given_the_words_of_an_html_email_and_no_more_than_the_lim
     service.run_intake_sweep(conn, reader)
 
     words, cut = (body for (_subject, body, _received) in reader.calls)
+    # Inline tags leave a space behind them: "MAN" and "EUS" were adjacent
+    # cells, and "MAN EUS" is right where "MANEUS" would not be.
     assert words == "Your e-ticket\nMAN EUS\n£45.50 paid"
     marker = "\n[cut here: the email was longer than the reader is given]"
     assert cut == "x" * 50_000 + marker
@@ -569,3 +591,47 @@ def test_bodies_are_blanked_after_the_retention_window(conn: psycopg.Connection)
     assert rows["<recent@r>"][:2] == (BODY, False)
     assert rows["<waiting@r>"][:2] == (BODY, False)
     assert service.run_retention_sweep(conn, keep_days=60) == 0
+
+    # An email nobody ever read — no extractor configured, or one that
+    # stayed broken — keeps status 'received' for ever, so it would never
+    # enter the retention index and its body would be held indefinitely.
+    # Past the window there is nothing worth reading anyway: the claim
+    # window closed weeks ago. It is retired and blanked together.
+    conn.execute(
+        "UPDATE inbound_emails SET received_at = now() - interval '61 days' WHERE message_id = %s",
+        ("<waiting@r>",),
+    )
+    assert service.run_retention_sweep(conn, keep_days=60) == 1
+    status, reason, _ = email_state(
+        conn, scalar(conn.execute("SELECT id FROM inbound_emails WHERE message_id = '<waiting@r>'"))
+    )
+    assert status == "failed"
+    assert reason is not None and "never read within 60 days" in reason
+    assert (
+        scalar(conn.execute("SELECT body FROM inbound_emails WHERE message_id = '<waiting@r>'"))
+        == ""
+    )
+
+
+def test_unreadable_markup_falls_back_to_the_raw_body(conn: psycopg.Connection) -> None:
+    """Mail is malformed more often than anyone expects. An unclosed tag in
+    the head used to swallow the whole message, and the reader given nothing
+    answers "not a ticket" — a wrong answer, shown to the user as though it
+    were about their ticket. Now the words survive; and if stripping really
+    does leave nothing, the reader gets the raw body instead."""
+    user_id = mk_user(conn)
+    receive(
+        conn,
+        user_id,
+        "<broken@r>",
+        body="<html><head><title>T</title><body><p>MAN to EUS 08:14</p></body></html>",
+    )
+    only_markup = receive(conn, user_id, "<empty@r>", body="<html><head><style>p{}</style></head>")
+    later(conn, only_markup)
+    reader = ScriptedExtractor(ticket())
+
+    service.run_intake_sweep(conn, reader)
+
+    survived, fallback = (body for (_subject, body, _received) in reader.calls)
+    assert survived == "MAN to EUS 08:14"
+    assert fallback == "<html><head><style>p{}</style></head>"

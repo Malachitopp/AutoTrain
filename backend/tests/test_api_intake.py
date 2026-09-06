@@ -106,6 +106,18 @@ class TestWebhook:
         dropped = _stored(conn, "<m4@retailer.test>")
         assert dropped is not None and dropped[1:3] == ("rejected", "")
 
+        # A NUL byte is legal in JSON and can decode out of a
+        # quoted-printable body, but no Postgres text column can hold one.
+        # Unstripped it makes the driver raise, so a route contracted to
+        # always answer 202 would 500 and the provider would retry for ever.
+        nul = _email(address, "<m5@retailer.test>")
+        nul["body"] = "Leeds to \x00 Kings Cross"
+        nul["subject"] = "Your\x00 e-ticket"
+        resp = client.post("/intake/email", json=nul, headers=SECRET_HEADER)
+        assert resp.status_code == 202, resp.text
+        kept = _stored(conn, "<m5@retailer.test>")
+        assert kept is not None and kept[2] == "Leeds to  Kings Cross"
+
     def test_an_unconfigured_secret_is_a_503_not_an_open_door(
         self, client: TestClient, monkeypatch: Any
     ) -> None:

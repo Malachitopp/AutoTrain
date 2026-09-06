@@ -111,6 +111,24 @@ class JourneyRow:
 
 
 @dataclass(frozen=True)
+class InboundEmailSummary:
+    """What the user's own list of forwarded emails needs, and nothing more.
+
+    Separate from InboundEmailRow because that shape carries `body`, which
+    the schema allows up to 500,000 characters. Selecting it for a page of
+    200 rows would have Postgres detoast and psycopg decode tens of
+    megabytes to render a few kilobytes of JSON, on a pooled connection.
+    """
+
+    id: UUID
+    received_at: datetime
+    sender: str
+    subject: str
+    status: str
+    status_reason: str | None
+
+
+@dataclass(frozen=True)
 class InboundEmailRow:
     """One row of `inbound_emails` (migration 0013): a forwarded ticket email
     and what became of it. `extraction` is the reader's answer as it was
