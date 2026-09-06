@@ -38,7 +38,13 @@ export function AppHeader() {
       <Link href="/journeys" aria-label="Your journeys">
         <Brand />
       </Link>
-      <span className="ml-auto truncate text-sm text-muted">{user.email}</span>
+      <Link
+        href="/settings"
+        className="ml-auto text-sm font-semibold text-muted transition-colors hover:text-ink"
+      >
+        Settings
+      </Link>
+      <span className="hidden truncate text-sm text-muted sm:inline">{user.email}</span>
       <button
         type="button"
         onClick={signOut}
