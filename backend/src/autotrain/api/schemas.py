@@ -233,6 +233,12 @@ class InboundEmailIn(BaseModel):
     recipient: str = Field(min_length=1, max_length=320)
     subject: str = Field(default="", max_length=2000)
     body: str = Field(default="", max_length=500_000)
+    # The provider's verdicts on the sender, when it gives them. None is
+    # "not checked"; an explicit False is refused at the door
+    # (journeys.intake.screen). The adapter that fills these in comes with
+    # the provider; the shape is fixed now so the contract does not move.
+    spf_pass: bool | None = None
+    dkim_pass: bool | None = None
 
 
 class IntakeReceipt(BaseModel):

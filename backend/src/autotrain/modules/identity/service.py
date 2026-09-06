@@ -43,7 +43,12 @@ from autotrain.modules.identity import repository as _repository
 
 # Re-exported: the shapes this service hands the worker and the api layer, so
 # callers stay off identity.models (the identity-privacy contract).
-from autotrain.modules.identity.models import PushTarget, SessionClaims, UserProfile
+from autotrain.modules.identity.models import (
+    ForwardingOwner,
+    PushTarget,
+    SessionClaims,
+    UserProfile,
+)
 from autotrain.modules.journeys import service as _journeys
 
 __all__ = [
@@ -199,9 +204,13 @@ def user_is_live(conn: psycopg.Connection, user_id: UUID) -> bool:
 # tickets-<code>@<domain>. Codes are lowercase hex; the match is
 # case-insensitive because mail systems may fold the local part either way.
 _FORWARDING_ADDRESS = re.compile(r"^tickets-([a-z0-9]{6,64})@", re.IGNORECASE)
-# 40 bits: unguessable by mail (the only way to use one), and the worst a
-# guess achieves is a journey added to someone else's list.
-_FORWARDING_CODE_BYTES = 5
+# 128 bits. Nothing in a forwarded email proves who forwarded it
+# (journeys.intake's note on the two shapes), so this code IS the
+# credential, and it is not a secret that stays hidden: it appears in the
+# headers of every message that touches it, in the user's own mail settings,
+# and in any header dump they paste into a support thread. Sized so guessing
+# is hopeless, and rotatable for when it leaks anyway.
+_FORWARDING_CODE_BYTES = 16
 
 
 def forwarding_code(conn: psycopg.Connection, user_id: UUID) -> str | None:
@@ -228,18 +237,35 @@ def forwarding_code(conn: psycopg.Connection, user_id: UUID) -> str | None:
     raise RuntimeError(f"could not mint a forwarding code for user {user_id}")
 
 
+def rotate_forwarding_code(conn: psycopg.Connection, user_id: UUID) -> str | None:
+    """A fresh code in place of the old one, for an address that has leaked
+    or is being spammed: from now on mail to the old address is nobody's
+    (the webhook stores it as 'unknown recipient', without a body). The
+    user updates their forwarding rule; nothing else changes. None for an
+    unknown or erased user. Same collision retry as minting."""
+    for _ in range(3):
+        code = secrets.token_hex(_FORWARDING_CODE_BYTES)
+        try:
+            with conn.transaction():
+                return code if _repository.rotate_forwarding_code(conn, user_id, code) else None
+        except pg_errors.UniqueViolation:
+            continue
+    raise RuntimeError(f"could not rotate the forwarding code for user {user_id}")
+
+
 def forwarding_address(code: str, domain: str) -> str:
     """The address the user forwards ticket emails to."""
     return f"tickets-{code}@{domain}"
 
 
-def user_by_forwarding_address(conn: psycopg.Connection, address: str) -> UUID | None:
-    """The user a forwarding address belongs to — None for any address that
-    is not one of ours, or whose code no live account holds."""
+def user_by_forwarding_address(conn: psycopg.Connection, address: str) -> ForwardingOwner | None:
+    """The account a forwarding address belongs to (id and email) — None for
+    any address that is not one of ours, or whose code no live account
+    holds."""
     match = _FORWARDING_ADDRESS.match(address.strip())
     if match is None:
         return None
-    return _repository.user_id_by_forwarding_code(conn, match.group(1).lower())
+    return _repository.user_by_forwarding_code(conn, match.group(1).lower())
 
 
 def session_is_live(conn: psycopg.Connection, *, user_id: UUID, issued_at: datetime) -> bool:

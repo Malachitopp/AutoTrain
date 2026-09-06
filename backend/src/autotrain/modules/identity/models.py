@@ -45,6 +45,16 @@ class ForwardingCode:
 
 
 @dataclass(frozen=True)
+class ForwardingOwner:
+    """The live account a forwarding address belongs to — the webhook's
+    lookup. The email rides along because the intake door
+    (journeys.intake.screen) compares the sender against it."""
+
+    id: UUID
+    email: str
+
+
+@dataclass(frozen=True)
 class SessionGate:
     """The bearer gate's per-request read (0014): a row means the account is
     live; the cutoff, when set, is the instant before which no session is

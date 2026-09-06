@@ -19,6 +19,7 @@ import psycopg
 from autotrain.core import db
 from autotrain.modules.identity.models import (
     ForwardingCode,
+    ForwardingOwner,
     PushTarget,
     SessionGate,
     UserProfile,
@@ -56,12 +57,19 @@ _USER_IS_LIVE = "SELECT EXISTS (SELECT 1 FROM users WHERE id = %s AND deleted_at
 
 # Forwarding codes (0013). The claim is guarded on IS NULL so two requests
 # minting at once both keep the first code; the loser reads it back.
+# Rotation is not guarded: a new code replaces whatever was there, and mail
+# to the old address is nobody's from then on.
 _FORWARDING_CODE = "SELECT forwarding_code FROM users WHERE id = %s AND deleted_at IS NULL"
 _CLAIM_FORWARDING_CODE = (
     "UPDATE users SET forwarding_code = %s "
     "WHERE id = %s AND forwarding_code IS NULL AND deleted_at IS NULL"
 )
-_USER_BY_FORWARDING_CODE = "SELECT id FROM users WHERE forwarding_code = %s AND deleted_at IS NULL"
+_ROTATE_FORWARDING_CODE = (
+    "UPDATE users SET forwarding_code = %s WHERE id = %s AND deleted_at IS NULL"
+)
+_USER_BY_FORWARDING_CODE = (
+    "SELECT id, email FROM users WHERE forwarding_code = %s AND deleted_at IS NULL"
+)
 
 # The session gate (0014): one read answers "still an account" (a row) and
 # "signed out everywhere since this token" (the cutoff). Cutoffs are set
@@ -144,8 +152,13 @@ def claim_forwarding_code(conn: psycopg.Connection, user_id: UUID, code: str) ->
     return db.execute(conn, _CLAIM_FORWARDING_CODE, (code, user_id)) == 1
 
 
-def user_id_by_forwarding_code(conn: psycopg.Connection, code: str) -> UUID | None:
-    return db.fetch_value(conn, _USER_BY_FORWARDING_CODE, (code,))
+def rotate_forwarding_code(conn: psycopg.Connection, user_id: UUID, code: str) -> bool:
+    """True if a live account's code was replaced; False if there was none."""
+    return db.execute(conn, _ROTATE_FORWARDING_CODE, (code, user_id)) == 1
+
+
+def user_by_forwarding_code(conn: psycopg.Connection, code: str) -> ForwardingOwner | None:
+    return db.fetch_one(conn, _USER_BY_FORWARDING_CODE, (code,), row_cls=ForwardingOwner)
 
 
 def session_gate(conn: psycopg.Connection, user_id: UUID) -> SessionGate | None:

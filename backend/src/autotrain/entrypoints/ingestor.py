@@ -49,7 +49,10 @@ def _build_source(settings: Settings) -> service.ArrivalsSource:
     )
 
 
-def _sweep_once(source: service.ArrivalsSource) -> service.SweepStats:
+def _sweep_once(source: service.ArrivalsSource) -> service.SweepStats | None:
+    """None when another ingestor holds the sweep's lock (core.db.job_lock):
+    a rolling deploy's overlap, or a scale-out. Skipped, not failed — the
+    other process is doing this work, and HSP must not be asked twice."""
     settings = get_settings()
     now = datetime.now(tz=UTC)
     # The lag gives the source time to publish: HSP is next-day data, so a
@@ -59,7 +62,9 @@ def _sweep_once(source: service.ArrivalsSource) -> service.SweepStats:
     # from the UK calendar date — the UTC date lags it by an hour a night
     # during BST.
     give_up_before = now.astimezone(_LONDON).date() - timedelta(days=settings.ingestor_give_up_days)
-    with db.transaction() as conn:
+    with db.transaction() as conn, db.job_lock(conn, "delay-sweep") as held:
+        if not held:
+            return None
         # commit_each: every journey's decision commits the moment it is
         # made — locks release, finished work survives a crash, and the
         # notification worker sees decisions without waiting for sweep end.
@@ -88,7 +93,10 @@ def main() -> None:
         while True:
             try:
                 stats = _sweep_once(source)
-                logger.info("sweep complete", extra=fields(stats))
+                if stats is None:
+                    logger.info("sweep skipped: another ingestor holds its lock")
+                else:
+                    logger.info("sweep complete", extra=fields(stats))
             except Exception:
                 # A transient failure (database blip mid-sweep) must not kill
                 # the process: per-journey commits made completed work

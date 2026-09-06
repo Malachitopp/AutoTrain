@@ -20,6 +20,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BACKEND_ROOT = Path(__file__).resolve().parents[3]
 
+# RFC 7518's floor for an HS256 key; pyjwt warns below it. Enforced only in
+# production (_production_lockdown), so a local .env can be anything.
+_SECRET_MIN_BYTES = 32
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -117,6 +121,14 @@ class Settings(BaseSettings):
     # Emails per scheduler pass. Small on purpose: one email is one model
     # call of a few seconds, and a pass should finish well inside the interval.
     intake_batch_size: int = Field(default=20, ge=1)
+    # The door's per-user cap (journeys.intake.screen): emails stored for one
+    # user in a rolling 24 hours. Generous — a year of tickets forwarded in
+    # one sitting is the honest case it must survive — and the excess is
+    # stored as rejected with the reason, so the user learns why.
+    intake_daily_cap: int = Field(default=50, ge=1)
+    # How long a decided email's raw body is kept before the scheduler's
+    # retention job blanks it: the 28-day claim window, doubled for slack.
+    intake_body_retention_days: int = Field(default=60, ge=1)
 
     # Only read by the integration test suite, which drops and recreates it.
     test_database_url: str | None = None
@@ -152,6 +164,42 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "AUTOTRAIN_TICKET_EXTRACTOR=claude requires AUTOTRAIN_ANTHROPIC_API_KEY"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _production_lockdown(self) -> Settings:
+        """AUTOTRAIN_ENVIRONMENT=production refuses to boot while any
+        development setting is still in place. Each of these is fine locally
+        and a silent hole in production: a short signing secret, login links
+        written to the log, a cookie that travels over http, a browser
+        origin that is not https. Every problem is listed at once, so a
+        deployment is fixed in one round, not one boot per setting."""
+        if not self.is_production:
+            return self
+        problems: list[str] = []
+        secret = self.jwt_secret.get_secret_value() if self.jwt_secret else ""
+        if len(secret.encode()) < _SECRET_MIN_BYTES:
+            problems.append(f"AUTOTRAIN_JWT_SECRET must be at least {_SECRET_MIN_BYTES} bytes")
+        if not self.session_cookie_secure:
+            problems.append("AUTOTRAIN_SESSION_COOKIE_SECURE must be true")
+        if self.email_sender == "log":
+            problems.append("AUTOTRAIN_EMAIL_SENDER=log would write login links to the log")
+        if self.push_sender == "log":
+            problems.append("AUTOTRAIN_PUSH_SENDER=log would deliver nothing")
+        for origin in self.cors_origins:
+            if not origin.startswith("https://"):
+                problems.append(f"AUTOTRAIN_CORS_ORIGINS entry {origin!r} is not https")
+        if self.app_base_url and not self.app_base_url.startswith("https://"):
+            problems.append("AUTOTRAIN_APP_BASE_URL is not https")
+        intake_secret = self.intake_secret.get_secret_value() if self.intake_secret else ""
+        if self.inbound_email_domain and not intake_secret:
+            problems.append(
+                "AUTOTRAIN_INTAKE_SECRET is required once AUTOTRAIN_INBOUND_EMAIL_DOMAIN is set"
+            )
+        if problems:
+            raise ValueError(
+                "AUTOTRAIN_ENVIRONMENT=production refuses to start: " + "; ".join(problems)
+            )
         return self
 
 

@@ -71,17 +71,33 @@ def ticket(**overrides: Any) -> ExtractedTicket:
     return ExtractedTicket(**fields)
 
 
+def email_of(conn: psycopg.Connection, user_id: UUID) -> str:
+    return scalar(conn.execute("SELECT email FROM users WHERE id = %s", (user_id,)))
+
+
 def receive(
-    conn: psycopg.Connection, user_id: UUID, message_id: str = "<one@retailer.test>"
+    conn: psycopg.Connection,
+    user_id: UUID,
+    message_id: str = "<one@retailer.test>",
+    *,
+    body: str = BODY,
+    subject: str = "Your booking",
+    **door: Any,
 ) -> InboundEmailRow:
+    """Store one email. By default it is the manual shape, forwarded by the
+    account holder themselves; `door` overrides receive_ticket_email's own
+    keyword arguments (sender, spf_pass, dkim_pass, daily_cap)."""
+    account_email = email_of(conn, user_id)
+    at_the_door: dict[str, Any] = {"sender": account_email, **door}
     row = service.receive_ticket_email(
         conn,
         user_id=user_id,
+        account_email=account_email,
         message_id=message_id,
-        sender="tickets@retailer.test",
         recipient=RECIPIENT,
-        subject="Your booking",
-        body=BODY,
+        subject=subject,
+        body=body,
+        **at_the_door,
     )
     assert row is not None
     return row
@@ -273,8 +289,9 @@ def test_journeys_already_tracked_are_skipped_leg_by_leg(conn: psycopg.Connectio
         service.receive_ticket_email(
             conn,
             user_id=user_id,
+            account_email=email_of(conn, user_id),
             message_id="<a@retailer.test>",
-            sender="tickets@retailer.test",
+            sender=email_of(conn, user_id),
             recipient=RECIPIENT,
             subject="Your booking",
             body=BODY,
@@ -364,6 +381,7 @@ def test_mail_for_nobody_records_only_that_it_arrived(conn: psycopg.Connection) 
     row = service.receive_ticket_email(
         conn,
         user_id=None,
+        account_email=None,
         message_id="<stranger@retailer.test>",
         sender="erased-person@example.com",
         recipient="tickets-0000000000@in.autotrain.test",
@@ -389,3 +407,165 @@ def test_list_inbound_emails_is_the_users_own_newest_first(conn: psycopg.Connect
     rows = service.list_inbound_emails(conn, alice)
 
     assert [row.id for row in rows] == [newer.id, older.id]
+
+
+def test_both_forwarding_shapes_are_accepted_and_the_door_judges_only_what_it_can(
+    conn: psycopg.Connection,
+) -> None:
+    """A ticket reaches us two ways and both must work. Pressing Forward
+    makes the account holder the sender. A Gmail forwarding rule redirects
+    the retailer's own message, so the sender stays the retailer — and
+    nothing in it proves who forwarded it, which is why the door does not
+    try to judge identity. What it does judge: an explicit provider verdict
+    against the sender, and how many emails this user has sent today.
+    Refused mail keeps its sender and subject but loses its body."""
+    user_id = mk_user(conn, "me@example.com")
+
+    pressed = receive(conn, user_id, "<manual@r>")
+    rule = receive(conn, user_id, "<auto@r>", sender="Trainline <noreply@trainline.com>")
+    assert (pressed.status, pressed.forwarding) == ("received", "manual")
+    assert (rule.status, rule.forwarding) == ("received", "automatic")
+    # A display name and letter case are not the address.
+    assert receive(conn, user_id, "<case@r>", sender="Me <ME@Example.com>").forwarding == "manual"
+
+    failed = receive(conn, user_id, "<f@r>", spf_pass=True, dkim_pass=False)
+    assert (failed.status, failed.status_reason, failed.body) == (
+        "rejected",
+        "the sender could not be verified (SPF or DKIM failed)",
+        "",
+    )
+    assert (failed.sender, failed.subject) == ("me@example.com", "Your booking")
+    # No verdict at all is not a failed verdict.
+    assert receive(conn, user_id, "<u@r>", spf_pass=None, dkim_pass=None).status == "received"
+
+    # Five rows stored so far, refused ones included, so a cap of five
+    # refuses the next.
+    over = receive(conn, user_id, "<over@r>", daily_cap=5)
+    assert (over.status, over.status_reason, over.body) == (
+        "rejected",
+        "daily limit of 5 emails reached",
+        "",
+    )
+    # The cap is a rolling day: once yesterday's rows age out there is room.
+    conn.execute(
+        "UPDATE inbound_emails SET received_at = received_at - interval '25 hours' "
+        "WHERE user_id = %s",
+        (user_id,),
+    )
+    assert receive(conn, user_id, "<after@r>", daily_cap=5).status == "received"
+
+    # Everything the door let through reaches the reader, both shapes.
+    reader = ScriptedExtractor(ticket())
+    stats = service.run_intake_sweep(conn, reader)
+    assert (stats.examined, stats.parsed, stats.duplicate) == (5, 1, 4)
+    assert len(reader.calls) == 5
+
+
+def test_gmails_setup_message_reaches_the_user_and_never_the_reader(
+    conn: psycopg.Connection,
+) -> None:
+    """Gmail will not start forwarding until a code it emails to the address
+    is typed back into Gmail. That email lands here. Given to the reader it
+    would be answered "not a ticket" and filed away, and the user could
+    never switch forwarding on — so it is recognised, and the code is put
+    where the settings page can show it."""
+    user_id = mk_user(conn, "me@example.com")
+
+    row = receive(
+        conn,
+        user_id,
+        "<confirm@google.test>",
+        sender="Gmail Team <forwarding-noreply@google.com>",
+        subject="Gmail Forwarding Confirmation (#33821484) - Receive Mail from me@example.com",
+        body=(
+            "me@example.com has requested to automatically forward mail to your "
+            f"email address {RECIPIENT}. Confirmation code: 33821484."
+        ),
+    )
+
+    assert row.status == "confirmation"
+    assert row.status_reason == (
+        "me@example.com asked to forward mail here. Enter code 33821484 in Gmail to switch it on."
+    )
+    assert row.processed_at is not None
+    reader = ScriptedExtractor(ticket())
+    assert service.run_intake_sweep(conn, reader).examined == 0
+    assert reader.calls == []
+
+    # Only Google sends it. The same words from anyone else are just an
+    # email, and the reader decides what it is.
+    forged = receive(
+        conn,
+        user_id,
+        "<forged@r>",
+        sender="attacker@example.com",
+        subject="Gmail Forwarding Confirmation (#99999999)",
+        body="nice try",
+    )
+    assert forged.status == "received"
+
+
+def test_the_reader_is_given_the_words_of_an_html_email_and_no_more_than_the_limit(
+    conn: psycopg.Connection,
+) -> None:
+    """HTML mail is mostly markup and the reader is paid by the character:
+    it gets the words, one line per block, entities decoded, scripts and
+    styles gone. A body over the limit is cut there, with a marker, AFTER
+    the markup is removed — so the words under a long header survive. The
+    stored body is untouched either way: a re-run gets the whole email."""
+    user_id = mk_user(conn)
+    html = (
+        "<html><head><title>Mail</title><style>p{color:red}</style></head>"
+        "<body><p>Your <b>e-ticket</b></p>"
+        "<table><tr><td>MAN</td><td>EUS</td></tr></table>"
+        "<script>track()</script>&pound;45.50&nbsp;paid</body></html>"
+    )
+    receive(conn, user_id, "<html@r>", body=html)
+    long_plain = receive(conn, user_id, "<long@r>", body="x" * 60_000)
+    later(conn, long_plain)
+    reader = ScriptedExtractor(ticket())
+
+    service.run_intake_sweep(conn, reader)
+
+    words, cut = (body for (_subject, body, _received) in reader.calls)
+    assert words == "Your e-ticket\nMAN EUS\n£45.50 paid"
+    marker = "\n[cut here: the email was longer than the reader is given]"
+    assert cut == "x" * 50_000 + marker
+    assert (
+        scalar(
+            conn.execute("SELECT length(body) FROM inbound_emails WHERE id = %s", (long_plain.id,))
+        )
+        == 60_000
+    )
+
+
+def test_bodies_are_blanked_after_the_retention_window(conn: psycopg.Connection) -> None:
+    """Sixty days after an email was decided its raw body goes; the sender,
+    subject, status and the reader's answer stay, so the user's list still
+    says what happened. Emails decided recently, or still waiting to be
+    read, are untouched, and a second run finds nothing."""
+    user_id = mk_user(conn)
+    old = receive(conn, user_id, "<old@r>")
+    recent = receive(conn, user_id, "<recent@r>")
+    later(conn, recent)
+    assert service.run_intake_sweep(conn, ScriptedExtractor(ticket())).examined == 2
+    receive(conn, user_id, "<waiting@r>")
+    conn.execute(
+        "UPDATE inbound_emails SET processed_at = now() - interval '61 days' WHERE id = %s",
+        (old.id,),
+    )
+
+    assert service.run_retention_sweep(conn, keep_days=60, batch_size=1) == 1
+
+    rows = {
+        row[0]: row[1:]
+        for row in conn.execute(
+            "SELECT message_id, body, body_purged_at IS NOT NULL, extraction IS NOT NULL, "
+            "status, sender, subject FROM inbound_emails WHERE user_id = %s",
+            (user_id,),
+        ).fetchall()
+    }
+    assert rows["<old@r>"] == ("", True, True, "parsed", email_of(conn, user_id), "Your booking")
+    assert rows["<recent@r>"][:2] == (BODY, False)
+    assert rows["<waiting@r>"][:2] == (BODY, False)
+    assert service.run_retention_sweep(conn, keep_days=60) == 0

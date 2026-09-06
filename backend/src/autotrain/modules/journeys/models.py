@@ -115,7 +115,9 @@ class InboundEmailRow:
     """One row of `inbound_emails` (migration 0013): a forwarded ticket email
     and what became of it. `extraction` is the reader's answer as it was
     stored (a dict, from jsonb); `body` is the raw email and never leaves
-    the module except to the reader."""
+    the module except to the reader — '' once the retention job has blanked
+    it (body_purged_at says when). The provider's sender verdicts are None
+    when it gave none (0015)."""
 
     id: UUID
     user_id: UUID | None
@@ -125,10 +127,14 @@ class InboundEmailRow:
     subject: str
     body: str
     received_at: datetime
+    spf_pass: bool | None
+    dkim_pass: bool | None
     status: str
     status_reason: str | None
     extraction: dict[str, Any] | None
     attempts: int
     processed_at: datetime | None
+    body_purged_at: datetime | None
+    forwarding: str | None
     created_at: datetime
     updated_at: datetime

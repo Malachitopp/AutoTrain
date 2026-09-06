@@ -66,6 +66,22 @@ export type Page<T> = { items: T[]; count: number; limit: number };
  * page shows the list before anyone signs in. */
 export type Operator = { atoc_code: string; name: string; min_delay_minutes: number };
 
+/** GET /intake/address and POST /intake/address/rotate: where this user
+ * forwards ticket emails. */
+export type ForwardingAddress = { address: string };
+
+/** GET /intake/emails: one forwarded email and what became of it. The body
+ * and the reader's raw answer stay on the server; status_reason is the
+ * backend's own plain-English explanation and is shown as written. */
+export type InboundEmail = {
+  id: string;
+  received_at: string;
+  sender: string;
+  subject: string;
+  status: string;
+  status_reason: string | null;
+};
+
 /** GET /journeys/{id}/decision: the frozen delay decision for one journey.
  * band_percent is null when the delay earned nothing. */
 export type Decision = {
@@ -225,4 +241,17 @@ export const claims = {
 export const operators = {
   /** The operators AutoTrain can file with, by name. Needs no session. */
   list: () => request<Operator[]>("GET", "/operators"),
+};
+
+export const intake = {
+  /** This user's forwarding address, minted on the first ask. 503 when the
+   * API has no inbound mail domain configured, which is every development
+   * machine until one is set up — the settings page treats that as a state,
+   * not a failure. */
+  address: () => request<ForwardingAddress>("GET", "/intake/address"),
+  /** A fresh address in place of the old one. Mail to the old address is
+   * nobody's from then on, so the user must update their forwarding rule. */
+  rotate: () => request<ForwardingAddress>("POST", "/intake/address/rotate"),
+  /** What became of the emails this user forwarded, newest first. */
+  emails: (limit = 50) => request<InboundEmail[]>("GET", `/intake/emails?limit=${limit}`),
 };
