@@ -55,6 +55,7 @@ __all__ = [
     "SESSION_TTL",
     "EmailDeliveryError",
     "EmailSender",
+    "LoginRateLimited",
     "PushTarget",
     "SessionClaims",
     "UserProfile",
@@ -62,6 +63,7 @@ __all__ = [
     "forwarding_address",
     "forwarding_code",
     "issue_session_token",
+    "purge_expired_login_tokens",
     "push_targets",
     "request_login",
     "revoke_sessions",
@@ -72,6 +74,15 @@ __all__ = [
     "user_profile",
     "verify_login",
 ]
+
+
+class LoginRateLimited(RuntimeError):
+    """Too many login links have been asked for; this one is refused.
+
+    Not an error in the system — the expected answer to a caller who has had
+    their share. Named by the module rather than the api layer because the
+    rule is the module's: the api only decides which status code says it.
+    """
 
 
 class EmailDeliveryError(RuntimeError):
@@ -103,6 +114,11 @@ class EmailSender(Protocol):
 
 _TOKEN_TTL = timedelta(minutes=15)
 _LOGIN_SUBJECT = "Your AutoTrain sign-in link"
+# The window both login rate limits are measured over. Rolling rather than a
+# calendar day on purpose: a fixed midnight boundary hands an attacker a full
+# fresh budget at a time they can pick, and lets them take two budgets back to
+# back across it.
+_RATE_WINDOW = timedelta(hours=24)
 # Public: the web session cookie's max-age is derived from it (routers/auth.py).
 SESSION_TTL = timedelta(days=30)
 # A verifier may run on a different host from the issuer; a few seconds of
@@ -120,7 +136,13 @@ def push_targets(
 
 
 def request_login(
-    conn: psycopg.Connection, email: str, sender: EmailSender, *, app_base_url: str
+    conn: psycopg.Connection,
+    email: str,
+    sender: EmailSender,
+    *,
+    app_base_url: str,
+    per_email_daily_cap: int = 5,
+    daily_cap: int = 80,
 ) -> None:
     """Start a magic-link login: mint an unguessable single-use token, store
     only its hash (a leaked database can recognise tokens, never mint them),
@@ -133,7 +155,17 @@ def request_login(
 
     The link is <app_base_url>/login#token=<token>: /login is the frontend's
     route, a contract with the app rather than a detail of this module.
+
+    Raises LoginRateLimited when this address, or the system as a whole, has
+    had its share of the window. Both caps count rows already in
+    login_tokens, which is what makes them survive the api's rollback rule:
+    a request that sends an email answers 204 and commits its row, so the
+    committed rows are the record of what went out, while a refused request
+    writes nothing and needs to write nothing. A limiter that instead
+    recorded its own refusals would have those records rolled back with the
+    429 that caused them, and would forget every attempt it ever blocked.
     """
+    _refuse_if_over_limit(conn, email, per_email_daily_cap=per_email_daily_cap, daily_cap=daily_cap)
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     expires_at = datetime.now(UTC) + _TOKEN_TTL
@@ -143,6 +175,66 @@ def request_login(
         subject=_LOGIN_SUBJECT,
         body=_login_email_body(f"{app_base_url}/login#token={token}"),
     )
+
+
+def _refuse_if_over_limit(
+    conn: psycopg.Connection, email: str, *, per_email_daily_cap: int, daily_cap: int
+) -> None:
+    """Raise LoginRateLimited if this request would exceed either cap.
+
+    Two caps, because they stop two different things and neither covers the
+    other. The per-address one stops a single inbox being filled with our
+    mail, which is how a login endpoint gets used to attack a stranger and
+    take the sending domain's reputation down with it. The daily one stops
+    the provider's own quota being drained, which no per-address cap can do:
+    an attacker uses a thousand addresses and stays under it every time.
+
+    Both are checked before anything is written, so a refusal costs one
+    indexed count and no email. The order is cheapest-blast-radius first:
+    the per-address answer is the one a real person hits.
+    """
+    since = datetime.now(UTC) - _RATE_WINDOW
+    for count, cap in (
+        (
+            _repository.count_login_tokens_for_email(conn, email, since, per_email_daily_cap),
+            per_email_daily_cap,
+        ),
+        (_repository.count_login_tokens_since(conn, since, daily_cap), daily_cap),
+    ):
+        if count >= cap:
+            # Deliberately the same exception, carrying nothing about which
+            # cap it was. Which one you hit is a fact about other people's
+            # traffic, and the api turns both into one identical 429.
+            raise LoginRateLimited("too many login links requested")
+
+
+def purge_expired_login_tokens(
+    conn: psycopg.Connection, *, keep_days: int, batch_size: int = 500, commit_each: bool = False
+) -> int:
+    """Delete login tokens older than `keep_days`; returns how many.
+
+    Nothing reads a token after its first 15 minutes, so this table was
+    growing for ever for no one. Batched, like journeys' retention sweep, so
+    a first run over a long backlog never holds one long transaction.
+
+    The cutoff is never inside the rate limiter's window, whatever retention
+    is configured. The limiter counts rows in login_tokens, so a purge that
+    reached into that window would delete the evidence of what an attacker
+    had already been sent and hand them a fresh budget — a hole opened by
+    lowering a retention setting, with nothing at either site to suggest the
+    two were connected. Taking the max here makes that impossible rather
+    than merely documented.
+    """
+    before = datetime.now(UTC) - max(timedelta(days=keep_days), _RATE_WINDOW)
+    deleted = 0
+    while True:
+        with conn.transaction():
+            batch = _repository.delete_old_login_tokens(conn, before, batch_size)
+        deleted += batch
+        if commit_each:
+            conn.commit()
+        if batch < batch_size:
+            return deleted
 
 
 def _login_email_body(link: str) -> str:

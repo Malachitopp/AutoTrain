@@ -16,6 +16,7 @@ from pydantic import (
     AwareDatetime,
     BaseModel,
     ConfigDict,
+    EmailStr,
     Field,
     field_serializer,
     field_validator,
@@ -174,9 +175,18 @@ class ClaimFilingOut(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    """A request to log in, which the service turns into a one-time token."""
+    """A request to log in, which the service turns into a one-time token.
 
-    email: str
+    This is the only unauthenticated endpoint that spends money: every
+    accepted request sends a real email on a metered account. So the address
+    is judged here, at the cheapest point in the system — before a database
+    row is written and before the provider is called. EmailStr refuses
+    anything that is not an address at all; max_length refuses the rest,
+    since RFC 5321 caps a real address at 254 characters and everything
+    beyond that is someone finding out how large a body we will parse.
+    """
+
+    email: EmailStr = Field(max_length=254)
 
 
 class LoginVerify(BaseModel):

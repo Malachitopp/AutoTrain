@@ -114,6 +114,128 @@ class TestRequestLogin:
         count = scalar(conn.execute("SELECT count(*) FROM login_tokens WHERE email = %s", (email,)))
         assert count == 0
 
+    def test_the_caps_survive_the_rollback_that_refusing_causes(
+        self, conn: psycopg.Connection
+    ) -> None:
+        """The property the whole limiter design turns on.
+
+        The api rolls a request's transaction back for any response of 400
+        and above, so a limiter that recorded its own refusals would have
+        every one of them undone by the 429 it had just produced — it would
+        forget each attempt it blocked and wave the next one through as a
+        first attempt, while reading, in the source, exactly like a working
+        limiter.
+
+        This one counts rows that COMMITTED instead. A request that sends an
+        email answers 204 and keeps its row; a refused one writes nothing
+        and needs to. So the count is unaffected by its own rollbacks, which
+        is what the savepoints below reproduce: each call runs in its own
+        unit of work, and the refusals unwind exactly as they would in the
+        api. Savepoints rather than real transactions, so the suite's
+        connection can still roll the whole test back — the property under
+        test is visibility to later statements, which behaves the same way.
+        """
+        # Two jobs, both needed. It gives these global caps a known global
+        # state to be measured against. And it puts the connection inside a
+        # transaction, so every conn.transaction() below opens a SAVEPOINT
+        # rather than a real transaction — psycopg only nests when one is
+        # already open, and a real one would COMMIT on exit and leak these
+        # rows into whatever test ran next. The fixture rolls the lot back.
+        conn.execute("DELETE FROM login_tokens")
+        sender = _RecordingEmailSender()
+        for _ in range(3):
+            with conn.transaction():
+                identity.request_login(
+                    conn, _EMAIL, sender, app_base_url=TEST_APP_BASE_URL, per_email_daily_cap=3
+                )
+
+        # Refused — and the refusal's own transaction unwinds, twice over.
+        for _ in range(2):
+            with pytest.raises(identity.LoginRateLimited), conn.transaction():
+                identity.request_login(
+                    conn, _EMAIL, sender, app_base_url=TEST_APP_BASE_URL, per_email_daily_cap=3
+                )
+
+        # Three emails, three rows. The refusals cost neither, and — the
+        # point — the second refusal still knew about the first three.
+        assert len(sender.sent) == 3
+        count = scalar(
+            conn.execute("SELECT count(*) FROM login_tokens WHERE email = %s", (_EMAIL,))
+        )
+        assert count == 3
+
+    def test_the_two_caps_stop_two_different_attacks(self, conn: psycopg.Connection) -> None:
+        """Per address, and across everyone. Neither covers the other: a
+        per-address cap never sees one caller working through a thousand
+        different inboxes, and a global cap never stops one inbox being
+        filled. The window is rolling, so aging the rows reopens it."""
+        # Two jobs, both needed. It gives these global caps a known global
+        # state to be measured against. And it puts the connection inside a
+        # transaction, so every conn.transaction() below opens a SAVEPOINT
+        # rather than a real transaction — psycopg only nests when one is
+        # already open, and a real one would COMMIT on exit and leak these
+        # rows into whatever test ran next. The fixture rolls the lot back.
+        conn.execute("DELETE FROM login_tokens")
+        sender = _RecordingEmailSender()
+
+        def ask(email: str, **caps: int) -> None:
+            identity.request_login(conn, email, sender, app_base_url=TEST_APP_BASE_URL, **caps)
+
+        # One address, its own share, then refused — while a second address
+        # is unaffected, because the cap is per inbox.
+        ask("a@example.com", per_email_daily_cap=2)
+        ask("a@example.com", per_email_daily_cap=2)
+        with pytest.raises(identity.LoginRateLimited):
+            ask("a@example.com", per_email_daily_cap=2)
+        ask("b@example.com", per_email_daily_cap=2)
+
+        # Three sent in total, so a global cap of three refuses a fourth
+        # even though the address is new and has never asked for anything.
+        with pytest.raises(identity.LoginRateLimited):
+            ask("c@example.com", daily_cap=3)
+
+        # Rolling, not a calendar day: once yesterday's rows age out of the
+        # window both caps have room again.
+        conn.execute("UPDATE login_tokens SET created_at = created_at - interval '25 hours'")
+        ask("a@example.com", per_email_daily_cap=2, daily_cap=3)
+
+    def test_cleanup_never_reaches_inside_the_rate_limit_window(
+        self, conn: psycopg.Connection
+    ) -> None:
+        """login_tokens grew for ever because nothing read a token after its
+        first 15 minutes and nothing deleted one either. The purge fixes
+        that — but the limiter now counts these same rows, so a purge that
+        reached inside its 24-hour window would delete the record of what an
+        attacker had already been sent and hand them a fresh budget. Lowering
+        a retention setting would open that hole, with nothing at either site
+        to say the two were connected, so the floor is arithmetic here rather
+        than a warning in a comment: even at the minimum retention of one
+        day, a two-hour-old token stays."""
+        # Two jobs, both needed. It gives these global caps a known global
+        # state to be measured against. And it puts the connection inside a
+        # transaction, so every conn.transaction() below opens a SAVEPOINT
+        # rather than a real transaction — psycopg only nests when one is
+        # already open, and a real one would COMMIT on exit and leak these
+        # rows into whatever test ran next. The fixture rolls the lot back.
+        conn.execute("DELETE FROM login_tokens")
+        sender = _RecordingEmailSender()
+        for email, age in (("fresh@x.test", "2 hours"), ("stale@x.test", "25 hours")):
+            identity.request_login(conn, email, sender, app_base_url=TEST_APP_BASE_URL)
+            conn.execute(
+                "UPDATE login_tokens SET created_at = now() - %s::interval WHERE email = %s",
+                (age, email),
+            )
+
+        assert identity.purge_expired_login_tokens(conn, keep_days=1) == 1
+
+        left = [
+            r[0] for r in conn.execute("SELECT email FROM login_tokens ORDER BY email").fetchall()
+        ]
+        assert left == ["fresh@x.test"]
+        # And a longer retention keeps the same row for longer, obviously —
+        # the floor raises the cutoff, it does not replace it.
+        assert identity.purge_expired_login_tokens(conn, keep_days=30) == 0
+
     def test_never_reveals_whether_the_email_has_an_account(self, conn: psycopg.Connection) -> None:
         """The enumeration property at the service layer: a known and an
         unknown email produce indistinguishable behaviour — one stored row,

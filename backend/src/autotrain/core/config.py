@@ -96,7 +96,42 @@ class Settings(BaseSettings):
     # recipient's client shows in the sender column:
     #   AutoTrain <login@in.example.com>
     email_from: str | None = None
-    # Signs session JWTs. SecretStr: a logged Settings shows '**********'.
+
+    # Login rate limits. /auth/login/request is the only unauthenticated
+    # endpoint that spends money, so all three of these exist to bound what
+    # a stranger with a loop can cost us.
+    #
+    # Per address, per rolling 24 hours. Five links a day is far more than a
+    # real person needs — each one lasts 15 minutes and one usually does —
+    # and it caps what a single targeted inbox can be sent, which is the
+    # difference between a login email and us being used to mail-bomb
+    # someone from a domain we just spent the morning getting trusted.
+    login_requests_per_email_per_day: int = Field(default=5, ge=1)
+    # Across everyone, per rolling 24 hours. Deliberately below the provider's
+    # own free-tier ceiling of 100/day: hitting OUR limit answers 429 and
+    # nothing else happens, while hitting THEIRS means refused sends, a
+    # provider that starts judging the account for abuse, and a sending
+    # reputation built over weeks spent in an afternoon. Note honestly what
+    # this does and does not buy: it protects the provider relationship, not
+    # availability — an attacker who reaches this cap has still denied real
+    # users their logins for the rest of the window.
+    login_requests_per_day: int = Field(default=80, ge=1)
+    # Per client address, per hour, held in the API process's memory rather
+    # than the database (api/middleware.py explains the trade). This is the
+    # only one of the three that stops one caller burning the daily cap with
+    # a thousand DIFFERENT addresses, which is the shape both a hostile
+    # script and a looping frontend actually take.
+    login_requests_per_ip_per_hour: int = Field(default=20, ge=1)
+    # How long a spent or expired login token is kept before the scheduler
+    # deletes it. Nothing read them after the first 15 minutes; they are kept
+    # a week only so a support question about "I could not log in on Tuesday"
+    # has something behind it. The purge never reaches inside the rate
+    # limiter's counting window whatever this says — identity.service does
+    # that arithmetic, so a short retention cannot silently hand an attacker
+    # a fresh budget.
+    login_token_retention_days: int = Field(
+        default=7, ge=1
+    )  # Signs session JWTs. SecretStr: a logged Settings shows '**********'.
     # Whoever holds it can mint a session for any user.
     jwt_secret: SecretStr | None = None
     # The frontend origin magic links point at (<app_base_url>/login?token=...).

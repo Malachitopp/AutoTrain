@@ -108,8 +108,25 @@ def _clear_session_cookie(response: Response) -> None:
 def request_login(payload: LoginRequest, conn: ConnDep) -> None:
     """Always 204, account or not — the enumeration reasoning lives in
     identity.request_login; this route adds nothing that could leak."""
+    settings = get_settings()
     try:
-        service.request_login(conn, payload.email, _email_sender(), app_base_url=_app_base_url())
+        service.request_login(
+            conn,
+            payload.email,
+            _email_sender(),
+            app_base_url=_app_base_url(),
+            per_email_daily_cap=settings.login_requests_per_email_per_day,
+            daily_cap=settings.login_requests_per_day,
+        )
+    except service.LoginRateLimited as exc:
+        # One 429 for both caps, saying nothing about which was hit: which
+        # one you reached is a fact about other people's traffic. No
+        # Retry-After — the window is rolling, so any number here would be a
+        # guess, and the middleware's fixed-window limiter is the one that
+        # can answer that honestly.
+        raise HTTPException(
+            status_code=429, detail="too many login requests; try again later"
+        ) from exc
     except service.EmailDeliveryError as exc:
         # 502, not 500: the fault is the provider's, and the distinction is
         # what sends whoever is on call to their status page instead of our
