@@ -10,6 +10,7 @@ issue/verify is pure signature math, which is rather the point of it.
 from __future__ import annotations
 
 import hashlib
+import threading
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -18,7 +19,7 @@ import psycopg
 import pytest
 
 from autotrain.modules.identity import service as identity
-from conftest import TEST_APP_BASE_URL, TEST_JWT_SECRET, mk_user, scalar
+from conftest import TEST_APP_BASE_URL, TEST_DATABASE_URL, TEST_JWT_SECRET, mk_user, scalar
 
 _EMAIL = "magic-link@example.com"
 
@@ -142,6 +143,7 @@ class TestRequestLogin:
         # already open, and a real one would COMMIT on exit and leak these
         # rows into whatever test ran next. The fixture rolls the lot back.
         conn.execute("DELETE FROM login_tokens")
+        conn.execute("DELETE FROM login_sends")
         sender = _RecordingEmailSender()
         for _ in range(3):
             with conn.transaction():
@@ -176,6 +178,7 @@ class TestRequestLogin:
         # already open, and a real one would COMMIT on exit and leak these
         # rows into whatever test ran next. The fixture rolls the lot back.
         conn.execute("DELETE FROM login_tokens")
+        conn.execute("DELETE FROM login_sends")
         sender = _RecordingEmailSender()
 
         def ask(email: str, **caps: int) -> None:
@@ -197,6 +200,7 @@ class TestRequestLogin:
         # Rolling, not a calendar day: once yesterday's rows age out of the
         # window both caps have room again.
         conn.execute("UPDATE login_tokens SET created_at = created_at - interval '25 hours'")
+        conn.execute("UPDATE login_sends SET created_at = created_at - interval '25 hours'")
         ask("a@example.com", per_email_daily_cap=2, daily_cap=3)
 
     def test_cleanup_never_reaches_inside_the_rate_limit_window(
@@ -218,6 +222,7 @@ class TestRequestLogin:
         # already open, and a real one would COMMIT on exit and leak these
         # rows into whatever test ran next. The fixture rolls the lot back.
         conn.execute("DELETE FROM login_tokens")
+        conn.execute("DELETE FROM login_sends")
         sender = _RecordingEmailSender()
         for email, age in (("fresh@x.test", "2 hours"), ("stale@x.test", "25 hours")):
             identity.request_login(conn, email, sender, app_base_url=TEST_APP_BASE_URL)
@@ -226,7 +231,11 @@ class TestRequestLogin:
                 (age, email),
             )
 
-        assert identity.purge_expired_login_tokens(conn, keep_days=1) == 1
+        conn.execute("UPDATE login_sends SET created_at = now() - interval '25 hours'")
+
+        # One stale token and both send records: three rows, one table each
+        # side of the window.
+        assert identity.purge_expired_login_tokens(conn, keep_days=1) == 3
 
         left = [
             r[0] for r in conn.execute("SELECT email FROM login_tokens ORDER BY email").fetchall()
@@ -235,6 +244,119 @@ class TestRequestLogin:
         # And a longer retention keeps the same row for longer, obviously —
         # the floor raises the cutoff, it does not replace it.
         assert identity.purge_expired_login_tokens(conn, keep_days=30) == 0
+
+    def test_a_plus_suffix_does_not_buy_another_budget(self, conn: psycopg.Connection) -> None:
+        """Nearly every provider delivers a+anything@x to a@x, so a cap keyed
+        on the address as typed was a fresh five a day per suffix — for the
+        one inbox. The cap keys on where the mail lands: suffix stripped,
+        case folded. The mail itself still goes to the address as typed, so
+        a person who uses a suffix on purpose still gets their link."""
+        conn.execute("DELETE FROM login_tokens")
+        conn.execute("DELETE FROM login_sends")
+        sender = _RecordingEmailSender()
+        for typed in ("Rider@Example.com", "rider+shop@example.com", "RIDER+2@example.com"):
+            identity.request_login(
+                conn, typed, sender, app_base_url=TEST_APP_BASE_URL, per_email_daily_cap=3
+            )
+        with pytest.raises(identity.LoginRateLimited):
+            identity.request_login(
+                conn,
+                "rider+3@example.com",
+                sender,
+                app_base_url=TEST_APP_BASE_URL,
+                per_email_daily_cap=3,
+            )
+        assert [to for to, _s, _b in sender.sent] == [
+            "Rider@Example.com",
+            "rider+shop@example.com",
+            "RIDER+2@example.com",
+        ]
+        keys = {
+            r[0] for r in conn.execute("SELECT DISTINCT email_key FROM login_tokens").fetchall()
+        }
+        assert keys == {"rider@example.com"}
+
+    def test_deleting_an_account_does_not_lower_the_daily_cap(
+        self, conn: psycopg.Connection
+    ) -> None:
+        """The daily cap used to count login_tokens, and erasure deletes a
+        person's login_tokens — as it must. Request links, sign in, delete
+        the account, and the day's count fell by that many: an authenticated
+        loop that reached the provider's quota without meeting our cap. The
+        count now comes from a table that records only that a send happened,
+        which erasure has no reason to touch."""
+        conn.execute("DELETE FROM login_tokens")
+        conn.execute("DELETE FROM login_sends")
+        sender = _RecordingEmailSender()
+        for _ in range(2):
+            identity.request_login(conn, _EMAIL, sender, app_base_url=TEST_APP_BASE_URL)
+        user_id = identity.verify_login(conn, link_in(sender.sent[-1][2]).split("token=")[1])
+        assert user_id is not None
+
+        assert identity.erase_user(conn, user_id)
+        assert scalar(conn.execute("SELECT count(*) FROM login_tokens")) == 0  # erased, rightly
+        assert scalar(conn.execute("SELECT count(*) FROM login_sends")) == 2  # and still counted
+
+        with pytest.raises(identity.LoginRateLimited):
+            identity.request_login(
+                conn,
+                "someone-else@example.com",
+                sender,
+                app_base_url=TEST_APP_BASE_URL,
+                daily_cap=2,
+            )
+
+    def test_concurrent_requests_cannot_slip_under_the_cap_together(self) -> None:
+        """Count-then-insert is a race: two requests in flight at once both
+        count under the cap and both insert, so the cap held only up to the
+        size of the connection pool. The check now runs under a
+        transaction-scoped lock. Two real connections here, because the race
+        needs two transactions: the second must BLOCK while the first holds
+        the lock, and then — once the first has committed and its row is
+        visible — be refused, where without the lock it would have counted
+        zero and sent."""
+        sender = _RecordingEmailSender()
+        first = psycopg.connect(TEST_DATABASE_URL)
+        second = psycopg.connect(TEST_DATABASE_URL)
+        outcome: dict[str, str] = {}
+        email = "racer@example.com"
+        try:
+            first.execute("DELETE FROM login_tokens WHERE email_key = %s", (email,))
+            first.commit()
+            identity.request_login(
+                first, email, sender, app_base_url=TEST_APP_BASE_URL, per_email_daily_cap=1
+            )  # holds the lock: not yet committed
+
+            def contend() -> None:
+                try:
+                    identity.request_login(
+                        second,
+                        email,
+                        sender,
+                        app_base_url=TEST_APP_BASE_URL,
+                        per_email_daily_cap=1,
+                    )
+                    outcome["second"] = "sent"
+                except identity.LoginRateLimited:
+                    outcome["second"] = "refused"
+
+            thread = threading.Thread(target=contend)
+            thread.start()
+            thread.join(timeout=1.0)
+            assert thread.is_alive(), "the second request should be waiting on the lock"
+            assert outcome == {}
+
+            first.commit()
+            thread.join(timeout=10.0)
+            assert outcome == {"second": "refused"}
+            assert len(sender.sent) == 1
+        finally:
+            second.rollback()
+            first.execute("DELETE FROM login_tokens WHERE email_key = %s", (email,))
+            first.execute("DELETE FROM login_sends WHERE id = (SELECT max(id) FROM login_sends)")
+            first.commit()
+            first.close()
+            second.close()
 
     def test_never_reveals_whether_the_email_has_an_account(self, conn: psycopg.Connection) -> None:
         """The enumeration property at the service layer: a known and an

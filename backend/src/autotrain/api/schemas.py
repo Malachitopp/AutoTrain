@@ -181,9 +181,10 @@ class LoginRequest(BaseModel):
     accepted request sends a real email on a metered account. So the address
     is judged here, at the cheapest point in the system — before a database
     row is written and before the provider is called. EmailStr refuses
-    anything that is not an address at all; max_length refuses the rest,
-    since RFC 5321 caps a real address at 254 characters and everything
-    beyond that is someone finding out how large a body we will parse.
+    anything that is not an address, including one past RFC 5321's 254
+    characters; the explicit max_length says the bound out loud rather than
+    leaving it to a validator's internals. Neither bounds the request body —
+    that is a transport concern, not this field's.
     """
 
     email: EmailStr = Field(max_length=254)
