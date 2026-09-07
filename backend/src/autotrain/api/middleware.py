@@ -46,9 +46,11 @@ logger = logging.getLogger(__name__)
 # or control characters into the log, no 4KB headers echoed back.
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
-# How many distinct callers the rate limiter will remember before it prunes
-# expired entries. Well above any real traffic this product will see, and far
-# below what would trouble the process's memory.
+# How many distinct callers the rate limiter remembers before it starts
+# evicting the ones seen longest ago. A hard ceiling, not a hint: with each
+# caller holding at most `limit` timestamps, the whole structure cannot pass
+# roughly 8 MB no matter what arrives. Well above any traffic this product
+# will see, and far below what would trouble the process.
 _MAX_TRACKED_CLIENTS = 10_000
 
 
@@ -198,26 +200,43 @@ class RateLimitMiddleware:
     def _over_limit(self, host: str) -> bool:
         """Record this hit and say whether the caller is over their share.
 
-        No lock: every line here runs on the event loop between awaits, so
-        no two requests can interleave inside it. Monotonic time, so a clock
-        correction cannot hand out a free window.
+        Every line of this runs on the event loop between awaits, so no two
+        requests interleave inside it and no lock is needed. Monotonic time,
+        so a clock correction cannot hand out a free window.
+
+        Bounded in both directions, which a rate limiter has to be or it is
+        an easier attack than the one it prevents:
+
+        * A caller already over the cap is NOT recorded. Their list stops at
+          `limit` entries instead of growing for as long as they keep
+          knocking — and since everything they send is inside the window,
+          nothing would ever expire out of it. The behavioural consequence
+          is deliberate and standard for a sliding window: knocking while
+          blocked does not extend the block, so capacity returns as the
+          oldest hits age out.
+        * The dictionary is capped by evicting whoever was seen longest ago.
+          A dict keeps insertion order, so popping the caller and putting it
+          back places it last, which leaves the FIRST key as the least
+          recently seen. That makes eviction O(1) — no scan, no sort. The
+          previous version rebuilt the whole dictionary looking for expired
+          entries, which ran on every request once full, found nothing
+          during the address-cycling attack it was meant to survive (every
+          entry is live), and turned attack traffic into quadratic work
+          here.
+
+        The ceiling is therefore `limit` timestamps for each of
+        _MAX_TRACKED_CLIENTS hosts: about 8 MB, whatever arrives.
         """
         now = time.monotonic()
         cutoff = now - self._window
-        if len(self._hits) > _MAX_TRACKED_CLIENTS:
-            # The limiter must not become the memory leak it exists to
-            # prevent: a caller cycling addresses would otherwise grow this
-            # dict for ever. Dropping expired entries is safe — an entry
-            # with nothing inside the window says nothing.
-            self._hits = {
-                host_: live
-                for host_, hits in self._hits.items()
-                if (live := [h for h in hits if h > cutoff])
-            }
-        hits = [h for h in self._hits.get(host, ()) if h > cutoff]
-        hits.append(now)
+        hits = [h for h in self._hits.pop(host, ()) if h > cutoff]
+        over = len(hits) >= self._limit
+        if not over:
+            hits.append(now)
         self._hits[host] = hits
-        return len(hits) > self._limit
+        while len(self._hits) > _MAX_TRACKED_CLIENTS:
+            del self._hits[next(iter(self._hits))]
+        return over
 
 
 class RequestIdMiddleware:
