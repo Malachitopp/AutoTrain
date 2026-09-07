@@ -111,7 +111,11 @@ def _intake_once(extractor: journeys.TicketExtractor) -> journeys.IntakeStats | 
         # decided — a model call is seconds, and a crash mid-pass must not
         # undo the emails already read.
         return journeys.run_intake_sweep(
-            conn, extractor, batch_size=settings.intake_batch_size, commit_each=True
+            conn,
+            extractor,
+            batch_size=settings.intake_batch_size,
+            max_emails=settings.intake_max_per_pass,
+            commit_each=True,
         )
 
 

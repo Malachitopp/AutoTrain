@@ -18,6 +18,7 @@ from pydantic import (
     ConfigDict,
     Field,
     field_serializer,
+    field_validator,
     model_validator,
 )
 
@@ -239,6 +240,17 @@ class InboundEmailIn(BaseModel):
     # the provider; the shape is fixed now so the contract does not move.
     spf_pass: bool | None = None
     dkim_pass: bool | None = None
+
+    @field_validator("message_id", "sender", "recipient", "subject", "body")
+    @classmethod
+    def _drop_nul_bytes(cls, value: str) -> str:
+        """Postgres text columns cannot hold a NUL byte, and psycopg raises
+        rather than storing one. JSON permits \u0000 and a quoted-printable
+        body can decode =00 into a real one, so without this a single byte
+        in a forwarded email turns a route contracted to always answer 202
+        into a 500 — and the provider then retries it for ever. Mail text
+        loses nothing by dropping them."""
+        return value.replace("\x00", "")
 
 
 class IntakeReceipt(BaseModel):

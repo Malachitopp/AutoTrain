@@ -24,6 +24,7 @@ from autotrain.modules.journeys.models import (
     AssessableJourney,
     ClaimContext,
     InboundEmailRow,
+    InboundEmailSummary,
     JourneyRow,
     NotificationContext,
 )
@@ -105,10 +106,12 @@ _LIST_RECEIVED_EMAILS = (
     "ORDER BY received_at, id LIMIT %s"
 )
 
+# Six columns, not the row: the body and the reader's raw answer are not
+# shown to the user, and the body is the largest column in the schema
+# (models.InboundEmailSummary says why). inbound_emails_user_idx serves the
+# WHERE and the ORDER BY either way.
 _LIST_INBOUND_FOR_USER = (
-    "SELECT id, user_id, message_id, sender, recipient, subject, body, received_at, "
-    "status, status_reason, extraction, attempts, processed_at, created_at, updated_at, "
-    "spf_pass, dkim_pass, body_purged_at, forwarding "
+    "SELECT id, received_at, sender, subject, status, status_reason "
     "FROM inbound_emails WHERE user_id = %s ORDER BY received_at DESC, id LIMIT %s"
 )
 
@@ -130,15 +133,41 @@ _MARK_FAILED_IF_EXHAUSTED = (
     "WHERE id = %s AND status = 'received' AND attempts >= %s"
 )
 
-# The door's per-user count (intake.screen's daily cap): rows stored for the
-# user since an instant, whatever became of them, on inbound_emails_user_idx.
+# The door's per-user count (intake.screen's daily cap). Two things it must
+# not do:
+#
+# * count rows the door itself refused. Those cost no reader call, and
+#   counting them means a flood keeps the window shut long after it stops —
+#   the refusals hold the cap up by themselves, and the user never gets back
+#   in. Confirmation messages are excluded for the same reason: recognised,
+#   never read.
+# * scan the whole window. The count is the check that bounds a flood, so it
+#   must not itself grow with one; the inner LIMIT stops it at the cap, so
+#   the work is the same whether the user has 51 emails today or a million.
 _COUNT_RECEIVED_SINCE = (
-    "SELECT count(*) FROM inbound_emails WHERE user_id = %s AND received_at >= %s"
+    "SELECT count(*) FROM (SELECT 1 FROM inbound_emails "
+    "WHERE user_id = %s AND received_at >= %s AND status NOT IN ('rejected', 'confirmation') "
+    "LIMIT %s) AS capped"
 )
 
 # Retention (0015): blank the bodies of emails decided before an instant, a
 # batch at a time on inbound_emails_retention_idx. Nothing else on the row
 # changes; the structured reading stays.
+#
+# Its companion below covers the rows retention would otherwise never reach:
+# an email nobody ever read (no extractor configured, or one that stayed
+# broken) keeps status 'received' and a NULL processed_at for ever, so it is
+# outside the retention index and its body would be held indefinitely. Past
+# the window there is nothing useful left to read — the 28-day claim window
+# closed long before — so the row is retired and blanked in one statement.
+# The queue index (0013) serves the subquery.
+_RETIRE_STALE_RECEIVED = (
+    "UPDATE inbound_emails SET status = 'failed', status_reason = %s, "
+    "processed_at = now(), body = '', body_purged_at = now() "
+    "WHERE id IN (SELECT id FROM inbound_emails "
+    "WHERE status = 'received' AND received_at < %s ORDER BY received_at LIMIT %s)"
+)
+
 _PURGE_OLD_BODIES = (
     "UPDATE inbound_emails SET body = '', body_purged_at = now() "
     "WHERE id IN (SELECT id FROM inbound_emails "
@@ -392,8 +421,8 @@ def list_received_emails(
 
 def list_inbound_for_user(
     conn: psycopg.Connection, user_id: UUID, limit: int
-) -> list[InboundEmailRow]:
-    return db.fetch_all(conn, _LIST_INBOUND_FOR_USER, (user_id, limit), row_cls=InboundEmailRow)
+) -> list[InboundEmailSummary]:
+    return db.fetch_all(conn, _LIST_INBOUND_FOR_USER, (user_id, limit), row_cls=InboundEmailSummary)
 
 
 def bump_attempts(conn: psycopg.Connection, email_id: UUID) -> bool:
@@ -421,13 +450,24 @@ def mark_failed_if_exhausted(
     return db.execute(conn, _MARK_FAILED_IF_EXHAUSTED, (reason, email_id, max_attempts)) == 1
 
 
-def count_received_since(conn: psycopg.Connection, user_id: UUID, since: datetime) -> int:
-    return db.fetch_value(conn, _COUNT_RECEIVED_SINCE, (user_id, since))
+def count_received_since(conn: psycopg.Connection, user_id: UUID, since: datetime, cap: int) -> int:
+    """How many emails this user has had accepted since `since`, counted no
+    further than `cap` — the caller only needs to know whether the cap is
+    reached."""
+    return db.fetch_value(conn, _COUNT_RECEIVED_SINCE, (user_id, since, cap))
 
 
 def purge_old_bodies(conn: psycopg.Connection, before: datetime, limit: int) -> int:
     """How many bodies this call blanked."""
     return db.execute(conn, _PURGE_OLD_BODIES, (before, limit))
+
+
+def retire_stale_received(
+    conn: psycopg.Connection, before: datetime, limit: int, *, reason: str
+) -> int:
+    """Retire and blank emails that were never read and are now past the
+    window. How many."""
+    return db.execute(conn, _RETIRE_STALE_RECEIVED, (reason, before, limit))
 
 
 # --- Erasure ----------------------------------------------------------------

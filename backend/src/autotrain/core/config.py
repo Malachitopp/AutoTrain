@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     # Emails per scheduler pass. Small on purpose: one email is one model
     # call of a few seconds, and a pass should finish well inside the interval.
     intake_batch_size: int = Field(default=20, ge=1)
+    # The whole pass, not the page. One email is one model call of a few
+    # seconds, so an unbounded pass over a long backlog would run for hours
+    # and outlast the interval. The queue is durable: whatever is left waits
+    # for the next pass.
+    intake_max_per_pass: int = Field(default=200, ge=1)
     # The door's per-user cap (journeys.intake.screen): emails stored for one
     # user in a rolling 24 hours. Generous — a year of tickets forwarded in
     # one sitting is the honest case it must survive — and the excess is
