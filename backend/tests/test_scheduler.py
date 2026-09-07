@@ -24,7 +24,13 @@ import pytest
 from autotrain.core import db
 from autotrain.entrypoints import scheduler
 from autotrain.entrypoints.scheduler import _expire_once, _run_jobs_once, _uk_today
-from autotrain.modules.journeys.service import ExtractedLeg, ExtractedTicket
+from autotrain.modules.journeys.service import (
+    ExtractedLeg,
+    ExtractedTicket,
+    MailboxAttachment,
+    MailboxHeader,
+    MailboxMessage,
+)
 from conftest import TEST_DATABASE_URL
 from conftest import mk_user as _mk_user
 from conftest import scalar as _scalar
@@ -431,3 +437,111 @@ def test_run_jobs_once_skips_a_job_another_scheduler_is_running(
 
         _run_jobs_once(batch_size=50)
         assert _claim_state(setup, user_id)[0][journey] == "draft"
+
+
+# --- The mailbox job ----------------------------------------------------------
+
+
+class _FakeMailbox:
+    """A Mailbox that hands over one message and records that it was closed."""
+
+    def __init__(self, message: MailboxMessage) -> None:
+        self.message = message
+        self.closed = False
+
+    def __enter__(self) -> _FakeMailbox:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.closed = True
+
+    def list_recent(self, *, since: date, limit: int) -> list[MailboxHeader]:
+        return [MailboxHeader(uid=self.message.uid, message_id=self.message.message_id)]
+
+    def fetch(self, uid: str) -> MailboxMessage | None:
+        return self.message if uid == self.message.uid else None
+
+
+@pytest.mark.usefixtures("pool")
+def test_run_jobs_once_polls_a_mailbox_and_reads_it_in_the_same_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single-user door, end to end through the real scheduler pass.
+
+    Three things this proves that the poll's own tests cannot: the mailbox
+    owner's account is created on first sight of the address, so a fresh
+    database needs no sign-up step; the connection is closed when the pass
+    ends, because an IMAP connection held across a fifteen-minute interval
+    is one the server has usually dropped without saying so; and the poll
+    runs BEFORE the intake sweep in the job list, so mail that arrives is
+    read in the same pass rather than an interval later.
+    """
+    owner = "mailbox-owner@example.com"
+    today = _uk_today(datetime.now(tz=UTC))
+    settings = scheduler.get_settings().model_copy(update={"mailbox_owner_email": owner})
+    monkeypatch.setattr(scheduler, "get_settings", lambda: settings)
+    mailbox = _FakeMailbox(
+        MailboxMessage(
+            uid="5001",
+            message_id="<scheduler-mailbox-1@retailer.test>",
+            sender="noreply@retailer.test",
+            recipient=owner,
+            subject="Your booking confirmation",
+            body="London Paddington 08:14",
+            attachments=(
+                MailboxAttachment(
+                    filename="e-ticket.pdf",
+                    content_type="application/pdf",
+                    content=b"%PDF-1.4 ticket",
+                ),
+            ),
+        )
+    )
+
+    setup = psycopg.connect(TEST_DATABASE_URL, autocommit=True)
+    user_id = None
+    try:
+        _run_jobs_once(
+            batch_size=50,
+            extractor=_OneTicketReader(today - timedelta(days=2)),
+            open_mailbox=lambda: mailbox,
+        )
+
+        assert mailbox.closed
+        user_id = _scalar(setup.execute("SELECT id FROM users WHERE email = %s", (owner,)))
+        assert user_id is not None, "the poll must create the mailbox owner's account"
+        # Stored, read by the reader in the SAME pass, and its ticket kept.
+        status, email_id = setup.execute(
+            "SELECT status, id FROM inbound_emails WHERE message_id = %s",
+            (mailbox.message.message_id,),
+        ).fetchone() or (None, None)
+        assert status == "parsed"
+        assert (
+            _scalar(
+                setup.execute(
+                    "SELECT count(*) FROM inbound_email_attachments WHERE inbound_email_id = %s",
+                    (email_id,),
+                )
+            )
+            == 1
+        )
+    finally:
+        if user_id is not None:
+            setup.execute("DELETE FROM claims WHERE user_id = %s", (user_id,))
+            setup.execute("DELETE FROM journeys WHERE user_id = %s", (user_id,))
+            setup.execute("DELETE FROM tickets WHERE user_id = %s", (user_id,))
+            setup.execute("DELETE FROM inbound_emails WHERE user_id = %s", (user_id,))
+            setup.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        setup.close()
+
+
+def test_the_mailbox_opener_exists_only_when_one_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AUTOTRAIN_MAILBOX_SOURCE=none must not merely fail to poll — it must
+    leave the job out of the pass entirely, the same way the reader does.
+    An opener built from half a configuration would turn a missing setting
+    into a login attempt against a mail server every fifteen minutes."""
+    settings = scheduler.get_settings().model_copy(update={"mailbox_source": "none"})
+    monkeypatch.setattr(scheduler, "get_settings", lambda: settings)
+    assert scheduler._build_mailbox_opener() is None

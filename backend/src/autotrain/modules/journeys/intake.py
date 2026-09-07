@@ -40,6 +40,7 @@ from outside the module. Callers reach it through service.run_intake_sweep.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from email.utils import parseaddr
@@ -433,6 +434,129 @@ def forwarding_confirmation(
     return ForwardingConfirmation(
         code=code.group(1), requested_by=asked.group(1).lower() if asked else None
     )
+
+
+# --- Reading a mailbox directly -------------------------------------------
+# The door above describes email arriving by webhook: someone else's mail
+# system receives it and posts it to us. A mailbox source inverts that — we
+# open the inbox ourselves and read what is in it.
+#
+# That is a smaller thing in every direction. There is no public endpoint,
+# no shared secret, no forwarding address to leak, and no provider adapter
+# to keep in step with. It also fixes the one gap the webhook never could:
+# an inbox hands over the WHOLE message, so the e-ticket PDF arrives with
+# the words that describe it, and a claim can eventually be filed with the
+# proof every operator asks for.
+#
+# What it gives up is multi-tenancy. A mailbox belongs to one person, so a
+# poll is configured with whose mailbox it is; the webhook could serve
+# everybody from one address. That trade is the whole point of the shape.
+#
+# The protocol is deliberately two calls, not one. Listing headers is cheap
+# and bodies are not: a mailbox is polled every few minutes over a window of
+# days, so re-downloading every message each pass would move megabytes to
+# learn nothing. list_recent answers "what is in there", the caller drops
+# the message ids it has already stored, and only what is left is fetched.
+
+
+@dataclass(frozen=True)
+class MailboxAttachment:
+    """One file that arrived on an email, already decoded."""
+
+    filename: str
+    content_type: str
+    content: bytes
+
+
+@dataclass(frozen=True)
+class MailboxHeader:
+    """Enough of a message to decide whether it is worth fetching.
+
+    `uid` is whatever the mailbox uses to name a message when asked for it
+    again — opaque here, and never stored. `message_id` is the RFC 5322
+    header, which IS stored, and is what makes a re-poll idempotent.
+    """
+
+    uid: str
+    message_id: str
+
+
+@dataclass(frozen=True)
+class MailboxMessage:
+    """A whole message, decoded into the shape the door already screens."""
+
+    uid: str
+    message_id: str
+    sender: str
+    recipient: str
+    subject: str
+    body: str
+    attachments: tuple[MailboxAttachment, ...] = ()
+
+
+class Mailbox(Protocol):
+    """Anything that can list and fetch messages from one inbox.
+
+    Implemented outside the module (sources/imap_mailbox.py) and handed in
+    by the scheduler — the same seam as TicketExtractor and ArrivalsSource.
+    Both calls may raise; the poll isolates the failure and tries again next
+    interval. Both must bound their own time, because a poll is waiting.
+
+    Implementations MUST NOT modify the mailbox — no flags, no moves, no
+    deletes. Idempotency comes from message ids we have already stored, not
+    from marking mail as read, so this can safely be pointed at an inbox a
+    person is also using.
+    """
+
+    def list_recent(self, *, since: date, limit: int) -> list[MailboxHeader]: ...
+
+    def fetch(self, uid: str) -> MailboxMessage | None: ...
+
+
+# What is worth keeping off an email. Everything else — the operator's logo,
+# the tracking pixel, the calendar invite — is dropped unread.
+_KEEPABLE_TYPES = frozenset(
+    {
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/heic",
+        # Apple Wallet passes: several retailers deliver the barcode this way
+        # and nothing else in the email carries it.
+        "application/vnd.apple.pkpass",
+    }
+)
+# One file this big is already far larger than any e-ticket; past it the
+# email is carrying something that is not a ticket, and the bytes would sit
+# in a row for ever.
+MAX_ATTACHMENT_BYTES = 5_000_000
+# ...and this many per email. Both caps are enforced by dropping the excess,
+# never by refusing the email: the words are what the reader needs, and an
+# email that arrived with one huge PDF must still become a journey.
+MAX_ATTACHMENTS_PER_EMAIL = 5
+
+
+def keepable_attachments(
+    attachments: Sequence[MailboxAttachment],
+) -> tuple[MailboxAttachment, ...]:
+    """The attachments worth storing, in arrival order, capped.
+
+    Pure, so the caps are testable without a mailbox. Type is judged by what
+    the sender DECLARED, which is unverifiable — that is fine, because
+    nothing here opens the file. It decides only what occupies a row.
+    """
+    kept: list[MailboxAttachment] = []
+    for attachment in attachments:
+        if len(kept) >= MAX_ATTACHMENTS_PER_EMAIL:
+            break
+        if attachment.content_type.lower() not in _KEEPABLE_TYPES:
+            continue
+        if not attachment.content or len(attachment.content) > MAX_ATTACHMENT_BYTES:
+            continue
+        kept.append(attachment)
+    return tuple(kept)
 
 
 # --- What the reader is given ---------------------------------------------------

@@ -126,3 +126,47 @@ def test_the_per_inbox_cap_must_sit_under_the_daily_one() -> None:
         _Settings(database_url=_DB, login_requests_per_email_per_day=80, login_requests_per_day=80)
     assert "PER_EMAIL_PER_DAY" in str(excinfo.value)
     _Settings(database_url=_DB, login_requests_per_email_per_day=5, login_requests_per_day=80)
+
+
+def test_a_mailbox_needs_a_server_a_login_and_an_owner() -> None:
+    """The fourth of the same rule (HSP, Claude, Resend, and now this): a
+    source selected without what it needs is an invalid deployment, refused
+    at boot in every process, with everything missing named at once.
+
+    The owner address is the one that is easy to miss and the one that
+    matters most. Nothing in a mailbox says whose it is, and a journey
+    belonging to nobody is a journey no claim can ever be filed for — so
+    the poll is not allowed to start guessing.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        _Settings(database_url=_DB, mailbox_source="imap")
+    message = str(excinfo.value)
+    assert "IMAP_HOST" in message
+    assert "IMAP_USERNAME" in message
+    assert "IMAP_PASSWORD" in message
+    assert "MAILBOX_OWNER_EMAIL" in message
+
+    # Blank counts as absent, as everywhere else: an interpolated-but-unset
+    # env var arrives as '' and would otherwise sail past an `is None` check
+    # and try to log in to a mail server with an empty password.
+    with pytest.raises(ValidationError):
+        _Settings(
+            database_url=_DB,
+            mailbox_source="imap",
+            imap_host="imap.gmail.com",
+            imap_username="you@example.com",
+            imap_password=SecretStr("   "),
+            mailbox_owner_email="you@example.com",
+        )
+
+    settings = _Settings(
+        database_url=_DB,
+        mailbox_source="imap",
+        imap_host="imap.gmail.com",
+        imap_username="you@example.com",
+        imap_password=SecretStr("app-password"),
+        mailbox_owner_email="you@example.com",
+    )
+    # The default folder reads everything; a Gmail label is how it narrows.
+    assert settings.imap_folder == "INBOX"
+    assert settings.imap_port == 993

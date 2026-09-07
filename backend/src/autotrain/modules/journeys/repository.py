@@ -92,6 +92,35 @@ _INSERT_INBOUND_EMAIL = (
     "spf_pass, dkim_pass, body_purged_at, forwarding"
 )
 
+# Which of these message ids are already stored. The mailbox poll asks this
+# before downloading anything: the unique index on message_id would refuse a
+# re-store anyway, but only after the whole body had crossed the network,
+# and a mailbox is re-listed every interval over a window of days. The
+# array_agg keeps it one scalar round trip.
+_KNOWN_MESSAGE_IDS = (
+    "SELECT coalesce(array_agg(message_id), '{}') FROM inbound_emails "
+    "WHERE message_id = ANY(%s::text[])"
+)
+
+# Attachments (0020). size_bytes is written from the same bytes that go into
+# content, so the two can never disagree.
+_INSERT_ATTACHMENT = (
+    "INSERT INTO inbound_email_attachments "
+    "(inbound_email_id, filename, content_type, content, size_bytes) "
+    "VALUES (%s, %s, %s, %s, %s)"
+)
+
+# Retention's companion (0020). Bodies are blanked in place rather than
+# deleted, so the files beside them have to be removed at the same moment or
+# they outlive the words that explain what they are. Batched on the same
+# principle as the body purge, and idempotent: a second pass finds nothing.
+_PURGE_PURGED_ATTACHMENTS = (
+    "DELETE FROM inbound_email_attachments WHERE id IN ("
+    "SELECT a.id FROM inbound_email_attachments a "
+    "JOIN inbound_emails e ON e.id = a.inbound_email_id "
+    "WHERE e.body_purged_at IS NOT NULL LIMIT %s)"
+)
+
 # The intake sweep's page: oldest unread first (inbound_emails_queue_idx).
 # The caller passes the ids it has given up on for this sweep, so a raising
 # email does not head every page until the sweep ends. Every 'received' row
@@ -411,6 +440,28 @@ def insert_inbound_email(
     )
 
 
+def known_message_ids(conn: psycopg.Connection, message_ids: Sequence[str]) -> set[str]:
+    """Which of `message_ids` are already stored. Empty input asks nothing."""
+    if not message_ids:
+        return set()
+    return set(db.fetch_value(conn, _KNOWN_MESSAGE_IDS, (list(message_ids),)))
+
+
+def insert_attachment(
+    conn: psycopg.Connection,
+    inbound_email_id: UUID,
+    *,
+    filename: str,
+    content_type: str,
+    content: bytes,
+) -> None:
+    db.execute(
+        conn,
+        _INSERT_ATTACHMENT,
+        (inbound_email_id, filename, content_type, content, len(content)),
+    )
+
+
 def list_received_emails(
     conn: psycopg.Connection, limit: int, *, excluding: Sequence[UUID] = ()
 ) -> list[InboundEmailRow]:
@@ -460,6 +511,12 @@ def count_received_since(conn: psycopg.Connection, user_id: UUID, since: datetim
 def purge_old_bodies(conn: psycopg.Connection, before: datetime, limit: int) -> int:
     """How many bodies this call blanked."""
     return db.execute(conn, _PURGE_OLD_BODIES, (before, limit))
+
+
+def purge_attachments_of_purged_bodies(conn: psycopg.Connection, limit: int) -> int:
+    """Delete attachments whose email body has already been blanked. How
+    many."""
+    return db.execute(conn, _PURGE_PURGED_ATTACHMENTS, (limit,))
 
 
 def retire_stale_received(

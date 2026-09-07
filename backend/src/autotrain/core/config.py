@@ -178,6 +178,44 @@ class Settings(BaseSettings):
     # retention job blanks it: the 28-day claim window, doubled for slack.
     intake_body_retention_days: int = Field(default=60, ge=1)
 
+    # Mailbox intake — the other door onto the same queue
+    # (sources/imap_mailbox.py). The webhook above waits for a mail provider
+    # to post messages to us and serves everybody from one address; this
+    # opens ONE person's inbox and reads it. That makes it single-user by
+    # construction, which is why it needs to be told whose mailbox it is —
+    # and it is the only door an attachment can come through, so it is where
+    # the e-ticket a claim has to be filed with actually arrives.
+    #
+    # 'none' (default) skips the scheduler's poll job entirely.
+    mailbox_source: Literal["none", "imap"] = "none"
+    imap_host: str | None = None
+    imap_port: int = Field(default=993, ge=1, le=65535)
+    imap_username: str | None = None
+    # A mailbox password — for a Gmail account this must be an App Password,
+    # not the account password, and Google will not issue one without
+    # two-factor turned on. SecretStr: a logged Settings shows '**********'.
+    # Whoever holds it can read every email the account has.
+    imap_password: SecretStr | None = None
+    # Which folder to read. A Gmail label IS a folder over IMAP, so a filter
+    # that labels booking confirmations is how the mailbox is narrowed to
+    # tickets; the default reads everything that arrives.
+    imap_folder: str = "INBOX"
+    # Whose mailbox it is: the account every message read from it is filed
+    # under, created on the first poll if it does not exist yet. Required
+    # with mailbox_source=imap, because nothing in a mailbox says who owns
+    # it and a journey with no user belongs to nobody.
+    mailbox_owner_email: str | None = None
+    # How far back each poll looks. This, not the count below, is the real
+    # bound on what can ever be imported: a message older than the window is
+    # never offered again. It needs to cover the longest gap a stopped
+    # poller could leave and no more — re-listing a fortnight costs a few
+    # hundred bytes a message, since bodies are only fetched for message ids
+    # that are not already stored.
+    mailbox_lookback_days: int = Field(default=14, ge=1)
+    # Messages examined per poll, newest first. A ceiling on one pass, not on
+    # the mailbox: whatever is left is listed again next interval.
+    mailbox_max_per_poll: int = Field(default=200, ge=1)
+
     # Only read by the integration test suite, which drops and recreates it.
     test_database_url: str | None = None
 
@@ -233,6 +271,29 @@ class Settings(BaseSettings):
             ]
             if missing:
                 raise ValueError("AUTOTRAIN_EMAIL_SENDER=resend requires " + " and ".join(missing))
+        return self
+
+    @model_validator(mode="after")
+    def _mailbox_requires_credentials(self) -> Settings:
+        """Same shape as the HSP, Claude and Resend rules: a source selected
+        without what it needs is an invalid deployment, refused at boot in
+        every process. All four fields are listed at once so a deployment is
+        fixed in one round. Blank counts as absent, as everywhere else."""
+        if self.mailbox_source != "imap":
+            return self
+        password = self.imap_password.get_secret_value() if self.imap_password else ""
+        missing = [
+            name
+            for name, value in (
+                ("AUTOTRAIN_IMAP_HOST", self.imap_host or ""),
+                ("AUTOTRAIN_IMAP_USERNAME", self.imap_username or ""),
+                ("AUTOTRAIN_IMAP_PASSWORD", password),
+                ("AUTOTRAIN_MAILBOX_OWNER_EMAIL", self.mailbox_owner_email or ""),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            raise ValueError("AUTOTRAIN_MAILBOX_SOURCE=imap requires " + " and ".join(missing))
         return self
 
     @model_validator(mode="after")

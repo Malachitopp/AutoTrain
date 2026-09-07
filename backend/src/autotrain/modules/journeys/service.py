@@ -37,7 +37,15 @@ from autotrain.modules.journeys import repository as _repository
 # Re-exported deliberately: the reader's protocol and its answer shape, so the
 # scheduler and the reader implementation import them from here and stay off
 # journeys.intake (the journeys-privacy contract).
-from autotrain.modules.journeys.intake import ExtractedLeg, ExtractedTicket, TicketExtractor
+from autotrain.modules.journeys.intake import (
+    ExtractedLeg,
+    ExtractedTicket,
+    Mailbox,
+    MailboxAttachment,
+    MailboxHeader,
+    MailboxMessage,
+    TicketExtractor,
+)
 
 # AssessableJourney, ClaimContext and NotificationContext are re-exported
 # deliberately: they are the shapes this service hands the delay engine, the
@@ -65,6 +73,11 @@ __all__ = [
     "InvalidJourney",
     "JourneyRow",
     "JourneysError",
+    "Mailbox",
+    "MailboxAttachment",
+    "MailboxHeader",
+    "MailboxMessage",
+    "MailboxStats",
     "NotificationContext",
     "TicketExtractor",
     "UnknownUser",
@@ -81,6 +94,7 @@ __all__ = [
     "notification_contexts",
     "receive_ticket_email",
     "run_intake_sweep",
+    "run_mailbox_poll",
     "run_retention_sweep",
 ]
 
@@ -343,6 +357,7 @@ def receive_ticket_email(
     body: str,
     spf_pass: bool | None = None,
     dkim_pass: bool | None = None,
+    attachments: Sequence[MailboxAttachment] = (),
     daily_cap: int = 50,
 ) -> InboundEmailRow | None:
     """Store one forwarded email: for the intake sweep to read, or as
@@ -358,6 +373,13 @@ def receive_ticket_email(
     the daily cap) is stored under its user without its body — the sender
     and subject stay, so they can see what was dropped and why — and never
     reaches the reader.
+
+    `attachments` are kept only for an email that reaches the reader's
+    queue — a refused one has its body dropped, and its files belong with
+    it. Every operator's Delay Repay form wants a picture of the ticket, so
+    this is where the proof of a claim starts existing. The webhook passes
+    none: a provider posting JSON has nowhere to put a PDF, which is one of
+    the reasons a mailbox is the better door.
 
     Gmail's forwarding-setup message is recognised and filed as
     'confirmation' with its code in the reason, never handed to the reader:
@@ -417,7 +439,160 @@ def receive_ticket_email(
             ),
             processed_at=now,
         )
-    return store(body=body, status="received", status_reason=None, processed_at=None)
+    row = store(body=body, status="received", status_reason=None, processed_at=None)
+    if row is not None:
+        _store_attachments(conn, row.id, attachments)
+    return row
+
+
+def _store_attachments(
+    conn: psycopg.Connection, email_id: UUID, attachments: Sequence[MailboxAttachment]
+) -> int:
+    """Keep the files worth keeping off one email; how many were kept.
+
+    The caps live in intake.keepable_attachments, and the excess is dropped
+    silently on purpose: the words are what the reader needs, so an email
+    that arrived with a 40 MB video must still become a journey.
+    """
+    kept = _intake.keepable_attachments(attachments)
+    for attachment in kept:
+        _repository.insert_attachment(
+            conn,
+            email_id,
+            filename=attachment.filename,
+            content_type=attachment.content_type.lower(),
+            content=attachment.content,
+        )
+    return len(kept)
+
+
+@dataclass
+class MailboxStats:
+    """One mailbox poll's outcome, for the scheduler's log line."""
+
+    listed: int = 0  # messages the mailbox offered inside the window
+    fresh: int = 0  # of those, ones we had not stored before
+    stored: int = 0  # queued for the reader
+    refused: int = 0  # stored, but the door said no (see status_reason)
+    files: int = 0  # attachments kept across every stored email
+    vanished: int = 0  # listed, then gone before it could be fetched
+    duplicate: int = 0  # another writer stored it between the two steps
+    errors: int = 0  # the mailbox raised on this one; retried next pass
+
+
+def run_mailbox_poll(
+    conn: psycopg.Connection,
+    mailbox: Mailbox,
+    *,
+    user_id: UUID,
+    account_email: str,
+    lookback_days: int = 14,
+    limit: int = 200,
+    daily_cap: int = 50,
+    commit_each: bool = False,
+) -> MailboxStats:
+    """Read one person's inbox into the intake queue.
+
+    The webhook's counterpart (receive_ticket_email is still the writer both
+    share): instead of a mail provider posting each message to us, we open
+    the mailbox and take what is in it. That makes this a SINGLE-USER path —
+    a mailbox belongs to one person, so whose it is has to be passed in.
+
+    Idempotency is the stored message_id, not anything done to the mailbox.
+    Implementations are forbidden from marking mail read or moving it
+    (intake.Mailbox), so this can be pointed at an inbox a person is also
+    reading, and a poll that crashes half way repeats harmlessly. The cost
+    of that choice is re-listing the same window every pass, which is why
+    the listing is headers only: `known_message_ids` drops what we already
+    have, and a body crosses the network at most once.
+
+    `lookback_days` is therefore the real bound on work, not `limit`: a
+    message older than the window is never offered again, so anything that
+    has to be re-imported must be moved back into the window by hand. It
+    only needs to cover the gap a stopped poller could leave.
+
+    Failures are isolated per message: one that raises is logged and left
+    for the next pass, and the rest of the batch still lands. A message
+    listed and then deleted before it could be fetched is counted, not an
+    error — a person tidying their inbox mid-poll is normal.
+    """
+    stats = MailboxStats()
+    since = (datetime.now(UTC) - timedelta(days=lookback_days)).date()
+    headers = mailbox.list_recent(since=since, limit=limit)
+    stats.listed = len(headers)
+
+    # Two messages can carry one Message-ID (a copy filed in another folder,
+    # a client that reuses one). Keeping the first occurrence means the
+    # second is not fetched only to be refused by the unique index.
+    by_id: dict[str, _intake.MailboxHeader] = {}
+    for header in headers:
+        by_id.setdefault(header.message_id, header)
+    known = _repository.known_message_ids(conn, list(by_id))
+    fresh = [header for message_id, header in by_id.items() if message_id not in known]
+    stats.fresh = len(fresh)
+
+    for header in fresh:
+        try:
+            with conn.transaction():
+                _poll_one(
+                    conn,
+                    mailbox,
+                    header,
+                    user_id=user_id,
+                    account_email=account_email,
+                    daily_cap=daily_cap,
+                    stats=stats,
+                )
+        except Exception:
+            # Broad on purpose: a mailbox is a network client, and its
+            # exception types are contractually invisible here (the module
+            # never imports sources/). The savepoint has already rolled this
+            # message back; the next pass lists it again.
+            logger.exception("mailbox poll: message %s failed; continuing", header.message_id)
+            stats.errors += 1
+            continue
+        if commit_each:
+            conn.commit()
+    return stats
+
+
+def _poll_one(
+    conn: psycopg.Connection,
+    mailbox: Mailbox,
+    header: _intake.MailboxHeader,
+    *,
+    user_id: UUID,
+    account_email: str,
+    daily_cap: int,
+    stats: MailboxStats,
+) -> None:
+    message = mailbox.fetch(header.uid)
+    if message is None:
+        stats.vanished += 1
+        return
+    row = receive_ticket_email(
+        conn,
+        user_id=user_id,
+        account_email=account_email,
+        message_id=message.message_id,
+        sender=message.sender,
+        recipient=message.recipient,
+        subject=message.subject,
+        body=message.body,
+        attachments=message.attachments,
+        daily_cap=daily_cap,
+    )
+    if row is None:
+        # Stored between the listing and now — another poller, or the same
+        # message under a second header we did not collapse.
+        stats.duplicate += 1
+    elif row.status == "received":
+        stats.stored += 1
+        # The same pure filter receive_ticket_email stored through, so
+        # this counts what is on the row without a second query.
+        stats.files += len(_intake.keepable_attachments(message.attachments))
+    else:
+        stats.refused += 1
 
 
 def list_inbound_emails(
@@ -682,6 +857,9 @@ def run_retention_sweep(
     exists to keep. Past the window there is nothing left worth reading
     anyway, the claim window having closed weeks earlier, so those rows are
     retired and blanked together.
+
+    Attachments (0020) go with the body, in a third pass. The count returned
+    is bodies only; the files are logged.
     """
     before = datetime.now(UTC) - timedelta(days=keep_days)
     stale = f"never read within {keep_days} days; the claim window had already closed"
@@ -698,7 +876,34 @@ def run_retention_sweep(
                 conn.commit()
             if batch < batch_size:
                 break
+    _purge_orphaned_attachments(conn, batch_size, commit_each=commit_each)
     return done
+
+
+def _purge_orphaned_attachments(
+    conn: psycopg.Connection, batch_size: int, *, commit_each: bool
+) -> int:
+    """Delete the files hanging off emails whose bodies have been blanked.
+
+    Runs after both body passes so it also covers what this very sweep just
+    blanked. Keyed on body_purged_at rather than a date of its own, so the
+    files can never outlive the words that say what they are, whatever the
+    retention setting is changed to later. Counted separately from the
+    bodies and logged, not returned: 'retention blanked 12' meaning some
+    mixture of rows and files would be a number nobody could act on.
+    """
+    deleted = 0
+    while True:
+        with conn.transaction():
+            batch = _repository.purge_attachments_of_purged_bodies(conn, batch_size)
+        deleted += batch
+        if commit_each:
+            conn.commit()
+        if batch < batch_size:
+            break
+    if deleted:
+        logger.info("intake retention deleted %d attachments of blanked emails", deleted)
+    return deleted
 
 
 # --- Erasure ----------------------------------------------------------------

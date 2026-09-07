@@ -59,6 +59,8 @@ __all__ = [
     "PushTarget",
     "SessionClaims",
     "UserProfile",
+    "account_email",
+    "ensure_account",
     "erase_user",
     "forwarding_address",
     "forwarding_code",
@@ -316,6 +318,25 @@ def verify_login(conn: psycopg.Connection, token: str) -> UUID | None:
     email = _repository.spend_login_token(conn, token_hash)
     if email is None:
         return None
+    return ensure_account(conn, email)
+
+
+def ensure_account(conn: psycopg.Connection, email: str) -> UUID:
+    """The account for this address, created if there is not one yet.
+
+    First sight of an address IS the sign-up — there is no separate
+    registration step anywhere in this system, because a magic link proves
+    the same thing a sign-up form would and asks for less. verify_login is
+    one caller; a mailbox poll is the other, and it has the same problem:
+    it holds an address and needs the account behind it.
+
+    Not race-guarded, deliberately. Both callers are already serialised by
+    something stronger than a lock — a login token can be spent exactly
+    once, and the poll runs under the scheduler's advisory job lock — so a
+    unique-violation retry here would be code that could never run. If a
+    third caller ever appears without that property, this is where the
+    retry goes.
+    """
     user_id = _repository.user_id_by_email(conn, email)
     if user_id is None:
         user_id = _repository.create_user(conn, email)
@@ -364,6 +385,18 @@ def user_profile(conn: psycopg.Connection, user_id: UUID) -> UserProfile | None:
     """The signed-in user's profile — None if the account is unknown or was
     erased after the session was issued."""
     return _repository.user_profile(conn, user_id)
+
+
+def account_email(conn: psycopg.Connection, user_id: UUID) -> str | None:
+    """The address a live account can be reached at, or None once it is
+    erased or was never there.
+
+    Distinct from user_profile in what it is FOR: a caller that wants to
+    send a person something needs one string, and asking for the whole
+    profile to reach it would copy the rest of their record through a worker
+    that has no use for it.
+    """
+    return _repository.user_email(conn, user_id)
 
 
 def user_is_live(conn: psycopg.Connection, user_id: UUID) -> bool:

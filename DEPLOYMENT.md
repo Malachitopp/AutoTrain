@@ -76,7 +76,32 @@ this has already happened once in development
 pending). Run `autotrain-migrate up` to completion as a release step, before
 any new task accepts a request.
 
-## 5. Settings that must change from their defaults
+## 5. The mailbox password is a mailbox password
+
+**Required if `AUTOTRAIN_MAILBOX_SOURCE=imap`.**
+
+`AUTOTRAIN_IMAP_PASSWORD` grants read access to every email in the account,
+not just the ticket ones. It sits at the same level as the JWT secret: never
+committed, never in a shell history, and set only where the scheduler runs.
+
+For Gmail it must be an **App Password**, not the account password — Google
+refuses the account password over IMAP, and will only issue an App Password
+once two-factor is on (<https://myaccount.google.com/apppasswords>). Revoking
+one is a single click there, which is the reason to prefer it beyond the fact
+that nothing else works.
+
+Narrow what it can see anyway. A Gmail filter that labels booking
+confirmations, with `AUTOTRAIN_IMAP_FOLDER` pointing at that label, means the
+poll never lists anything else. IMAP has no per-folder credential, so this is
+a limit on what is read, not on what could be — but it is the difference
+between a bug touching your tickets and a bug touching your bank mail.
+
+The mailbox is opened read-only (`EXAMINE`) and every fetch uses `BODY.PEEK`,
+so nothing is marked read, moved or deleted. That is enforced in
+`sources/imap_mailbox.py` and asserted in its tests; it is listed here because
+it is the promise that makes pointing this at a personal inbox reasonable.
+
+## 6. Settings that must change from their defaults
 
 `AUTOTRAIN_ENVIRONMENT=production` refuses to boot while several development
 settings remain (`core/config.py`, `_production_lockdown`), which covers the
@@ -87,3 +112,10 @@ JWT secret, the cookie's Secure flag, non-https origins, and a `log` or
 * `AUTOTRAIN_INTAKE_SECRET` matching whatever posts to `/intake/email`
 * `AUTOTRAIN_ANTHROPIC_API_KEY` if `AUTOTRAIN_TICKET_EXTRACTOR=claude`
 * `AUTOTRAIN_HSP_EMAIL` / `AUTOTRAIN_HSP_PASSWORD` if the ingestor is running
+* the four `AUTOTRAIN_IMAP_*` / `AUTOTRAIN_MAILBOX_OWNER_EMAIL` settings if
+  the mailbox poll is running (Settings refuses to boot without all four)
+* at least one delivery channel for the worker: `AUTOTRAIN_PUSH_SENDER`,
+  `AUTOTRAIN_EMAIL_SENDER`, or both. With neither it refuses to start, which
+  is deliberate — the sweep stamps every detection it examines, so a worker
+  with nowhere to deliver would silently mark a month of real money as
+  told-about

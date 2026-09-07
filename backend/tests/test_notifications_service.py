@@ -339,3 +339,71 @@ def test_sweep_pages_through_more_than_one_batch(conn: psycopg.Connection) -> No
 
     assert (stats.examined, stats.notified) == (3, 3)
     assert len(sender.sent) == 3
+
+
+# --- The email channel -------------------------------------------------------
+
+
+class _RecordingEmailSender:
+    """EmailSender double that remembers every message."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str, str]] = []
+
+    def send_email(self, *, to: str, subject: str, body: str) -> None:
+        self.sent.append((to, subject, body))
+
+
+def test_the_channel_is_the_device_if_there_is_one_else_the_account_email(
+    conn: psycopg.Connection,
+) -> None:
+    """Three branches of one rule, so they are asserted against each other
+    rather than in three tests that could each pass while the choice between
+    them was wrong.
+
+    A registered device is a person who installed something and asked to be
+    interrupted, so it wins whenever it exists. Failing that the account's
+    own address is the channel — the only one a deployment with no mobile
+    app has. Failing both, the detection is still stamped, because tokens
+    arrive when an app is installed and week-old news must not greet the
+    install as a storm.
+    """
+    push = _RecordingSender()
+
+    # 1. No device: the email carries it, and carries what a push cannot.
+    inbox_only = _mk_user(conn, "inbox-only@example.com")
+    emailed = _mk_detection(conn, _mk_journey(conn, inbox_only))
+    email = _RecordingEmailSender()
+    stats = run_notification_sweep(
+        conn, push, email_sender=email, app_base_url="https://autotrain.test"
+    )
+    assert (stats.emails, stats.pushes, stats.no_target) == (1, 0, 0)
+    assert stats.notified == 1
+    assert _notified_at(conn, emailed) is not None
+    to, subject, body = email.sent[0]
+    assert to == "inbox-only@example.com"
+    # The money and the train, in that order: a subject line is read from
+    # the left and truncated from the right.
+    assert subject == "You're owed £6.40 for your 08:14 to EUS"
+    # An email is read later, so it spells out what "your 08:14" was.
+    assert "MAN to EUS" in body
+    assert "15 June 2026" in body
+    assert "https://autotrain.test" in body
+
+    # 2. A device: it wins, and no email goes out.
+    with_device = _mk_user(conn, "has-device@example.com")
+    _mk_device(conn, with_device, token="tok-phone")
+    pushed = _mk_detection(conn, _mk_journey(conn, with_device))
+    email = _RecordingEmailSender()
+    stats = run_notification_sweep(conn, push, email_sender=email)
+    assert (stats.pushes, stats.emails) == (1, 0)
+    assert email.sent == []
+    assert push.sent[0][0] == "tok-phone"
+    assert _notified_at(conn, pushed) is not None
+
+    # 3. Neither channel: stamped anyway, and counted honestly.
+    nowhere = _mk_user(conn, "nowhere@example.com")
+    stranded = _mk_detection(conn, _mk_journey(conn, nowhere))
+    stats = run_notification_sweep(conn)
+    assert (stats.no_target, stats.notified) == (1, 0)
+    assert _notified_at(conn, stranded) is not None

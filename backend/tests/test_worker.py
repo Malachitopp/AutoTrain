@@ -23,6 +23,7 @@ from autotrain.core.config import get_settings
 from autotrain.entrypoints import worker
 from autotrain.modules.delays import service as delays
 from autotrain.modules.notifications import service as notifications
+from autotrain.sources.email import LogEmailSender
 from autotrain.sources.push import LogPushSender
 from conftest import TEST_DATABASE_URL
 from conftest import mk_user as _mk_user
@@ -81,17 +82,28 @@ def _committed_world() -> Iterator[tuple[psycopg.Connection, UUID, UUID]]:
 # --- Sender selection ---------------------------------------------------------
 
 
-def test_build_sender_refuses_to_run_without_one() -> None:
-    """A worker that stamps detections while delivering nothing would be
-    worse than no worker: the refusal is the safety feature."""
-    settings = get_settings().model_copy(update={"push_sender": "none"})
+def test_channel_selection() -> None:
+    """Either transport alone runs the worker; neither refuses to start.
+
+    The refusal is the safety feature, not pedantry: the sweep stamps every
+    detection it examines, so a worker with nowhere to deliver would mark a
+    month of real money as told-about and never say so.
+    """
+    none = {"push_sender": "none", "email_sender": "none"}
     with pytest.raises(SystemExit):
-        worker._build_sender(settings)
+        worker._build_channels(get_settings().model_copy(update=none))
 
+    push, email = worker._build_channels(
+        get_settings().model_copy(update={**none, "push_sender": "log"})
+    )
+    assert isinstance(push, LogPushSender)
+    assert email is None
 
-def test_build_sender_log() -> None:
-    settings = get_settings().model_copy(update={"push_sender": "log"})
-    assert isinstance(worker._build_sender(settings), LogPushSender)
+    push, email = worker._build_channels(
+        get_settings().model_copy(update={**none, "email_sender": "log"})
+    )
+    assert push is None
+    assert isinstance(email, LogEmailSender)
 
 
 # --- Two workers, one queue ---------------------------------------------------
