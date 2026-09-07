@@ -94,6 +94,17 @@ _GET_BY_ID = (
 
 # Ownership lives in the WHERE clause, as in journeys: a claim belonging to
 # someone else is indistinguishable from one that does not exist.
+# claims.detection_id is UNIQUE (0006), so this answers "has the claim for
+# this detection been opened yet" with an index lookup and no ambiguity. The
+# notification sweep asks it: the email it sends carries the claim's filing
+# link, so it has to know whether there is one.
+_GET_BY_DETECTION = (
+    "SELECT id, journey_id, detection_id, operator_id, user_id, amount_pence, status, "
+    "submission_token, file_by, submitted_at, resolved_at, operator_reference, "
+    "created_at, updated_at "
+    "FROM claims WHERE detection_id = %s"
+)
+
 _GET_FOR_USER = (
     "SELECT id, journey_id, detection_id, operator_id, user_id, amount_pence, status, "
     "submission_token, file_by, submitted_at, resolved_at, operator_reference, "
@@ -201,6 +212,10 @@ def transition(
 
 def get_by_id(conn: psycopg.Connection, claim_id: UUID) -> ClaimRow | None:
     return db.fetch_one(conn, _GET_BY_ID, (claim_id,), row_cls=ClaimRow)
+
+
+def get_by_detection(conn: psycopg.Connection, detection_id: UUID) -> ClaimRow | None:
+    return db.fetch_one(conn, _GET_BY_DETECTION, (detection_id,), row_cls=ClaimRow)
 
 
 def get_for_user(conn: psycopg.Connection, claim_id: UUID, user_id: UUID) -> ClaimRow | None:

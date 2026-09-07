@@ -85,6 +85,7 @@ __all__ = [
     "SupportedOperator",
     "UnclaimedDetection",
     "UnknownClaim",
+    "claim_for_detection",
     "claim_history",
     "claims_total",
     "expire_overdue",
@@ -481,6 +482,19 @@ def file_claim(
 
 
 # --- Read paths -------------------------------------------------------------
+
+
+def claim_for_detection(conn: psycopg.Connection, detection_id: UUID) -> ClaimRow | None:
+    """The claim opened for this delay detection, or None if the sweep has
+    not opened one yet (or never will — an operator we cannot file with).
+
+    Keyed on the detection rather than the journey because that is the
+    UNIQUE column: one detection has at most one claim, so there is no
+    "which claim did you mean". The notification sweep is the caller — the
+    email it sends carries the claim's filing link, and it needs to know
+    whether there is one to carry.
+    """
+    return _repository.get_by_detection(conn, detection_id)
 
 
 def get_claim(conn: psycopg.Connection, claim_id: UUID, user_id: UUID) -> ClaimRow | None:

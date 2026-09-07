@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 
 # Private aliases for the same reason as in the other module services.
+from autotrain.modules.claims import service as _claims
 from autotrain.modules.delays import service as _delays
 
 # Re-exported: the queue row this sweep consumes, so a caller (or test fake)
@@ -259,7 +260,12 @@ def _notify_one(
             email_sender.send_email(
                 to=address,
                 subject=_email_subject(context, detection),
-                body=_email_body(context, detection, app_base_url=app_base_url),
+                body=_email_body(
+                    context,
+                    detection,
+                    claim_url=_hand_over_the_claim(conn, detection.id, context.user_id),
+                    app_base_url=app_base_url,
+                ),
             )
             stats.emails += 1
             delivered += 1
@@ -274,6 +280,39 @@ def _notify_one(
         # the claim sweep's no_operator rows.
         stats.no_target += 1
     _delays.mark_notified(conn, detection.id)
+
+
+def _hand_over_the_claim(conn: psycopg.Connection, detection_id: UUID, user_id: UUID) -> str | None:
+    """The operator's filing page for this detection, or None if there is
+    not one to give.
+
+    Sending the link IS the handover, so the claim moves draft -> needs_user
+    here rather than when a button is pressed later: claims.file_claim's own
+    words for that status are "the user holds the link now", and from this
+    moment they do. That transition is not bookkeeping — it is what stops
+    the deadline sweep expiring a claim the person has gone and filed, and
+    what stops the dashboard offering it again as though nothing had
+    happened.
+
+    None is the ordinary answer in three cases, and none of them should cost
+    the person their email: the claim sweep has not opened one yet, the
+    operator has no working deep link, or the claim has already moved past
+    filing. The message then reads as it did before, pointing at the
+    dashboard.
+
+    Its own savepoint, so a refusal cannot poison the transaction carrying
+    the send and the notified_at stamp.
+    """
+    claim = _claims.claim_for_detection(conn, detection_id)
+    if claim is None:
+        return None
+    try:
+        with conn.transaction():
+            filing = _claims.file_claim(conn, claim.id, user_id)
+    except _claims.ClaimsError as exc:
+        logger.info("claim %s has no link to send: %s", claim.id, exc)
+        return None
+    return filing.url if filing is not None else None
 
 
 def _body(context: NotificationContext, detection: PendingNotification) -> str:
@@ -300,6 +339,7 @@ def _email_body(
     context: NotificationContext,
     detection: PendingNotification,
     *,
+    claim_url: str | None,
     app_base_url: str | None,
 ) -> str:
     """The same news as the push, with the detail an email has room for.
@@ -318,11 +358,24 @@ def _email_body(
         f"Date      {departure.strftime('%A %d %B %Y')}",
         f"Departed  {departure.strftime('%H:%M')}",
         "",
-        "AutoTrain has opened a claim for this journey. Delay Repay closes",
-        "28 days after the date above.",
     ]
+    if claim_url:
+        # The whole point of the email: one link, straight to the form that
+        # pays out. Nothing to open first.
+        lines += [
+            "File it on the operator's form:",
+            claim_url,
+            "",
+            "Delay Repay closes 28 days after the date above. AutoTrain has",
+            "recorded that you have this link and will stop chasing it.",
+        ]
+    else:
+        lines += [
+            "AutoTrain has opened a claim for this journey. Delay Repay closes",
+            "28 days after the date above.",
+        ]
     if app_base_url:
-        lines += ["", f"Open AutoTrain to check and file it: {app_base_url}"]
+        lines += ["", f"Your journeys and claims: {app_base_url}"]
     lines.append("")
     return "\n".join(lines)
 

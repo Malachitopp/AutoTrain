@@ -9,12 +9,13 @@ fake. Every stamp, lock and queue read here is real SQL.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
 import psycopg
 
 from autotrain.modules.notifications.service import run_notification_sweep
+from conftest import mk_operator as _mk_operator
 from conftest import mk_user as _mk_user
 from conftest import scalar as _scalar
 
@@ -407,3 +408,82 @@ def test_the_channel_is_the_device_if_there_is_one_else_the_account_email(
     stats = run_notification_sweep(conn)
     assert (stats.no_target, stats.notified) == (1, 0)
     assert _notified_at(conn, stranded) is not None
+
+
+def test_the_email_carries_the_filing_link_and_records_the_handover(
+    conn: psycopg.Connection,
+) -> None:
+    """The point of the whole email: one link, straight to the form that pays.
+
+    And the half that is easy to forget — handing the link over IS the
+    filing handover, so the claim moves draft -> needs_user as the message
+    goes. Without that the deadline sweep would expire a claim the person
+    had already filed, and the dashboard would keep offering it as though
+    nothing had happened. Asserted together because a link sent without the
+    transition is the broken state that looks fine.
+    """
+    user_id = _mk_user(conn, "one-click@example.com")
+    operator_id = _mk_operator(
+        conn, "QD", adapter="deep_link", claim_url="https://delayrepay.example/"
+    )
+    journey_id = _mk_journey(conn, user_id)
+    conn.execute("UPDATE journeys SET operator_id = %s WHERE id = %s", (operator_id, journey_id))
+    detection_id = _mk_detection(conn, journey_id)
+    claim_id = _scalar(
+        conn.execute(
+            "INSERT INTO claims (journey_id, detection_id, operator_id, user_id, amount_pence, "
+            "file_by) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (
+                journey_id,
+                detection_id,
+                operator_id,
+                user_id,
+                ENTITLEMENT,
+                date.today() + timedelta(days=20),
+            ),
+        )
+    )
+    email = _RecordingEmailSender()
+
+    stats = run_notification_sweep(conn, email_sender=email, app_base_url="https://autotrain.test")
+
+    assert stats.emails == 1
+    body = email.sent[0][2]
+    assert "https://delayrepay.example/" in body
+    assert "File it on the operator's form:" in body
+    # The claim knows the link is out there, so the deadline sweep leaves it
+    # alone from here.
+    assert _scalar(conn.execute("SELECT status FROM claims WHERE id = %s", (claim_id,))) == (
+        "needs_user"
+    )
+
+
+def test_an_operator_we_cannot_file_with_still_gets_the_email(conn: psycopg.Connection) -> None:
+    """No link is never a reason to withhold the news.
+
+    A claim can be missing a link three ways: the sweep has not opened one
+    yet, the operator has no deep link at all, or it has already moved past
+    filing. All three are ordinary, and in every one the person still needs
+    to know they are owed money — they can file it themselves. The refusal
+    also must not poison the transaction carrying the send and the stamp,
+    which is why it gets its own savepoint.
+    """
+    user_id = _mk_user(conn, "no-link@example.com")
+    operator_id = _mk_operator(conn, "QE", adapter="none", claim_url=None)
+    journey_id = _mk_journey(conn, user_id)
+    conn.execute("UPDATE journeys SET operator_id = %s WHERE id = %s", (operator_id, journey_id))
+    detection_id = _mk_detection(conn, journey_id)
+    conn.execute(
+        "INSERT INTO claims (journey_id, detection_id, operator_id, user_id, amount_pence, "
+        "file_by) VALUES (%s, %s, %s, %s, %s, %s)",
+        (journey_id, detection_id, operator_id, user_id, ENTITLEMENT, date.today()),
+    )
+    email = _RecordingEmailSender()
+
+    stats = run_notification_sweep(conn, email_sender=email, app_base_url="https://autotrain.test")
+
+    assert (stats.emails, stats.errors) == (1, 0)
+    body = email.sent[0][2]
+    assert "delayrepay" not in body
+    assert "AutoTrain has opened a claim for this journey" in body
+    assert "https://autotrain.test" in body

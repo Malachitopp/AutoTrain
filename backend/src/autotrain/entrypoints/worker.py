@@ -1,5 +1,11 @@
 """Process type 3 of 4: the worker — queue consumers (ARCHITECTURE §2).
 
+The claim sweep runs here too, immediately before the notification sweep,
+because the message now carries the claim's own filing link and there has to
+BE a claim by then (see _sweep_once). It is the scheduler's job as much as
+this one's; both are idempotent and hold the same advisory lock, so whichever
+gets there first does the work.
+
 One queue today: unnotified qualifying delay detections
 (delay_detections_pending_idx, 0006), drained by the notification sweep. The
 queue is the database itself — polled on an interval, rows claimed with FOR
@@ -25,6 +31,7 @@ import time
 from autotrain.core import db
 from autotrain.core.config import Settings, get_settings
 from autotrain.core.observability import fields, setup_logging
+from autotrain.modules.claims import service as claims
 from autotrain.modules.notifications import service as notifications
 from autotrain.sources.email import LogEmailSender, ResendEmailSender
 from autotrain.sources.push import LogPushSender
@@ -91,6 +98,21 @@ def _sweep_once(
 ) -> notifications.NotificationStats:
     settings = get_settings()
     with db.transaction() as conn:
+        # The claim sweep first, in this process, because the notification
+        # now CARRIES the claim's filing link — and without this the two
+        # sweeps race on their intervals. A detection appears when the
+        # ingestor runs; this worker sees it within a minute, while the
+        # scheduler's claim sweep may be fourteen minutes away, so the email
+        # would almost always go out before the claim existed and would have
+        # no link in it. Both sweeps are idempotent and advisory-locked, so
+        # running it here as well as in the scheduler costs a no-op when
+        # there is nothing to open, and skips entirely when the scheduler
+        # holds the lock (the email then simply points at the dashboard).
+        with db.job_lock(conn, "claim-sweep") as held:
+            if held:
+                claims.run_claim_sweep(
+                    conn, batch_size=settings.worker_batch_size, commit_each=True
+                )
         # commit_each: each PAGE of sends commits as it finishes — stamps
         # become durable and row locks release, so a crash re-delivers at
         # most one page (the sweep's own docstring owns that argument).
