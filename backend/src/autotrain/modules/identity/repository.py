@@ -35,7 +35,10 @@ _PUSH_TARGETS = (
 
 # The two noqas: bandit's S105 sees "TOKEN" in a name and suspects a hardcoded
 # credential — these are SQL statements about tokens, not tokens.
-_INSERT_LOGIN_TOKEN = "INSERT INTO login_tokens (email, token_hash, expires_at) VALUES (%s, %s, %s)"  # noqa: S105
+_INSERT_LOGIN_TOKEN = (
+    "INSERT INTO login_tokens (email, email_key, token_hash, expires_at) "  # noqa: S105
+    "VALUES (%s, %s, %s, %s)"
+)
 
 _SPEND_LOGIN_TOKEN = (
     "UPDATE login_tokens "  # noqa: S105 — the directive sits on the diagnostic's line
@@ -43,28 +46,46 @@ _SPEND_LOGIN_TOKEN = (
     "WHERE token_hash = %s AND used_at IS NULL AND expires_at > now() "
     "RETURNING email"
 )
-# The rate limiter's two questions (0018). Both count rows that are already
-# here: a request that sends an email commits its login_tokens row, so the
-# committed rows are the record of what went out, and a refusal writes
-# nothing — which is what makes this survive TransactionMiddleware rolling
-# back every response of 400 and above.
+# The login caps (0018, 0019). Both count rows that are already here: a
+# request that sends an email commits its rows, so the committed rows are
+# the record of what went out, and a refusal writes nothing — which is what
+# makes this survive TransactionMiddleware rolling back every response of
+# 400 and above.
+#
+# Two tables, because the two questions have different owners. "How many
+# links has this INBOX been sent" keys on email_key, the address reduced to
+# where it lands, so a plus-suffix cannot buy a fresh budget. "How many have
+# we sent today" counts login_sends, which holds a timestamp and nothing
+# else: erasure deletes a person's login_tokens and must, and a daily cap
+# counted from that table fell by five every time an account was deleted.
 #
 # The inner LIMIT is the same trick as journeys' intake cap: the answer is
 # only ever compared against a small cap, so counting past it is work whose
 # result is thrown away. Under attack that is the difference between a count
 # over the day's whole traffic and one that stops at five.
-_COUNT_LOGIN_TOKENS_FOR_EMAIL = (
+_COUNT_LOGIN_TOKENS_FOR_INBOX = (
     "SELECT count(*) FROM (SELECT 1 FROM login_tokens "
-    "WHERE email = %s AND created_at >= %s LIMIT %s) AS capped"
+    "WHERE email_key = %s AND created_at >= %s LIMIT %s) AS capped"
 )
-_COUNT_LOGIN_TOKENS_SINCE = (
-    "SELECT count(*) FROM (SELECT 1 FROM login_tokens WHERE created_at >= %s LIMIT %s) AS capped"
+_COUNT_LOGIN_SENDS_SINCE = (
+    "SELECT count(*) FROM (SELECT 1 FROM login_sends WHERE created_at >= %s LIMIT %s) AS capped"
 )
+_INSERT_LOGIN_SEND = "INSERT INTO login_sends DEFAULT VALUES"
+# Transaction-scoped, unlike job_lock's session-level lock: it is released
+# by the commit or rollback the middleware performs either way, so it can
+# never be leaked by a failing request. Counting and then inserting is a
+# race without it — every concurrent request counts under the cap, and all
+# of them insert.
+_LOCK_LOGIN_REQUESTS = "SELECT pg_advisory_xact_lock(%s)"
 # Batched like journeys' retention purge, so a first run over a long backlog
 # never holds one long transaction.
 _DELETE_OLD_LOGIN_TOKENS = (
     "DELETE FROM login_tokens WHERE id IN ("
     "SELECT id FROM login_tokens WHERE created_at < %s ORDER BY created_at LIMIT %s)"
+)
+_DELETE_OLD_LOGIN_SENDS = (
+    "DELETE FROM login_sends WHERE id IN ("
+    "SELECT id FROM login_sends WHERE created_at < %s ORDER BY created_at LIMIT %s)"
 )
 
 _USER_ID_EMAIL = "SELECT id FROM users WHERE email = %s AND deleted_at IS NULL"
@@ -108,7 +129,10 @@ _REVOKE_SESSIONS = (
 # Erasure (0004's anonymise-not-delete). The email is read first so the
 # pending login tokens for it can go; then the row is stripped and stamped.
 _USER_EMAIL = "SELECT email FROM users WHERE id = %s AND deleted_at IS NULL"
-_DELETE_LOGIN_TOKENS = "DELETE FROM login_tokens WHERE email = %s"
+# By inbox, not by the address as typed: the person forgotten as a@x is the
+# person the links to a+shop@x were sent to, and those rows carry their
+# address too.
+_DELETE_LOGIN_TOKENS = "DELETE FROM login_tokens WHERE email_key = %s"
 _DELETE_DEVICES = "DELETE FROM devices WHERE user_id = %s"
 _ERASE_USER = (
     "UPDATE users SET email = NULL, display_name = NULL, password_hash = NULL, "
@@ -129,11 +153,11 @@ def push_targets(
 
 
 def insert_login_token(
-    conn: psycopg.Connection, email: str, token_hash: str, expires_at: datetime
+    conn: psycopg.Connection, email: str, email_key: str, token_hash: str, expires_at: datetime
 ) -> None:
     """Store a pending magic-link login: the token hash, never the token."""
 
-    db.execute(conn, _INSERT_LOGIN_TOKEN, (email, token_hash, expires_at))
+    db.execute(conn, _INSERT_LOGIN_TOKEN, (email, email_key, token_hash, expires_at))
 
 
 def spend_login_token(conn: psycopg.Connection, token_hash: str) -> str | None:
@@ -199,18 +223,27 @@ def user_email(conn: psycopg.Connection, user_id: UUID) -> str | None:
     return db.fetch_value(conn, _USER_EMAIL, (user_id,))
 
 
-def count_login_tokens_for_email(
-    conn: psycopg.Connection, email: str, since: datetime, cap: int
+def lock_login_requests(conn: psycopg.Connection) -> None:
+    """Serialise login requests for the rest of this transaction."""
+    db.fetch_value(conn, _LOCK_LOGIN_REQUESTS, (db.lock_key("login-request"),))
+
+
+def count_login_tokens_for_inbox(
+    conn: psycopg.Connection, email_key: str, since: datetime, cap: int
 ) -> int:
-    """How many links this address has been sent since `since`, counted no
+    """How many links this inbox has been sent since `since`, counted no
     further than `cap`."""
-    return db.fetch_value(conn, _COUNT_LOGIN_TOKENS_FOR_EMAIL, (email, since, cap))
+    return db.fetch_value(conn, _COUNT_LOGIN_TOKENS_FOR_INBOX, (email_key, since, cap))
 
 
-def count_login_tokens_since(conn: psycopg.Connection, since: datetime, cap: int) -> int:
-    """How many links everyone has been sent since `since`, counted no
-    further than `cap`."""
-    return db.fetch_value(conn, _COUNT_LOGIN_TOKENS_SINCE, (since, cap))
+def count_login_sends_since(conn: psycopg.Connection, since: datetime, cap: int) -> int:
+    """How many login emails have gone out since `since`, counted no further
+    than `cap`."""
+    return db.fetch_value(conn, _COUNT_LOGIN_SENDS_SINCE, (since, cap))
+
+
+def record_login_send(conn: psycopg.Connection) -> None:
+    db.execute(conn, _INSERT_LOGIN_SEND)
 
 
 def delete_old_login_tokens(conn: psycopg.Connection, before: datetime, limit: int) -> int:
@@ -218,8 +251,13 @@ def delete_old_login_tokens(conn: psycopg.Connection, before: datetime, limit: i
     return db.execute(conn, _DELETE_OLD_LOGIN_TOKENS, (before, limit))
 
 
-def delete_login_tokens(conn: psycopg.Connection, email: str) -> int:
-    return db.execute(conn, _DELETE_LOGIN_TOKENS, (email,))
+def delete_old_login_sends(conn: psycopg.Connection, before: datetime, limit: int) -> int:
+    """How many send records this call deleted."""
+    return db.execute(conn, _DELETE_OLD_LOGIN_SENDS, (before, limit))
+
+
+def delete_login_tokens(conn: psycopg.Connection, email_key: str) -> int:
+    return db.execute(conn, _DELETE_LOGIN_TOKENS, (email_key,))
 
 
 def delete_devices(conn: psycopg.Connection, user_id: UUID) -> int:

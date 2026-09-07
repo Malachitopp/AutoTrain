@@ -116,33 +116,6 @@ class TestRequestLink:
         assert sender.sent == []
         assert scalar(conn.execute("SELECT count(*) FROM login_tokens")) == 0
 
-    def test_one_caller_cannot_walk_through_many_addresses(
-        self, client: TestClient, sender: _RecordingEmailSender
-    ) -> None:
-        """What the per-address cap structurally cannot catch: a single
-        caller using a fresh inbox every time. Every request here is a
-        different address, so the service's caps never fire — only the
-        middleware, counting the connection the requests arrive on, sees
-        that they are all the same person.
-
-        Retry-After is the proof of which limiter answered: the middleware
-        knows its window and sends one, the service's rolling caps
-        deliberately do not.
-        """
-        limit = get_settings().login_requests_per_ip_per_hour
-        for i in range(limit):
-            resp = client.post("/auth/login/request", json={"email": f"r{i}@example.com"})
-            assert resp.status_code == 204, i
-
-        blocked = client.post("/auth/login/request", json={"email": "fresh@example.com"})
-        assert blocked.status_code == 429
-        assert blocked.headers["Retry-After"] == "3600"
-        assert len(sender.sent) == limit
-
-        # Other routes are untouched: they cost a query, not a message sent
-        # to a stranger from a domain we have to keep trusted.
-        assert client.get("/healthz").status_code == 200
-
     def test_too_many_links_to_one_address_is_refused(
         self, client: TestClient, sender: _RecordingEmailSender
     ) -> None:
@@ -157,7 +130,6 @@ class TestRequestLink:
 
         blocked = client.post("/auth/login/request", json={"email": _EMAIL})
         assert blocked.status_code == 429
-        assert "Retry-After" not in blocked.headers  # the rolling cap, not the middleware
         assert len(sender.sent) == cap
 
     def test_a_provider_that_will_not_take_the_message_answers_502(

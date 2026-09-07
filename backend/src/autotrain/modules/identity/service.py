@@ -156,20 +156,22 @@ def request_login(
     The link is <app_base_url>/login#token=<token>: /login is the frontend's
     route, a contract with the app rather than a detail of this module.
 
-    Raises LoginRateLimited when this address, or the system as a whole, has
-    had its share of the window. Both caps count rows already in
-    login_tokens, which is what makes them survive the api's rollback rule:
-    a request that sends an email answers 204 and commits its row, so the
-    committed rows are the record of what went out, while a refused request
-    writes nothing and needs to write nothing. A limiter that instead
-    recorded its own refusals would have those records rolled back with the
-    429 that caused them, and would forget every attempt it ever blocked.
+    Raises LoginRateLimited when this inbox, or the system as a whole, has
+    had its share of the window. Both caps count rows already committed,
+    which is what makes them survive the api's rollback rule: a request that
+    sends an email answers 204 and commits its rows, so the committed rows
+    are the record of what went out, while a refused request writes nothing
+    and needs to write nothing. A limiter that instead recorded its own
+    refusals would have those records rolled back with the 429 that caused
+    them, and would forget every attempt it ever blocked.
     """
-    _refuse_if_over_limit(conn, email, per_email_daily_cap=per_email_daily_cap, daily_cap=daily_cap)
+    inbox = _email_key(email)
+    _refuse_if_over_limit(conn, inbox, per_email_daily_cap=per_email_daily_cap, daily_cap=daily_cap)
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     expires_at = datetime.now(UTC) + _TOKEN_TTL
-    _repository.insert_login_token(conn, email, token_hash, expires_at)
+    _repository.insert_login_token(conn, email, inbox, token_hash, expires_at)
+    _repository.record_login_send(conn)
     sender.send_email(
         to=email,
         subject=_LOGIN_SUBJECT,
@@ -177,48 +179,74 @@ def request_login(
     )
 
 
+def _email_key(email: str) -> str:
+    """The inbox an address reaches, which is what the per-address cap and
+    erasure are really about.
+
+    Nearly every provider delivers a+anything@x to a@x, so a cap keyed on
+    the address as typed handed out a fresh budget per suffix — the cap
+    that exists to stop one person being mail-bombed did not stop it. The
+    reduction is the two things that are safe everywhere: the plus-suffix
+    goes, and case goes (the column is citext, so case never mattered for
+    equality; lower-casing keeps what is stored honest about that). Dots in
+    the local part are NOT folded — that is one provider's rule, and folding
+    them for everyone would merge strangers' mailboxes at the others.
+
+    A few providers treat '+' as an ordinary character, and there two
+    different mailboxes will share one budget of five a day. That is the
+    right side to err on.
+    """
+    local, _, domain = email.partition("@")
+    return f"{local.split('+', 1)[0]}@{domain}".lower()
+
+
 def _refuse_if_over_limit(
-    conn: psycopg.Connection, email: str, *, per_email_daily_cap: int, daily_cap: int
+    conn: psycopg.Connection, inbox: str, *, per_email_daily_cap: int, daily_cap: int
 ) -> None:
     """Raise LoginRateLimited if this request would exceed either cap.
 
     Two caps, because they stop two different things and neither covers the
-    other. The per-address one stops a single inbox being filled with our
+    other. The per-inbox one stops a single inbox being filled with our
     mail, which is how a login endpoint gets used to attack a stranger and
     take the sending domain's reputation down with it. The daily one stops
-    the provider's own quota being drained, which no per-address cap can do:
+    the provider's own quota being drained, which no per-inbox cap can do:
     an attacker uses a thousand addresses and stays under it every time.
 
-    Both are checked before anything is written, so a refusal costs one
-    indexed count and no email. The order is cheapest-blast-radius first:
-    the per-address answer is the one a real person hits.
+    Checked under a transaction-scoped lock, because count-then-insert is
+    otherwise a race: every request in flight at once counts under the cap
+    and every one inserts, so the cap holds only up to the size of the
+    connection pool. The lock serialises the check with the insert that
+    follows it, and the middleware's commit or rollback releases it either
+    way. Login traffic is tens a day; the serialisation costs nothing.
+
+    Cheapest blast radius first: the per-inbox answer is the one a real
+    person hits, and it is refused before the global count runs.
     """
+    _repository.lock_login_requests(conn)
     since = datetime.now(UTC) - _RATE_WINDOW
-    for count, cap in (
-        (
-            _repository.count_login_tokens_for_email(conn, email, since, per_email_daily_cap),
-            per_email_daily_cap,
-        ),
-        (_repository.count_login_tokens_since(conn, since, daily_cap), daily_cap),
+    if _repository.count_login_tokens_for_inbox(conn, inbox, since, per_email_daily_cap) >= (
+        per_email_daily_cap
     ):
-        if count >= cap:
-            # Deliberately the same exception, carrying nothing about which
-            # cap it was. Which one you hit is a fact about other people's
-            # traffic, and the api turns both into one identical 429.
-            raise LoginRateLimited("too many login links requested")
+        raise LoginRateLimited("too many login links requested")
+    if _repository.count_login_sends_since(conn, since, daily_cap) >= daily_cap:
+        # Deliberately the same exception, carrying nothing about which
+        # cap it was. Which one you hit is a fact about other people's
+        # traffic, and the api turns both into one identical 429.
+        raise LoginRateLimited("too many login links requested")
 
 
 def purge_expired_login_tokens(
     conn: psycopg.Connection, *, keep_days: int, batch_size: int = 500, commit_each: bool = False
 ) -> int:
-    """Delete login tokens older than `keep_days`; returns how many.
+    """Delete login tokens, and the send records beside them, older than
+    `keep_days`; returns how many rows went.
 
     Nothing reads a token after its first 15 minutes, so this table was
     growing for ever for no one. Batched, like journeys' retention sweep, so
     a first run over a long backlog never holds one long transaction.
 
     The cutoff is never inside the rate limiter's window, whatever retention
-    is configured. The limiter counts rows in login_tokens, so a purge that
+    is configured. The limiter counts these same rows, so a purge that
     reached into that window would delete the evidence of what an attacker
     had already been sent and hand them a fresh budget — a hole opened by
     lowering a retention setting, with nothing at either site to suggest the
@@ -227,14 +255,19 @@ def purge_expired_login_tokens(
     """
     before = datetime.now(UTC) - max(timedelta(days=keep_days), _RATE_WINDOW)
     deleted = 0
-    while True:
-        with conn.transaction():
-            batch = _repository.delete_old_login_tokens(conn, before, batch_size)
-        deleted += batch
-        if commit_each:
-            conn.commit()
-        if batch < batch_size:
-            return deleted
+    for purge in (
+        lambda: _repository.delete_old_login_tokens(conn, before, batch_size),
+        lambda: _repository.delete_old_login_sends(conn, before, batch_size),
+    ):
+        while True:
+            with conn.transaction():
+                batch = purge()
+            deleted += batch
+            if commit_each:
+                conn.commit()
+            if batch < batch_size:
+                break
+    return deleted
 
 
 def _login_email_body(link: str) -> str:
@@ -448,6 +481,6 @@ def erase_user(conn: psycopg.Connection, user_id: UUID) -> bool:
     if email is None:
         return False
     _journeys.forget_user(conn, user_id)
-    _repository.delete_login_tokens(conn, email)
+    _repository.delete_login_tokens(conn, _email_key(email))
     _repository.delete_devices(conn, user_id)
     return _repository.erase_user_row(conn, user_id)

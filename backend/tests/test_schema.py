@@ -60,23 +60,25 @@ class TestMigrationsApply:
         }
         assert expected <= tables, f"missing: {expected - tables}"
 
-    def test_erasure_can_find_a_persons_login_tokens_by_email(
+    def test_erasure_can_find_a_persons_login_tokens_by_inbox(
         self, conn: psycopg.Connection
     ) -> None:
-        """0017. login_tokens is indexed by token_hash, which is what login
-        reads it by — but erasure deletes by email, and 0012 shipped with no
-        index for that. Nothing prunes this table, so it only grows: without
-        this index, honouring a deletion request means a sequential scan of
-        every login token ever minted, and it gets slower for the rest of the
-        system's life.
+        """0017, then 0019. login_tokens is indexed by token_hash, which is
+        what login reads it by — but erasure deletes by the person, and 0012
+        shipped with no index for that. Without one, honouring a deletion
+        request means a sequential scan of every login token ever minted.
+        0019 moved erasure's key from the address as typed to email_key, the
+        inbox it reaches, and moved the index with it; this test moved too,
+        which is the point of pinning the query rather than the index name.
 
         Asserted against the planner rather than the catalogue, so that
         renaming the index or replacing it with a wider one still passes —
-        what matters is that the query has a way in that is not a scan."""
+        what matters is that the query erasure actually runs has a way in
+        that is not a scan."""
         conn.execute("SET LOCAL enable_seqscan = off")
         plan = _scalar(
             conn.execute(
-                "EXPLAIN (FORMAT JSON) DELETE FROM login_tokens WHERE email = 'a@example.com'"
+                "EXPLAIN (FORMAT JSON) DELETE FROM login_tokens WHERE email_key = 'a@example.com'"
             )
         )
         assert "Index" in str(plan), plan

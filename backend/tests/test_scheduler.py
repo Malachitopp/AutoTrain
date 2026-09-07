@@ -200,6 +200,46 @@ def test_run_jobs_once_opens_then_expires_claims() -> None:
 
 
 @pytest.mark.usefixtures("pool")
+def test_run_jobs_once_deletes_login_tokens_past_retention() -> None:
+    """The cleanup job, through the scheduler: registration, its lock name
+    and the retention wiring, in one pass. An old token and an old send
+    record go; a fresh pair stays — the fresh pair is inside the window the
+    login caps count, and must."""
+    with _committed_world() as (setup, _user_id, _operator_id):
+        for email, age in (("old@sched.test", "8 days"), ("new@sched.test", "8 hours")):
+            setup.execute(
+                "INSERT INTO login_tokens (email, email_key, token_hash, expires_at, created_at) "
+                "VALUES (%s, %s, %s, now(), now() - %s::interval)",
+                (email, email, f"hash-{email}", age),
+            )
+            setup.execute(
+                "INSERT INTO login_sends (created_at) VALUES (now() - %s::interval)", (age,)
+            )
+        try:
+            _run_jobs_once(batch_size=50)
+
+            left = [
+                r[0]
+                for r in setup.execute(
+                    "SELECT email FROM login_tokens WHERE email LIKE '%@sched.test'"
+                ).fetchall()
+            ]
+            assert left == ["new@sched.test"]
+            assert (
+                _scalar(
+                    setup.execute(
+                        "SELECT count(*) FROM login_sends "
+                        "WHERE created_at < now() - interval '7 days'"
+                    )
+                )
+                == 0
+            )
+        finally:
+            setup.execute("DELETE FROM login_tokens WHERE email LIKE '%@sched.test'")
+            setup.execute("DELETE FROM login_sends WHERE created_at < now() - interval '7 hours'")
+
+
+@pytest.mark.usefixtures("pool")
 def test_run_jobs_once_isolates_a_failing_job(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -46,13 +46,29 @@ def test_production_refuses_every_development_setting_at_once() -> None:
     ):
         assert setting in message, setting
 
+    # 'none' is refused too, and separately: it is not a development
+    # setting but an absent one, and magic links are the only way in — a
+    # production API without a sender boots cleanly and 503s every login.
+    with pytest.raises(ValidationError) as excinfo:
+        _Settings(
+            database_url=_DB,
+            environment="production",
+            jwt_secret=SecretStr("x" * 32),
+            session_cookie_secure=True,
+            email_sender="none",
+            app_base_url="https://app.autotrain.example",
+        )
+    assert "EMAIL_SENDER=none" in str(excinfo.value)
+
     # The same deployment with every problem fixed boots...
     _Settings(
         database_url=_DB,
         environment="production",
         jwt_secret=SecretStr("x" * 32),
         session_cookie_secure=True,
-        email_sender="none",
+        email_sender="resend",
+        resend_api_key=SecretStr("re_live_key"),
+        email_from="AutoTrain <login@in.example.com>",
         push_sender="none",
         cors_origins=["https://app.autotrain.example"],
         app_base_url="https://app.autotrain.example",
@@ -99,3 +115,14 @@ def test_resend_needs_a_key_and_a_from_address() -> None:
         # app base url, and the lockdown would refuse this on that instead.
         app_base_url="https://app.autotrain.example",
     )
+
+
+def test_the_per_inbox_cap_must_sit_under_the_daily_one() -> None:
+    """Otherwise the daily cap fires first for everyone and the per-inbox
+    rule is decoration: every refusal a person ever saw would be about other
+    people's traffic. Boot-time, like every setting whose only failure mode
+    is silent."""
+    with pytest.raises(ValidationError) as excinfo:
+        _Settings(database_url=_DB, login_requests_per_email_per_day=80, login_requests_per_day=80)
+    assert "PER_EMAIL_PER_DAY" in str(excinfo.value)
+    _Settings(database_url=_DB, login_requests_per_email_per_day=5, login_requests_per_day=80)
