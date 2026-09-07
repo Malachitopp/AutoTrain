@@ -163,13 +163,58 @@ def test_a_poll_stores_what_is_new_and_never_fetches_a_body_twice(
     assert _attachments_of(conn, fresh.message_id) == [
         ("e-ticket.pdf", "application/pdf", len(TICKET_PDF.content))
     ]
-    # The one that raised wrote nothing at all — its savepoint rolled back.
+    # The one that raised wrote nothing — though it raised before any
+    # statement, so this only says the counting is right. The savepoint
+    # itself is what the next test is for.
     assert (
         conn.execute(
             "SELECT id FROM inbound_emails WHERE message_id = %s", (broken.message_id,)
         ).fetchone()
         is None
     )
+
+
+@pytest.mark.usefixtures("migrated_database")
+def test_a_message_that_fails_half_way_leaves_no_row_behind(conn: psycopg.Connection) -> None:
+    """The savepoint, tested where it can actually be observed.
+
+    An email is two writes: the row, then its attachments. A failure between
+    them is the case worth proving, because a surviving email row would have
+    its message_id stored — and a stored message_id is never offered again,
+    so the ticket would be permanently lost while the poll reported success.
+
+    A NUL in the filename is the real trigger. Postgres text cannot hold one,
+    so psycopg refuses the parameter at the second write. The IMAP source
+    strips control characters precisely so this never comes off a real
+    mailbox (sources/imap_mailbox.py, _clean); the fake here hands one
+    straight to the poll, which is the only way to reach the failure.
+    """
+    user_id = _mk_user(conn, "traveller@example.com")
+    message = _message(
+        "41",
+        attachments=(
+            MailboxAttachment(
+                filename="ticket\x00.pdf", content_type="application/pdf", content=b"%PDF-1.4"
+            ),
+        ),
+    )
+
+    stats = run_mailbox_poll(
+        conn,
+        _FakeMailbox([message]),
+        user_id=user_id,
+        account_email="traveller@example.com",
+    )
+
+    assert (stats.errors, stats.stored) == (1, 0)
+    # Neither half survived, so the next poll will offer it again.
+    assert (
+        conn.execute(
+            "SELECT id FROM inbound_emails WHERE message_id = %s", (message.message_id,)
+        ).fetchone()
+        is None
+    )
+    assert _attachments_of(conn, message.message_id) == []
 
 
 @pytest.mark.usefixtures("migrated_database")
@@ -209,6 +254,51 @@ def test_only_files_that_could_be_a_ticket_are_kept(conn: psycopg.Connection) ->
     kept = _attachments_of(conn, message.message_id)
     assert [name for name, _, _ in kept] == [f"leg-{index}.png" for index in range(5)]
     assert {kind for _, kind, _ in kept} == {"image/png"}
+
+
+@pytest.mark.usefixtures("migrated_database")
+def test_a_backlog_bigger_than_one_pass_drains_instead_of_starving(
+    conn: psycopg.Connection,
+) -> None:
+    """The per-pass limit bounds BODIES fetched, never what can be seen.
+
+    The bug this exists for: capping the LISTING first meant that once the
+    limit's worth of messages in the window were already stored, a pass had
+    nothing left to look at, and the older unimported ones behind them could
+    never be reached. They sat there until they aged out of the lookback
+    window — permanently lost — while every pass logged a clean zero. It bites
+    the ordinary case of labelling a year of bookings in one sitting.
+
+    Oldest first, so each pass makes progress on the back of the queue rather
+    than re-examining a fixed head of it.
+    """
+    user_id = _mk_user(conn, "traveller@example.com")
+    messages = [_message(str(50 + index)) for index in range(5)]
+    mailbox = _FakeMailbox(messages)
+
+    def poll() -> Any:
+        return run_mailbox_poll(
+            conn,
+            mailbox,
+            user_id=user_id,
+            account_email="traveller@example.com",
+            limit=2,
+        )
+
+    first, second, third = poll(), poll(), poll()
+
+    assert [s.stored for s in (first, second, third)] == [2, 2, 1]
+    # Every pass could SEE all five; only the fetching was rationed.
+    assert [s.listed for s in (first, second, third)] == [5, 5, 5]
+    assert [s.fresh for s in (first, second, third)] == [5, 3, 1]
+    # Oldest first, and no body was ever fetched twice.
+    assert mailbox.fetched == ["50", "51", "52", "53", "54"]
+    assert (
+        _scalar(conn.execute("SELECT count(*) FROM inbound_emails WHERE user_id = %s", (user_id,)))
+        == 5
+    )
+    # A fourth pass has nothing left to do.
+    assert poll().stored == 0
 
 
 @pytest.mark.usefixtures("migrated_database")

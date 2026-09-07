@@ -330,17 +330,30 @@ def ensure_account(conn: psycopg.Connection, email: str) -> UUID:
     one caller; a mailbox poll is the other, and it has the same problem:
     it holds an address and needs the account behind it.
 
-    Not race-guarded, deliberately. Both callers are already serialised by
-    something stronger than a lock — a login token can be spent exactly
-    once, and the poll runs under the scheduler's advisory job lock — so a
-    unique-violation retry here would be code that could never run. If a
-    third caller ever appears without that property, this is where the
-    retry goes.
+    Race-guarded, and it has to be. Each caller is serialised only against
+    ITSELF — a login token can be spent once, and the poll holds the
+    scheduler's advisory job lock — which says nothing about the two running
+    at the same moment, and a first sign-in while the first poll is running
+    is not a strange thing to happen. Both would see no user and both would
+    insert; users_email_key (0004) then fails the loser. Without the catch
+    that surfaces as a mailbox poll dying on the person's very first login.
+
+    The insert gets its own savepoint so the violation does not poison the
+    caller's transaction, and the re-read after it is what actually answers:
+    the winner's row is committed by then, or, if it is not, the raise
+    stands rather than a None being returned as an id.
     """
     user_id = _repository.user_id_by_email(conn, email)
-    if user_id is None:
-        user_id = _repository.create_user(conn, email)
-    return user_id
+    if user_id is not None:
+        return user_id
+    try:
+        with conn.transaction():
+            return _repository.create_user(conn, email)
+    except pg_errors.UniqueViolation:
+        existing = _repository.user_id_by_email(conn, email)
+        if existing is None:
+            raise
+        return existing
 
 
 def issue_session_token(user_id: UUID, *, secret: str, now: datetime | None = None) -> str:

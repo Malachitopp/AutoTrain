@@ -212,8 +212,14 @@ class Settings(BaseSettings):
     # hundred bytes a message, since bodies are only fetched for message ids
     # that are not already stored.
     mailbox_lookback_days: int = Field(default=14, ge=1)
-    # Messages examined per poll, newest first. A ceiling on one pass, not on
-    # the mailbox: whatever is left is listed again next interval.
+    # Message BODIES downloaded per poll, oldest unimported first. Not a
+    # ceiling on what a pass can SEE: every message in the window is listed
+    # every time (headers only, a few hundred bytes each), and this bounds
+    # only what is fetched from what is new. That distinction is the whole
+    # point — capping the listing instead would mean that once this many
+    # messages in the window were stored, the older unimported ones behind
+    # them could never be reached, and they would age out of the window
+    # unread while every pass reported a clean zero.
     mailbox_max_per_poll: int = Field(default=200, ge=1)
 
     # Only read by the integration test suite, which drops and recreates it.

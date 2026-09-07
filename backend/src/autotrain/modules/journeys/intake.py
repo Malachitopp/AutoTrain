@@ -390,7 +390,7 @@ def screen(
     spf_pass: bool | None,
     dkim_pass: bool | None,
     recent_count: int,
-    daily_cap: int,
+    daily_cap: int | None,
 ) -> DoorVerdict:
     """Whether this email may be read, and which forwarding shape it is.
 
@@ -400,12 +400,18 @@ def screen(
       "not checked" and passes, because the provider adapter that fills
       these in may not be the one running.
     * The per-user daily cap, which bounds what a leaked address, or a
-      runaway forwarding rule, can make the reader spend.
+      runaway forwarding rule, can make the reader spend. `daily_cap` None
+      switches it off, for a caller where it cannot apply: a mailbox poll
+      reads an inbox WE opened, so there is no address to leak and no
+      stranger to bound, and the refusal it would produce is destructive —
+      a refused email is stored body-less under a message id that is never
+      offered again, so hitting the cap would silently and permanently
+      discard the person's own tickets.
     """
     shape = MANUAL if sender_address(sender) == account_email.strip().lower() else AUTOMATIC
     if spf_pass is False or dkim_pass is False:
         return DoorVerdict(shape, "the sender could not be verified (SPF or DKIM failed)")
-    if recent_count >= daily_cap:
+    if daily_cap is not None and recent_count >= daily_cap:
         return DoorVerdict(shape, f"daily limit of {daily_cap} emails reached")
     return DoorVerdict(shape)
 
@@ -513,8 +519,21 @@ class Mailbox(Protocol):
     def fetch(self, uid: str) -> MailboxMessage | None: ...
 
 
+# The two shapes an e-ticket actually arrives as. Kept apart from the wider
+# set below because they win the per-email budget: see keepable_attachments.
+_TICKET_TYPES = frozenset(
+    {
+        "application/pdf",
+        # Apple Wallet passes: several retailers deliver the barcode this way
+        # and nothing else in the email carries it.
+        "application/vnd.apple.pkpass",
+    }
+)
+
 # What is worth keeping off an email. Everything else — the operator's logo,
-# the tracking pixel, the calendar invite — is dropped unread.
+# the tracking pixel, the calendar invite — is dropped unread. Images are in
+# here because a ticket is sometimes a screenshot or a PNG barcode, not
+# because a picture in an email is usually worth storing.
 _KEEPABLE_TYPES = frozenset(
     {
         "application/pdf",
@@ -547,16 +566,22 @@ def keepable_attachments(
     the sender DECLARED, which is unverifiable — that is fine, because
     nothing here opens the file. It decides only what occupies a row.
     """
-    kept: list[MailboxAttachment] = []
-    for attachment in attachments:
-        if len(kept) >= MAX_ATTACHMENTS_PER_EMAIL:
-            break
-        if attachment.content_type.lower() not in _KEEPABLE_TYPES:
-            continue
-        if not attachment.content or len(attachment.content) > MAX_ATTACHMENT_BYTES:
-            continue
-        kept.append(attachment)
-    return tuple(kept)
+    usable = [
+        attachment
+        for attachment in attachments
+        if attachment.content_type.lower() in _KEEPABLE_TYPES
+        and attachment.content
+        and len(attachment.content) <= MAX_ATTACHMENT_BYTES
+    ]
+    # The count cap is applied to the LIKELIEST tickets, not to whatever came
+    # first. Arrival order is a fact about a mail client's template, and a
+    # template that puts its images before its attachment would otherwise
+    # spend the whole budget on decoration and drop the ticket — which is
+    # what happened before this sort existed. A document is a ticket far more
+    # often than an image is, so documents get the places first; sorted() is
+    # stable, so within a tier the message's own order still decides.
+    usable.sort(key=lambda attachment: attachment.content_type.lower() not in _TICKET_TYPES)
+    return tuple(usable[:MAX_ATTACHMENTS_PER_EMAIL])
 
 
 # --- What the reader is given ---------------------------------------------------

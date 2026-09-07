@@ -101,7 +101,26 @@ so nothing is marked read, moved or deleted. That is enforced in
 `sources/imap_mailbox.py` and asserted in its tests; it is listed here because
 it is the promise that makes pointing this at a personal inbox reasonable.
 
-## 6. Settings that must change from their defaults
+## 6. Turn the mailbox poll off before erasing its owner
+
+**Required if `AUTOTRAIN_MAILBOX_SOURCE=imap` and you ever run erasure.**
+
+GDPR erasure anonymises rather than deletes: `users.email` is set to NULL and
+the row is stamped (`0004`). The mailbox poll, though, resolves its owner by
+address on every pass — it asks `identity.ensure_account` for the account
+behind `AUTOTRAIN_MAILBOX_OWNER_EMAIL`, and creates one if there is none.
+
+After erasure there is none, because the address it matched on is gone. So
+the next pass creates a fresh account and re-imports every message still
+inside the lookback window, under a new id. Erasure is undone within one
+scheduler interval, silently.
+
+Nothing in the code can tell "this address was erased, leave it alone" from
+"this address is new" — the record that would say so is exactly what erasure
+removes. So it is an operational rule instead: **stop the scheduler, or set
+`AUTOTRAIN_MAILBOX_SOURCE=none`, before erasing the mailbox owner.**
+
+## 7. Settings that must change from their defaults
 
 `AUTOTRAIN_ENVIRONMENT=production` refuses to boot while several development
 settings remain (`core/config.py`, `_production_lockdown`), which covers the

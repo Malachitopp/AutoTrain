@@ -470,6 +470,17 @@ def test_both_forwarding_shapes_are_accepted_and_the_door_judges_only_what_it_ca
     )
     assert receive(conn, user_id, "<after@r>", daily_cap=5).status == "received"
 
+    # A cap of one now refuses...
+    assert receive(conn, user_id, "<capped@r>", daily_cap=1).status == "rejected"
+    # ...and the identical traffic with the cap switched off does not. None
+    # is for the caller where the cap cannot apply: a mailbox poll reads an
+    # inbox WE opened, so there is no leaked address and no stranger to
+    # bound — and a refusal there destroys rather than protects, because the
+    # row is stored body-less under a message id that is never offered
+    # again. Labelling a year of bookings in one sitting would silently lose
+    # everything past the cap, which is the opposite of what it is for.
+    assert receive(conn, user_id, "<uncapped@r>", daily_cap=None).status == "received"
+
     # Everything the door let through reaches the reader, both shapes — but
     # a pass is bounded, so the rest of the queue waits for the next one
     # rather than running a backlog past the scheduler's interval.
@@ -477,8 +488,8 @@ def test_both_forwarding_shapes_are_accepted_and_the_door_judges_only_what_it_ca
     first = service.run_intake_sweep(conn, reader, max_emails=2)
     assert first.examined == 2
     rest = service.run_intake_sweep(conn, reader)
-    assert (first.examined + rest.examined, first.parsed + rest.parsed) == (6, 1)
-    assert len(reader.calls) == 6
+    assert (first.examined + rest.examined, first.parsed + rest.parsed) == (7, 1)
+    assert len(reader.calls) == 7
 
 
 def test_gmails_setup_message_reaches_the_user_and_never_the_reader(

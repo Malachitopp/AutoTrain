@@ -87,6 +87,11 @@ _SIZE_IN_RESPONSE = re.compile(rb"\bRFC822\.SIZE\s+(\d+)")
 # to open, to say what would have worked instead.
 _FOLDER_NAME = re.compile(r'"([^"]*)"\s*$')
 
+# A FETCH record opens with the message's sequence number and a bracket:
+# b'7 (UID 4213 ...'. Used to tell where one message's attributes end and the
+# next begins, since imaplib hands them over as a flat list.
+_RECORD_START = re.compile(rb"^\s*\d+\s+\(")
+
 # Message-ID is optional in practice — plenty of mail arrives without one,
 # and the database needs a unique key for every row. A synthetic id built
 # from the folder's UIDVALIDITY and the message's UID is stable for as long
@@ -99,6 +104,23 @@ _SYNTHETIC_DOMAIN = "imap.autotrain.invalid"
 def _imap_date(day: date) -> str:
     """A date as IMAP's SEARCH wants it: 01-Sep-2026."""
     return f"{day.day:02d}-{_MONTHS[day.month - 1]}-{day.year}"
+
+
+def _clean(text: str) -> str:
+    """Text from a message, fit to be stored and shown.
+
+    Control characters go, and a NUL is the reason this exists rather than
+    tidiness: Postgres text cannot hold one, psycopg refuses the parameter,
+    and the whole message would fail to store. Because the poll's error
+    handling then leaves the message unstored, it would be listed and fail
+    again on every pass for the rest of the lookback window — a permanent
+    loop started by any sender who puts a NUL in a filename or a subject
+    (RFC 2231 percent-encoding and encoded words both allow it).
+
+    Tabs and newlines are dropped with the rest: every value passing through
+    here is a header or a filename, and both are single-line by definition.
+    """
+    return " ".join("".join(ch for ch in text if ch >= " " and ch != "\x7f").split())
 
 
 def _quoted(folder: str) -> str:
@@ -214,7 +236,7 @@ class ImapMailbox:
             return []
 
         headers: list[MailboxHeader] = []
-        oversized = 0
+        oversized = unnamed = unsized = 0
         for start in range(0, len(wanted), _FETCH_CHUNK):
             chunk = wanted[start : start + _FETCH_CHUNK]
             joined = b",".join(chunk).decode("ascii")
@@ -223,25 +245,35 @@ class ImapMailbox:
             )
             if status != "OK":
                 raise imaplib.IMAP4.error(f"FETCH of headers failed: {status}")
-            for envelope, literal in _fetch_pairs(response):
-                uid_match = _UID_IN_RESPONSE.search(envelope)
+            for attributes, literal in _fetch_records(response):
+                uid_match = _UID_IN_RESPONSE.search(attributes)
                 if uid_match is None:
-                    # No UID means nothing can be fetched later, and no row
-                    # could be deduplicated. Skipping is the only option.
+                    # No UID means nothing can be fetched later and no row
+                    # could be deduplicated, so skipping is the only option —
+                    # but it is COUNTED, because a poll that skips everything
+                    # and a genuinely empty mailbox both report zero, and
+                    # those two need to look different in a log.
+                    unnamed += 1
                     continue
-                size_match = _SIZE_IN_RESPONSE.search(envelope)
-                if size_match is not None and int(size_match.group(1)) > MAX_MESSAGE_BYTES:
+                size_match = _SIZE_IN_RESPONSE.search(attributes)
+                if size_match is None:
+                    # The cap cannot be applied to a message whose size the
+                    # server did not give, and quietly downloading it anyway
+                    # is the failure the cap exists to prevent.
+                    unsized += 1
+                    continue
+                if int(size_match.group(1)) > MAX_MESSAGE_BYTES:
                     oversized += 1
                     continue
                 uid = uid_match.group(1).decode("ascii")
                 headers.append(MailboxHeader(uid=uid, message_id=self._message_id(literal, uid)))
-        if oversized:
-            logger.warning(
-                "mailbox %r: skipped %d message(s) over %d bytes",
-                self._folder,
-                oversized,
-                MAX_MESSAGE_BYTES,
-            )
+        for count, why in (
+            (oversized, f"over {MAX_MESSAGE_BYTES} bytes"),
+            (unnamed, "the server sent no UID for them"),
+            (unsized, "the server sent no size for them"),
+        ):
+            if count:
+                logger.warning("mailbox %r: skipped %d message(s) — %s", self._folder, count, why)
         return headers
 
     def fetch(self, uid: str) -> MailboxMessage | None:
@@ -254,10 +286,10 @@ class ImapMailbox:
         status, response = self._conn.uid("FETCH", uid, "(BODY.PEEK[])")
         if status != "OK":
             raise imaplib.IMAP4.error(f"FETCH of message {uid} failed: {status}")
-        pairs = _fetch_pairs(response)
-        if not pairs:
+        records = _fetch_records(response)
+        raw = records[0][1] if records else None
+        if raw is None:
             return None
-        raw = pairs[0][1]
         parsed = email.message_from_bytes(raw, policy=email.policy.default)
         return MailboxMessage(
             uid=uid,
@@ -271,8 +303,15 @@ class ImapMailbox:
 
     # --- Message ids ------------------------------------------------------
 
-    def _message_id(self, header_literal: bytes, uid: str) -> str:
-        """The Message-ID out of a header-only fetch, or a synthetic one."""
+    def _message_id(self, header_literal: bytes | None, uid: str) -> str:
+        """The Message-ID out of a header-only fetch, or a synthetic one.
+
+        None is the server answering the body section as NIL or "" rather
+        than as a literal, which is what a message with no Message-ID looks
+        like on some servers. It takes a synthetic id like any other.
+        """
+        if not header_literal:
+            return self._synthetic_id(uid)
         parsed = email.message_from_bytes(header_literal, policy=email.policy.default)
         return _header(parsed, "Message-ID") or self._synthetic_id(uid)
 
@@ -342,20 +381,64 @@ def _uid_validity_of(connection: imaplib.IMAP4) -> str:
     return value[0].decode("ascii", "replace")
 
 
-def _fetch_pairs(response: list[object]) -> list[tuple[bytes, bytes]]:
-    """The (envelope, literal) pairs out of an imaplib FETCH response.
+def _fetch_records(response: list[Any]) -> list[tuple[bytes, bytes | None]]:
+    """One (attributes, literal) record per message in a FETCH response.
 
-    imaplib flattens a FETCH into a list mixing tuples — the envelope line
-    and the literal it announced — with bare bytes for everything that had
-    no literal, such as the closing bracket. Only the tuples carry data.
+    imaplib flattens a FETCH into a list that mixes tuples — a line and the
+    literal it announced — with bare bytes for everything that had no
+    literal: the closing bracket, and any attribute the server happened to
+    put AFTER the literal. Reading only the tuples' first element is
+    therefore reading part of a message's attributes and guessing at the
+    rest, which matters because RFC 3501 fixes no order for them. A server
+    answering
+
+        * 1 FETCH (BODY[HEADER.FIELDS (MESSAGE-ID)] {21}
+        <literal>
+         UID 101 RFC822.SIZE 400)
+
+    is entirely legal, and leaves the UID and the size in a bare item that a
+    tuples-only reader never looks at — so every message would be skipped and
+    the poll would report an empty mailbox for ever.
+
+    So: accumulate everything belonging to one message, starting a new record
+    at each item that opens one (a sequence number and a bracket). The
+    literal is optional, because a body section is an nstring — a server may
+    answer `""` or NIL for a message with no Message-ID rather than send an
+    empty literal, and that message still needs a synthetic id rather than
+    vanishing.
     """
-    pairs: list[tuple[bytes, bytes]] = []
+    records: list[tuple[bytes, bytes | None]] = []
+    attributes = b""
+    literal: bytes | None = None
+    started = False
+
+    def flush() -> None:
+        nonlocal attributes, literal
+        if started:
+            records.append((attributes, literal))
+        attributes, literal = b"", None
+
     for item in response:
+        head: bytes | None = None
+        payload: bytes | None = None
         if isinstance(item, tuple) and len(item) >= 2:
-            envelope, literal = item[0], item[1]
-            if isinstance(envelope, bytes) and isinstance(literal, bytes):
-                pairs.append((envelope, literal))
-    return pairs
+            if isinstance(item[0], bytes):
+                head = item[0]
+            if isinstance(item[1], bytes):
+                payload = item[1]
+        elif isinstance(item, bytes):
+            head = item
+        if head is None and payload is None:
+            continue
+        if head is not None and _RECORD_START.match(head):
+            flush()
+            started = True
+        if head is not None:
+            attributes += b" " + head
+        if payload is not None:
+            literal = payload
+    flush()
+    return records
 
 
 def _header(message: email.message.Message, name: str) -> str:
@@ -375,7 +458,7 @@ def _header(message: email.message.Message, name: str) -> str:
     if value is None:
         return ""
     try:
-        return " ".join(str(value).split())
+        return _clean(str(value))
     except Exception:
         logger.debug("could not render header %s", name, exc_info=True)
         return ""
@@ -446,6 +529,8 @@ def _attachments(message: email.message.Message) -> tuple[MailboxAttachment, ...
         return ()
     found: list[MailboxAttachment] = []
     for index, part in enumerate(parts, start=1):
+        if _is_body_decoration(part):
+            continue
         try:
             content = part.get_payload(decode=True)
         except Exception:
@@ -463,6 +548,31 @@ def _attachments(message: email.message.Message) -> tuple[MailboxAttachment, ...
     return tuple(found)
 
 
+def _is_body_decoration(part: email.message.Message) -> bool:
+    """Whether this part is part of the HTML, not a file the message carries.
+
+    `iter_attachments` returns every non-body part, and that includes the
+    logos and spacers a bulk mailer references from its own markup with
+    cid: URLs. They are not attachments in any sense a person would mean,
+    and left in they COMPETE with the ticket: the per-email cap keeps the
+    first few files, so an email with six inline logos and one e-ticket
+    stored six logos and no ticket. Measured, not theorised — it is exactly
+    the shape a retailer's template produces.
+
+    The test is deliberately narrow: inline AND carrying a Content-ID, which
+    together mean "the markup points at this". A part merely marked inline
+    without a Content-ID is kept, because some senders label a real
+    attachment that way.
+    """
+    try:
+        disposition = part.get_content_disposition()
+        content_id = part.get("Content-ID")
+    except Exception:
+        logger.debug("could not read a part's disposition", exc_info=True)
+        return False
+    return disposition == "inline" and content_id is not None
+
+
 def _safe_filename(name: str | None, index: int) -> str:
     """The file's name with any path taken off it, or a positional one.
 
@@ -472,6 +582,5 @@ def _safe_filename(name: str | None, index: int) -> str:
     """
     if not name:
         return f"attachment-{index}"
-    base = name.replace(chr(92), "/").rsplit("/", 1)[-1]
-    base = " ".join(base.split())
+    base = _clean(name.replace(chr(92), "/").rsplit("/", 1)[-1])
     return base[:255] or f"attachment-{index}"

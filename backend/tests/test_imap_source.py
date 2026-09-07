@@ -250,6 +250,63 @@ def test_a_refused_search_is_an_error_not_an_empty_mailbox() -> None:
         _mailbox(_Refusing({})).list_recent(since=date(2026, 9, 1), limit=10)
 
 
+def test_attributes_after_the_literal_are_still_read() -> None:
+    """RFC 3501 fixes no order for a message's FETCH attributes, and imaplib
+    hands them over as a flat list — so a server that puts UID and
+    RFC822.SIZE AFTER the body section leaves them in a bare item, not in the
+    tuple carrying the literal.
+
+    Reading only the tuple would find no UID, skip every message, and report
+    an empty mailbox on every pass — indistinguishable from a mailbox that
+    really is empty, and silent. The parse therefore accumulates a whole
+    record rather than trusting where the server chose to put things.
+
+    Gmail happens to send UID first, which is exactly why this needs a test
+    rather than a run.
+    """
+
+    class _AttributesLast(_FakeImap):
+        def _fetched(self, uid: str, spec: str) -> Any:
+            if "HEADER.FIELDS" not in spec:
+                return super()._fetched(uid, spec)
+            header = b"Message-ID: <late-" + uid.encode() + b"@x>\r\n\r\n"
+            return [
+                (f"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {{{len(header)}}}".encode(), header),
+                f" UID {uid} RFC822.SIZE 400)".encode(),
+            ]
+
+    headers = _mailbox(_AttributesLast({"101": _bare_email()})).list_recent(
+        since=date(2026, 9, 1), limit=10
+    )
+
+    assert [(h.uid, h.message_id) for h in headers] == [("101", "<late-101@x>")]
+
+
+def test_a_message_with_no_message_id_literal_still_gets_an_id() -> None:
+    """A body section is an nstring, so a server may answer `""` or NIL for a
+    message that has no Message-ID rather than send an empty literal. There
+    is then no tuple at all for that message.
+
+    It must still be listed with a synthetic id — the id is what makes a
+    re-poll idempotent, so a message that cannot have one is a message that
+    can never be imported, and dropping it silently is the worst option.
+    """
+
+    class _NilHeader(_FakeImap):
+        def _fetched(self, uid: str, spec: str) -> Any:
+            if "HEADER.FIELDS" not in spec:
+                return super()._fetched(uid, spec)
+            return [f'1 (UID {uid} RFC822.SIZE 400 BODY[HEADER.FIELDS (MESSAGE-ID)] "")'.encode()]
+
+    headers = _mailbox(_NilHeader({"77": _bare_email()})).list_recent(
+        since=date(2026, 9, 1), limit=10
+    )
+
+    assert [(h.uid, h.message_id) for h in headers] == [
+        ("77", f"<imap-{UID_VALIDITY}-77@imap.autotrain.invalid>")
+    ]
+
+
 def test_a_folder_that_will_not_open_fails_at_connect_and_says_what_would(
     monkeypatch: Any,
 ) -> None:

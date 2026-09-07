@@ -176,7 +176,6 @@ def _mailbox_poll_once(open_mailbox: MailboxOpener) -> journeys.MailboxStats | N
                 account_email=owner,
                 lookback_days=settings.mailbox_lookback_days,
                 limit=settings.mailbox_max_per_poll,
-                daily_cap=settings.intake_daily_cap,
                 commit_each=True,
             )
 

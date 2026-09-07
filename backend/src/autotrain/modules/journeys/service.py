@@ -358,7 +358,7 @@ def receive_ticket_email(
     spf_pass: bool | None = None,
     dkim_pass: bool | None = None,
     attachments: Sequence[MailboxAttachment] = (),
-    daily_cap: int = 50,
+    daily_cap: int | None = 50,
 ) -> InboundEmailRow | None:
     """Store one forwarded email: for the intake sweep to read, or as
     refused at the door, with the reason.
@@ -405,12 +405,20 @@ def receive_ticket_email(
         )
     if account_email is None:
         raise ValueError("account_email is required when user_id is given")
+    # Counted only when a cap can fire: `daily_cap` None means there is
+    # nothing to compare against, and the query would be a round trip whose
+    # answer is thrown away.
+    recent = (
+        _repository.count_received_since(conn, user_id, now - _CAP_WINDOW, daily_cap)
+        if daily_cap is not None
+        else 0
+    )
     verdict = _intake.screen(
         sender=sender,
         account_email=account_email,
         spf_pass=spf_pass,
         dkim_pass=dkim_pass,
-        recent_count=_repository.count_received_since(conn, user_id, now - _CAP_WINDOW, daily_cap),
+        recent_count=recent,
         daily_cap=daily_cap,
     )
     store = functools.partial(
@@ -466,6 +474,13 @@ def _store_attachments(
     return len(kept)
 
 
+# How many message headers one pass will list. Not a tuning knob: it is the
+# point past which a folder is too big for the "list everything, fetch what
+# is new" shape to hold, and reaching it is logged rather than silently
+# truncating. A hand-curated label never comes near it.
+MAX_MAILBOX_LISTING = 5_000
+
+
 @dataclass
 class MailboxStats:
     """One mailbox poll's outcome, for the scheduler's log line."""
@@ -488,7 +503,6 @@ def run_mailbox_poll(
     account_email: str,
     lookback_days: int = 14,
     limit: int = 200,
-    daily_cap: int = 50,
     commit_each: bool = False,
 ) -> MailboxStats:
     """Read one person's inbox into the intake queue.
@@ -518,8 +532,24 @@ def run_mailbox_poll(
     """
     stats = MailboxStats()
     since = (datetime.now(UTC) - timedelta(days=lookback_days)).date()
-    headers = mailbox.list_recent(since=since, limit=limit)
+    # Listed wide, fetched narrow. `limit` bounds BODIES, not the listing:
+    # capping the listing first would mean that once `limit` messages in the
+    # window were already stored, the pass had nothing left to look at and
+    # the older unimported ones behind them could never be reached — they
+    # would sit there until they aged out of the window, permanently
+    # invisible, while every pass reported a clean zero. Headers are a few
+    # hundred bytes each, so listing the whole window and then choosing is
+    # both correct and cheap.
+    headers = mailbox.list_recent(since=since, limit=MAX_MAILBOX_LISTING)
     stats.listed = len(headers)
+    if len(headers) >= MAX_MAILBOX_LISTING:
+        logger.warning(
+            "mailbox poll: the listing cap of %d was reached; messages older than the "
+            "newest %d in the window cannot be seen. Narrow the folder or shorten "
+            "AUTOTRAIN_MAILBOX_LOOKBACK_DAYS.",
+            MAX_MAILBOX_LISTING,
+            MAX_MAILBOX_LISTING,
+        )
 
     # Two messages can carry one Message-ID (a copy filed in another folder,
     # a client that reuses one). Keeping the first occurrence means the
@@ -530,6 +560,18 @@ def run_mailbox_poll(
     known = _repository.known_message_ids(conn, list(by_id))
     fresh = [header for message_id, header in by_id.items() if message_id not in known]
     stats.fresh = len(fresh)
+    if len(fresh) > limit:
+        # Oldest first, which is the order the listing already comes in:
+        # taking the oldest unimported guarantees a backlog drains instead of
+        # a fixed head of it being re-examined for ever. A new booking waits
+        # at most a few intervals behind a backlog, which costs nothing —
+        # claims are judged on travel dates, not on when we read the email.
+        logger.info(
+            "mailbox poll: %d new messages, fetching the oldest %d this pass",
+            len(fresh),
+            limit,
+        )
+        fresh = fresh[:limit]
 
     for header in fresh:
         try:
@@ -540,7 +582,6 @@ def run_mailbox_poll(
                     header,
                     user_id=user_id,
                     account_email=account_email,
-                    daily_cap=daily_cap,
                     stats=stats,
                 )
         except Exception:
@@ -563,7 +604,6 @@ def _poll_one(
     *,
     user_id: UUID,
     account_email: str,
-    daily_cap: int,
     stats: MailboxStats,
 ) -> None:
     message = mailbox.fetch(header.uid)
@@ -580,7 +620,15 @@ def _poll_one(
         subject=message.subject,
         body=message.body,
         attachments=message.attachments,
-        daily_cap=daily_cap,
+        # No daily cap on this path, deliberately. The webhook's cap bounds
+        # what a stranger who found a leaked forwarding address can make the
+        # reader spend; a mailbox is one WE opened, and its bound is the
+        # lookback window and the per-pass limit above. Applying the cap here
+        # would be destructive rather than protective: a refused email is
+        # stored body-less under a message id that is never offered again, so
+        # labelling sixty tickets in one sitting would permanently discard the
+        # last ten.
+        daily_cap=None,
     )
     if row is None:
         # Stored between the listing and now — another poller, or the same
