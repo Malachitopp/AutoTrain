@@ -89,6 +89,17 @@ def _one_of_everything(conn: psycopg.Connection) -> tuple[UUID, str]:
         recipient=address,
         subject="Your e-ticket",
         body=BODY,
+        # The booking reference goes in the FILENAME so the text-column scan
+        # below covers attachments for free, exactly as it covers every other
+        # place personal data lives — and in the CONTENT too, which that scan
+        # cannot see, because bytea is where the passenger's name really is.
+        attachments=(
+            journeys.MailboxAttachment(
+                filename="ticket-ZX123QQ.pdf",
+                content_type="application/pdf",
+                content=b"%PDF-1.4 ZX123QQ Leeds to London",
+            ),
+        ),
     )
     assert journeys.run_intake_sweep(conn, _Reader()).parsed == 1
     journey_id = scalar(conn.execute("SELECT id FROM journeys WHERE user_id = %s", (user_id,)))
@@ -142,6 +153,7 @@ def test_erase_user_leaves_nothing_of_the_person_and_keeps_the_claim(
     assert _columns_holding(conn, EMAIL)
     assert _columns_holding(conn, "ZX123QQ")
     assert _columns_holding(conn, code)
+    assert scalar(conn.execute("SELECT count(*) FROM inbound_email_attachments")) == 1
     token = identity.issue_session_token(
         user_id, secret=TEST_JWT_SECRET, now=datetime.now(UTC) - timedelta(seconds=5)
     )
@@ -153,6 +165,11 @@ def test_erase_user_leaves_nothing_of_the_person_and_keeps_the_claim(
 
     for needle in (EMAIL, "ZX123QQ", RETAILER, code, PUSH_TOKEN):
         assert _columns_holding(conn, needle) == [], needle
+    # The scan reads text columns, and an e-ticket's bytes are bytea — the
+    # one place in this database holding a scan of the passenger's name and
+    # their booking reference as an image. Asserted separately because the
+    # sweep above is structurally unable to see it.
+    assert scalar(conn.execute("SELECT count(*) FROM inbound_email_attachments")) == 0
     # Every gate says no, including the session that was fine a moment ago.
     assert identity.user_is_live(conn, user_id) is False
     assert (

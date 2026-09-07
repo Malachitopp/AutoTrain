@@ -76,10 +76,43 @@ for OTRL — the other agent reported reCAPTCHA on that platform.
 
 ## Every operator requires a ticket image
 
-Without exception, and AutoTrain currently has no attachment capture at all:
-`inbound_emails` stores sender, subject and body, and nothing parses an
-attachment. `claim_proofs.s3_key` points at object storage that was never set
-up. This blocks filing for every operator regardless of the answers above.
+Without exception. This section said the blocker was that AutoTrain captured
+no attachments. That half is now false — migration 0020 stores them and the
+IMAP mailbox source delivers them — but the blocker did not clear. It moved,
+and it moved somewhere worse: to the retailer.
+
+**Trainline does not email the ticket.** Verified 2026-09-07 against a real
+confirmation (Gatwick Airport to St Pancras, 23 August, £9.65), read straight
+off the mailbox. The whole 94 KB message is two parts:
+
+| Part | Disposition | Size |
+| --- | --- | --- |
+| `text/html` | inline | 81,591 bytes |
+| `text/calendar` (`trip.ics`) | attachment | 998 bytes |
+
+A calendar invite, and nothing else. No PDF, no image, no barcode. For a
+Trainline booking the ticket is collected from a station machine or lives in
+their app, so it never touches the inbox at all — and no amount of attachment
+capture can find something that was never sent.
+
+So "can we file?" now splits by **who sold the ticket**, not by who ran the
+train:
+
+* **Bought direct from an operator** — the e-ticket PDF is usually attached,
+  and 0020 now keeps it. This is the case that works.
+* **Bought through Trainline** (and probably the other third-party
+  retailers) — there is nothing in the email to keep. Filing needs the ticket
+  from somewhere else: the retailer's own account, an app export, or the
+  passenger photographing it.
+
+That second case is the one the product was originally for — the gap where an
+operator's own automatic scheme does not reach. Worth knowing that it is also
+the harder half to file.
+
+Still unverified: whether a direct operator booking really does attach a PDF.
+*Book one cheap advance ticket direct from LNER or GWR and look at the parts
+of the confirmation.* Until that is done, attachment capture is built and
+proven to run, but has never once had a real ticket to store.
 
 ## Five UK services already do this
 
