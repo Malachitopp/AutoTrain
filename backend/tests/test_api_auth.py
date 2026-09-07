@@ -31,6 +31,7 @@ from conftest import (
     mk_user,
     scalar,
 )
+from test_identity_service import link_in
 
 _EMAIL = "rider@example.com"
 
@@ -61,7 +62,7 @@ def client(
 
 def _token_from(sender: _RecordingEmailSender) -> str:
     assert len(sender.sent) == 1
-    return sender.sent[0][2].split("token=")[1]
+    return link_in(sender.sent[0][2]).split("token=")[1]
 
 
 class TestRequestLink:
@@ -96,7 +97,29 @@ class TestRequestLink:
         server, so it stays out of the frontend host's request logs."""
         client.post("/auth/login/request", json={"email": _EMAIL})
         token = _token_from(sender)
-        assert sender.sent[0][2] == f"{TEST_APP_BASE_URL}/login#token={token}"
+        assert link_in(sender.sent[0][2]) == f"{TEST_APP_BASE_URL}/login#token={token}"
+
+    def test_a_provider_that_will_not_take_the_message_answers_502(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The only answer this endpoint gives other than 204. It is 502 and
+        not 500 because the fault is upstream, and it says nothing the
+        provider said — a refusal names our sending domain or our API key,
+        neither of which belongs in a response to the public. It still
+        cannot be used to probe for accounts: a provider refuses over
+        configuration, never over who has one."""
+
+        class _Failing:
+            def send_email(self, *, to: str, subject: str, body: str) -> None:
+                raise identity.EmailDeliveryError("the in.autotrain.test domain is not verified")
+
+        monkeypatch.setattr(auth_router, "_email_sender", lambda: _Failing())
+
+        resp = client.post("/auth/login/request", json={"email": _EMAIL})
+
+        assert resp.status_code == 502
+        assert resp.json() == {"detail": "could not send the login email"}
+        assert "in.autotrain.test" not in resp.text
 
     @pytest.mark.parametrize("unset", [None, ""], ids=["absent", "blank"])
     def test_unconfigured_app_base_url_is_503(

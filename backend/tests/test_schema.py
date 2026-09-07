@@ -60,6 +60,27 @@ class TestMigrationsApply:
         }
         assert expected <= tables, f"missing: {expected - tables}"
 
+    def test_erasure_can_find_a_persons_login_tokens_by_email(
+        self, conn: psycopg.Connection
+    ) -> None:
+        """0017. login_tokens is indexed by token_hash, which is what login
+        reads it by — but erasure deletes by email, and 0012 shipped with no
+        index for that. Nothing prunes this table, so it only grows: without
+        this index, honouring a deletion request means a sequential scan of
+        every login token ever minted, and it gets slower for the rest of the
+        system's life.
+
+        Asserted against the planner rather than the catalogue, so that
+        renaming the index or replacing it with a wider one still passes —
+        what matters is that the query has a way in that is not a scan."""
+        conn.execute("SET LOCAL enable_seqscan = off")
+        plan = _scalar(
+            conn.execute(
+                "EXPLAIN (FORMAT JSON) DELETE FROM login_tokens WHERE email = 'a@example.com'"
+            )
+        )
+        assert "Index" in str(plan), plan
+
     def test_launch_operators_file_by_deep_link(self, conn: psycopg.Connection) -> None:
         """0011's payload. The UPDATE ... FROM (VALUES ...) join silently
         matches zero rows on a mistyped ATOC code — the suite would stay green

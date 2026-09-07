@@ -53,6 +53,7 @@ from autotrain.modules.journeys import service as _journeys
 
 __all__ = [
     "SESSION_TTL",
+    "EmailDeliveryError",
     "EmailSender",
     "PushTarget",
     "SessionClaims",
@@ -73,21 +74,35 @@ __all__ = [
 ]
 
 
+class EmailDeliveryError(RuntimeError):
+    """A transport could not deliver an email.
+
+    Part of the EmailSender contract rather than any one implementation's
+    private business, so the api layer can answer "the provider would not
+    take it" without importing a provider, and a second transport later
+    needs no new handling anywhere. Raised for both halves of a failure —
+    the provider was unreachable, and the provider refused — because the
+    caller's response to each is identical: the login did not go out.
+    """
+
+
 class EmailSender(Protocol):
     """Anything that can deliver one email.
 
     Implemented outside the module (sources/email.py) and injected by the
     api layer — the same seam as notifications' PushSender. Implementations
-    may raise: request_login runs inside the caller's transaction, so a
-    failed send rolls the token insert back with it and no orphaned token
-    outlives its email. They must bound their own delivery time (network
-    timeouts) — a request handler is waiting on send_email.
+    may raise, and should raise EmailDeliveryError when they do:
+    request_login runs inside the caller's transaction, so a failed send
+    rolls the token insert back with it and no orphaned token outlives its
+    email. They must bound their own delivery time (network timeouts) — a
+    request handler is waiting on send_email.
     """
 
     def send_email(self, *, to: str, subject: str, body: str) -> None: ...
 
 
 _TOKEN_TTL = timedelta(minutes=15)
+_LOGIN_SUBJECT = "Your AutoTrain sign-in link"
 # Public: the web session cookie's max-age is derived from it (routers/auth.py).
 SESSION_TTL = timedelta(days=30)
 # A verifier may run on a different host from the issuer; a few seconds of
@@ -125,8 +140,42 @@ def request_login(
     _repository.insert_login_token(conn, email, token_hash, expires_at)
     sender.send_email(
         to=email,
-        subject="Your AutoTrain login link",
-        body=f"{app_base_url}/login#token={token}",
+        subject=_LOGIN_SUBJECT,
+        body=_login_email_body(f"{app_base_url}/login#token={token}"),
+    )
+
+
+def _login_email_body(link: str) -> str:
+    """The words wrapped around the link.
+
+    The body used to be the bare URL and nothing else. That was right while
+    the log was the inbox, and wrong the moment a real one is: a message
+    whose entire content is one long URL is among the oldest phishing shapes
+    there is, and spam filters score it accordingly — this is the one email
+    in the product that absolutely must arrive.
+
+    So: what it is, the link alone on its own line where every client will
+    linkify it, how long it lasts, and what to do if the reader did not ask
+    for it. The expiry is read from _TOKEN_TTL rather than written out, so
+    the promise in the inbox cannot drift from the one the database keeps.
+    """
+    minutes = int(_TOKEN_TTL.total_seconds() // 60)
+    # Joined rather than concatenated so the shape of the message is the
+    # shape of this list: one entry per line, blank entries where the
+    # blank lines go, and the link on a line of its own.
+    return "\n".join(
+        [
+            "Open this link to sign in to AutoTrain:",
+            "",
+            link,
+            "",
+            f"It signs you in once and stops working after {minutes} minutes.",
+            "",
+            "If you did not ask to sign in, you can ignore this email. Nobody",
+            "can sign in as you without the link above, and nothing has changed",
+            "on your account.",
+            "",
+        ]
     )
 
 

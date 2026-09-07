@@ -13,23 +13,50 @@ bearer header. deps.current_user_id accepts either.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from fastapi import APIRouter, HTTPException, Response
 
 from autotrain.api.deps import SESSION_COOKIE, ConnDep, UserIdDep
 from autotrain.api.schemas import LoginRequest, LoginVerify, SessionOut, UserOut
 from autotrain.core.config import get_settings
 from autotrain.modules.identity import service
-from autotrain.sources.email import LogEmailSender
+from autotrain.sources.email import LogEmailSender, ResendEmailSender
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _email_sender() -> service.EmailSender:
-    """The configured email transport — 'log' in development."""
+    """The configured email transport — 'log' in development, 'resend' in
+    production. One branch per transport, the same shape as the scheduler's
+    reader builder; adding one touches this function and sources/."""
     settings = get_settings()
     if settings.email_sender == "log":
         return LogEmailSender()
+    if settings.email_sender == "resend":
+        return _resend_sender()
     raise HTTPException(status_code=503, detail="no email sender configured")
+
+
+@lru_cache(maxsize=1)
+def _resend_sender() -> ResendEmailSender:
+    """Built once and kept for the life of the process.
+
+    Unlike LogEmailSender, this one owns an HTTP client, and a client built
+    per request throws away a warm TLS connection and re-handshakes on
+    every single login — three extra round trips to the provider while a
+    user waits on the button they just pressed.
+
+    Settings already refuses to boot with 'resend' and no credentials, so
+    the check below is the type checker's and not a second policy; it stays
+    a 503 rather than a crash because the API has other jobs to keep doing.
+    """
+    settings = get_settings()
+    if settings.resend_api_key is None or not settings.email_from:
+        raise HTTPException(status_code=503, detail="no email sender configured")
+    return ResendEmailSender.from_api_key(
+        settings.resend_api_key.get_secret_value(), from_address=settings.email_from
+    )
 
 
 def _jwt_secret() -> str:
@@ -81,7 +108,21 @@ def _clear_session_cookie(response: Response) -> None:
 def request_login(payload: LoginRequest, conn: ConnDep) -> None:
     """Always 204, account or not — the enumeration reasoning lives in
     identity.request_login; this route adds nothing that could leak."""
-    service.request_login(conn, payload.email, _email_sender(), app_base_url=_app_base_url())
+    try:
+        service.request_login(conn, payload.email, _email_sender(), app_base_url=_app_base_url())
+    except service.EmailDeliveryError as exc:
+        # 502, not 500: the fault is the provider's, and the distinction is
+        # what sends whoever is on call to their status page instead of our
+        # stack traces. The middleware rolls the transaction back on any
+        # >=400 response, so the login token this request minted goes with
+        # it and no token survives the email that was meant to carry it.
+        #
+        # This is the one answer this endpoint can give other than 204, and
+        # it does not break the enumeration property: a provider refuses for
+        # a bad key, an unverified domain or a malformed address — never for
+        # whether the address has an account here. The detail is deliberately
+        # ours rather than the provider's, which can name our sending domain.
+        raise HTTPException(status_code=502, detail="could not send the login email") from exc
 
 
 @router.post("/login/verify")
