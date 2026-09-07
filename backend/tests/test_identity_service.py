@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 import jwt
 import psycopg
+import pytest
 
 from autotrain.modules.identity import service as identity
 from conftest import TEST_APP_BASE_URL, TEST_JWT_SECRET, mk_user, scalar
@@ -30,6 +31,18 @@ class _RecordingEmailSender:
         self.sent.append((to, subject, body))
 
 
+def link_in(body: str) -> str:
+    """The one line of the email that is the link.
+
+    Exactly one, and alone: mail clients linkify a URL that owns its line,
+    and wrap — and so break — one buried in a sentence. That the link stands
+    by itself is part of the message's contract with the inbox, so pulling
+    it out this way asserts it on every test that reads a token.
+    """
+    (link,) = [line for line in body.splitlines() if line.startswith(TEST_APP_BASE_URL)]
+    return link
+
+
 def _request_token(conn: psycopg.Connection, email: str = _EMAIL) -> str:
     """Run request_login and pull the raw token back out of the 'email' —
     the same move a real user makes in their inbox."""
@@ -39,8 +52,9 @@ def _request_token(conn: psycopg.Connection, email: str = _EMAIL) -> str:
     to, _subject, body = sender.sent[0]
     assert to == email
     # The link's shape is a contract with the frontend's /login route.
-    assert body.startswith(f"{TEST_APP_BASE_URL}/login#token=")
-    return body.split("token=")[1]
+    link = link_in(body)
+    assert link.startswith(f"{TEST_APP_BASE_URL}/login#token=")
+    return link.split("token=")[1]
 
 
 # --- The magic-link lifecycle -------------------------------------------------
@@ -61,6 +75,44 @@ class TestRequestLogin:
         # The 15-minute policy, with slack for the test's own runtime.
         remaining = expires_at - datetime.now(UTC)
         assert timedelta(minutes=14) < remaining <= timedelta(minutes=15)
+
+    def test_the_email_is_a_message_and_not_a_bare_link(self, conn: psycopg.Connection) -> None:
+        """A body that is nothing but a long URL is one of the oldest
+        phishing shapes there is, and spam filters score it that way — for
+        the one email in this product that must arrive. So the message says
+        what it is, how long the link lasts, and what to do if the reader
+        did not ask for it; and the expiry it promises is read from the same
+        constant the database row is stamped from, so the two cannot drift.
+        """
+        sender = _RecordingEmailSender()
+        identity.request_login(conn, _EMAIL, sender, app_base_url=TEST_APP_BASE_URL)
+        _to, subject, body = sender.sent[0]
+
+        assert "AutoTrain" in subject
+        assert body.splitlines()[0].endswith(":")  # the link is introduced
+        assert "15 minutes" in body  # the row's own expiry, asserted above
+        assert "did not ask" in body
+        # The token appears once and only inside the link.
+        token = link_in(body).split("token=")[1]
+        assert body.count(token) == 1
+
+    def test_a_failed_send_leaves_no_token_behind(self, conn: psycopg.Connection) -> None:
+        """Why the send sits inside the caller's transaction rather than
+        after it. A token whose email never went out is a row nobody can
+        ever spend and an attacker can still guess at, so the delivery
+        failure has to unwind the INSERT with it — which only works while
+        both are one unit of work."""
+
+        class _Failing:
+            def send_email(self, *, to: str, subject: str, body: str) -> None:
+                raise identity.EmailDeliveryError("the provider refused the message")
+
+        email = "undeliverable@example.com"
+        with pytest.raises(identity.EmailDeliveryError), conn.transaction():
+            identity.request_login(conn, email, _Failing(), app_base_url=TEST_APP_BASE_URL)
+
+        count = scalar(conn.execute("SELECT count(*) FROM login_tokens WHERE email = %s", (email,)))
+        assert count == 0
 
     def test_never_reveals_whether_the_email_has_an_account(self, conn: psycopg.Connection) -> None:
         """The enumeration property at the service layer: a known and an

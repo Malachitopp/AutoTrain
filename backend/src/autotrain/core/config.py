@@ -84,8 +84,18 @@ class Settings(BaseSettings):
 
     # Auth and the browser frontend (identity module, api process).
     # 'none' makes /auth/login/request refuse; 'log' writes the email to the
-    # process log — the development transport until a real provider arrives.
-    email_sender: Literal["none", "log"] = "none"
+    # process log (development only — the lockdown below refuses it in
+    # production); 'resend' delivers through Resend's HTTPS API.
+    email_sender: Literal["none", "log", "resend"] = "none"
+    # Resend's API key. Whoever holds it can send mail as our domain, which
+    # is a phishing kit — it is a secret on the level of the JWT one.
+    resend_api_key: SecretStr | None = None
+    # The From address every AutoTrain email is sent as. Must be on a domain
+    # verified with the provider, or every send is refused. RFC 5322 display
+    # form is allowed and preferred, because "AutoTrain <...>" is what the
+    # recipient's client shows in the sender column:
+    #   AutoTrain <login@in.example.com>
+    email_from: str | None = None
     # Signs session JWTs. SecretStr: a logged Settings shows '**********'.
     # Whoever holds it can mint a session for any user.
     jwt_secret: SecretStr | None = None
@@ -169,6 +179,27 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "AUTOTRAIN_TICKET_EXTRACTOR=claude requires AUTOTRAIN_ANTHROPIC_API_KEY"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _resend_requires_credentials(self) -> Settings:
+        """Same shape as the HSP and Claude rules: a transport selected
+        without what it needs is an invalid deployment, refused at boot in
+        every process rather than discovered by the first person who cannot
+        log in. Blank counts as absent for the same reason as everywhere
+        else — an interpolated-but-unset env var arrives as ''."""
+        if self.email_sender == "resend":
+            key = self.resend_api_key.get_secret_value() if self.resend_api_key else ""
+            missing = [
+                name
+                for name, value in (
+                    ("AUTOTRAIN_RESEND_API_KEY", key),
+                    ("AUTOTRAIN_EMAIL_FROM", self.email_from or ""),
+                )
+                if not value.strip()
+            ]
+            if missing:
+                raise ValueError("AUTOTRAIN_EMAIL_SENDER=resend requires " + " and ".join(missing))
         return self
 
     @model_validator(mode="after")
