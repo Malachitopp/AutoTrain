@@ -12,7 +12,10 @@ Four jobs today, all cheap no-ops when their work queues are empty:
     (AUTOTRAIN_TICKET_EXTRACTOR); the reader is built here, once, and handed
     to the journeys module — the sources/ seam, as in the ingestor;
   * intake retention — blanks the raw bodies of emails decided long enough
-    ago (inbound_emails_retention_idx, 0015).
+    ago (inbound_emails_retention_idx, 0015);
+  * login token cleanup — deletes spent and expired magic-link tokens past
+    retention (login_tokens_created_at_idx, 0018). Nothing reads a token
+    after its first 15 minutes, and without this the table grew for ever.
 
 Jobs are isolated from each other: one failing is logged and retried next
 interval while the rest still run — the same containment stance as the
@@ -45,6 +48,7 @@ from autotrain.core import db
 from autotrain.core.config import get_settings
 from autotrain.core.observability import fields, setup_logging
 from autotrain.modules.claims import service as claims
+from autotrain.modules.identity import service as identity
 from autotrain.modules.journeys import service as journeys
 from autotrain.sources.ticket_emails import ClaudeTicketExtractor
 
@@ -129,6 +133,16 @@ def _retention_once() -> int | None:
         )
 
 
+def _login_token_cleanup_once() -> int | None:
+    settings = get_settings()
+    with db.transaction() as conn, db.job_lock(conn, "login-token-cleanup") as held:
+        if not held:
+            return None
+        return identity.purge_expired_login_tokens(
+            conn, keep_days=settings.login_token_retention_days, commit_each=True
+        )
+
+
 def _as_fields(result: Any) -> dict[str, Any]:
     """A job's result as log fields: a stats dataclass field by field, a
     bare count under 'count'."""
@@ -150,6 +164,7 @@ def _run_jobs_once(batch_size: int, extractor: journeys.TicketExtractor | None =
         reader = extractor
         jobs.append(("ticket intake", lambda: _intake_once(reader)))
     jobs.append(("intake retention", _retention_once))
+    jobs.append(("login token cleanup", _login_token_cleanup_once))
     for name, run in jobs:
         try:
             result = run()

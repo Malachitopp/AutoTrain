@@ -43,6 +43,30 @@ _SPEND_LOGIN_TOKEN = (
     "WHERE token_hash = %s AND used_at IS NULL AND expires_at > now() "
     "RETURNING email"
 )
+# The rate limiter's two questions (0018). Both count rows that are already
+# here: a request that sends an email commits its login_tokens row, so the
+# committed rows are the record of what went out, and a refusal writes
+# nothing — which is what makes this survive TransactionMiddleware rolling
+# back every response of 400 and above.
+#
+# The inner LIMIT is the same trick as journeys' intake cap: the answer is
+# only ever compared against a small cap, so counting past it is work whose
+# result is thrown away. Under attack that is the difference between a count
+# over the day's whole traffic and one that stops at five.
+_COUNT_LOGIN_TOKENS_FOR_EMAIL = (
+    "SELECT count(*) FROM (SELECT 1 FROM login_tokens "
+    "WHERE email = %s AND created_at >= %s LIMIT %s) AS capped"
+)
+_COUNT_LOGIN_TOKENS_SINCE = (
+    "SELECT count(*) FROM (SELECT 1 FROM login_tokens WHERE created_at >= %s LIMIT %s) AS capped"
+)
+# Batched like journeys' retention purge, so a first run over a long backlog
+# never holds one long transaction.
+_DELETE_OLD_LOGIN_TOKENS = (
+    "DELETE FROM login_tokens WHERE id IN ("
+    "SELECT id FROM login_tokens WHERE created_at < %s ORDER BY created_at LIMIT %s)"
+)
+
 _USER_ID_EMAIL = "SELECT id FROM users WHERE email = %s AND deleted_at IS NULL"
 _CREATE_USER = "INSERT INTO users (email) VALUES (%s) RETURNING id"
 
@@ -173,6 +197,25 @@ def revoke_sessions(conn: psycopg.Connection, user_id: UUID) -> bool:
 
 def user_email(conn: psycopg.Connection, user_id: UUID) -> str | None:
     return db.fetch_value(conn, _USER_EMAIL, (user_id,))
+
+
+def count_login_tokens_for_email(
+    conn: psycopg.Connection, email: str, since: datetime, cap: int
+) -> int:
+    """How many links this address has been sent since `since`, counted no
+    further than `cap`."""
+    return db.fetch_value(conn, _COUNT_LOGIN_TOKENS_FOR_EMAIL, (email, since, cap))
+
+
+def count_login_tokens_since(conn: psycopg.Connection, since: datetime, cap: int) -> int:
+    """How many links everyone has been sent since `since`, counted no
+    further than `cap`."""
+    return db.fetch_value(conn, _COUNT_LOGIN_TOKENS_SINCE, (since, cap))
+
+
+def delete_old_login_tokens(conn: psycopg.Connection, before: datetime, limit: int) -> int:
+    """How many tokens this call deleted."""
+    return db.execute(conn, _DELETE_OLD_LOGIN_TOKENS, (before, limit))
 
 
 def delete_login_tokens(conn: psycopg.Connection, email: str) -> int:
