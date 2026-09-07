@@ -67,8 +67,15 @@ class _FakeImap:
     it sends, not about what it returns.
     """
 
-    def __init__(self, messages: dict[str, bytes], *, sizes: dict[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        messages: dict[str, bytes],
+        *,
+        sizes: dict[str, int] | None = None,
+        folders: tuple[str, ...] = ("INBOX", "AutoTrain Tickets"),
+    ) -> None:
         self.messages = messages
+        self.folders = folders
         self.sizes = sizes or {uid: len(raw) for uid, raw in messages.items()}
         self.commands: list[tuple[str, ...]] = []
         self.selected: tuple[str, bool] | None = None
@@ -81,7 +88,14 @@ class _FakeImap:
 
     def select(self, mailbox: str = "INBOX", readonly: bool = False) -> Any:
         self.selected = (mailbox, readonly)
+        if mailbox.strip('"') not in self.folders:
+            # What Gmail actually answers, and imaplib does NOT raise on it.
+            return ("NO", [f"[NONEXISTENT] Unknown Mailbox: {mailbox} (Failure)".encode()])
         return ("OK", [b"3"])
+
+    def list(self, directory: str = '""', pattern: str = "*") -> Any:
+        rows = [f'(\\HasNoChildren) "/" "{name}"'.encode() for name in self.folders]
+        return ("OK", [b'(\\HasChildren \\Noselect) "/" "[Gmail]"', *rows])
 
     def response(self, name: str) -> Any:
         return (name, [UID_VALIDITY.encode()]) if name == "UIDVALIDITY" else (name, [None])
@@ -234,3 +248,43 @@ def test_a_refused_search_is_an_error_not_an_empty_mailbox() -> None:
 
     with pytest.raises(imaplib.IMAP4.error):
         _mailbox(_Refusing({})).list_recent(since=date(2026, 9, 1), limit=10)
+
+
+def test_a_folder_that_will_not_open_fails_at_connect_and_says_what_would(
+    monkeypatch: Any,
+) -> None:
+    """The first-run mistake, caught where it can be understood.
+
+    A Gmail label does not exist over IMAP until it has been created, and
+    imaplib does not raise when a server refuses a SELECT — it returns the
+    refusal and stays in AUTH state. Without this check the failure surfaces
+    at the next command as "SEARCH illegal in state AUTH", which names
+    neither the folder nor the reason. This test exists because that is
+    exactly what happened on the first run against a real mailbox.
+
+    The message carries what would have worked, because the fix is always one
+    of those names and looking them up is a step we can just do for the
+    person reading the log.
+    """
+    fake = _FakeImap({}, folders=("INBOX", "Receipts"))
+    monkeypatch.setattr(imap_mailbox.imaplib, "IMAP4_SSL", lambda host, port, timeout: fake)
+
+    with pytest.raises(imaplib.IMAP4.error) as excinfo:
+        ImapMailbox.connect(
+            host="imap.example.com",
+            username="traveller@example.com",
+            password="app-password",
+            folder="AutoTrain",
+        )
+
+    message = str(excinfo.value)
+    assert "AutoTrain" in message
+    assert "Unknown Mailbox" in message
+    assert "'INBOX'" in message
+    assert "'Receipts'" in message
+    # A folder the server marks unselectable cannot be the answer, so it is
+    # not offered — Gmail's own "[Gmail]" is one, and suggesting it would
+    # send someone down a second dead end.
+    assert "'[Gmail]'" not in message
+    # ...and the socket was closed on the way out.
+    assert fake.logged_out

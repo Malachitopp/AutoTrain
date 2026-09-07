@@ -43,6 +43,7 @@ import logging
 import re
 from datetime import date
 from types import TracebackType
+from typing import Any
 
 from autotrain.modules.journeys.service import MailboxAttachment, MailboxHeader, MailboxMessage
 
@@ -80,6 +81,11 @@ _FETCH_CHUNK = 100
 # it implicit), in an envelope line like: 7 (UID 4213 RFC822.SIZE 8192 ...
 _UID_IN_RESPONSE = re.compile(rb"\bUID\s+(\d+)")
 _SIZE_IN_RESPONSE = re.compile(rb"\bRFC822\.SIZE\s+(\d+)")
+
+# A LIST row is: (\HasNoChildren) "/" "[Gmail]/All Mail" — flags, the
+# hierarchy delimiter, then the name, quoted. Only read when a folder failed
+# to open, to say what would have worked instead.
+_FOLDER_NAME = re.compile(r'"([^"]*)"\s*$')
 
 # Message-ID is optional in practice — plenty of mail arrives without one,
 # and the database needs a unique key for every row. A synthetic id built
@@ -144,7 +150,17 @@ class ImapMailbox:
             connection.login(username, password)
             # EXAMINE, not SELECT: the server itself refuses any change to
             # the folder for the life of this connection.
-            connection.select(_quoted(folder), readonly=True)
+            status, detail = connection.select(_quoted(folder), readonly=True)
+            if status != "OK":
+                # imaplib does NOT raise here — it returns the refusal and
+                # leaves the connection in AUTH state, so without this check
+                # the failure surfaces at the next command as "SEARCH illegal
+                # in state AUTH", which names neither the folder nor the
+                # reason. A missing folder is the single most likely thing to
+                # be wrong on a first run (a Gmail label only exists over IMAP
+                # once it has been created and used), so it is worth saying
+                # exactly that, with the alternatives.
+                raise imaplib.IMAP4.error(_cannot_open(connection, folder, detail))
             uid_validity = _uid_validity_of(connection)
         except BaseException:
             # Including KeyboardInterrupt: a half-open socket to a mail
@@ -262,6 +278,52 @@ class ImapMailbox:
 
     def _synthetic_id(self, uid: str) -> str:
         return f"<imap-{self._uid_validity}-{uid}@{_SYNTHETIC_DOMAIN}>"
+
+
+def _cannot_open(connection: imaplib.IMAP4, folder: str, detail: list[Any]) -> str:
+    """Why the folder would not open, and what would have.
+
+    The folder list is fetched only on this path, and only to be put in the
+    message: the fix for "Unknown Mailbox: AutoTrain" is always one of the
+    names the server would have accepted, and making someone go and ask for
+    that list by hand is a diagnostic step we can just do for them. Gmail
+    labels are case-sensitive here and nested ones are separated by '/', so
+    the exact spelling is genuinely worth printing.
+    """
+    said = ""
+    if detail and isinstance(detail[0], bytes):
+        said = detail[0].decode("utf-8", "replace").strip()
+    names = _selectable_folders(connection)
+    known = ", ".join(repr(name) for name in names) if names else "none could be listed"
+    return f"could not open folder {folder!r}: {said or 'refused'}. This account has: {known}"
+
+
+def _selectable_folders(connection: imaplib.IMAP4) -> list[str]:
+    """Every folder that can actually be opened, best effort.
+
+    Never raises: this runs while another error is being reported, and
+    failing to decorate a message must not replace it. \\Noselect entries
+    are dropped because they cannot be the answer — Gmail's '[Gmail]' is one,
+    and offering it as an option would send someone down a second dead end.
+    """
+    try:
+        status, rows = connection.list()
+    except Exception:
+        logger.debug("could not list folders", exc_info=True)
+        return []
+    if status != "OK" or not rows:
+        return []
+    names: list[str] = []
+    for row in rows:
+        if not isinstance(row, bytes):
+            continue
+        line = row.decode("utf-8", "replace")
+        if "\\Noselect" in line:
+            continue
+        match = _FOLDER_NAME.search(line)
+        if match is not None:
+            names.append(match.group(1))
+    return names
 
 
 def _uid_validity_of(connection: imaplib.IMAP4) -> str:
